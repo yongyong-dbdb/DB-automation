@@ -18,12 +18,17 @@ Example:
     /home/postgres/postgres_daily_reports/postgres_daily_check_db_20260707.log
 
 Notes:
-  - Sections 00, 01, and 02 are excluded.
-  - Sections 03 and later are compared with unified diff.
+  - Sections 00 and 01 are excluded.
+  - Section 02 is compared, but recent occurrence timestamps are excluded.
+  - Default output shows a compact change summary.
+  - In terminal mode, the script asks whether to show unified diff details.
+  - When output_file is used, set COMPARE_DETAIL=true to include details.
 USAGE
 }
 
 DEFAULT_REPORT_DIR="$HOME/postgres_daily_reports"
+COMPARE_DETAIL="${COMPARE_DETAIL:-false}"
+ASK_DETAIL="${ASK_DETAIL:-true}"
 
 choose_report_file() {
   local report_dir="$1"
@@ -113,10 +118,6 @@ OLD_DIR="$TMP_DIR/old"
 NEW_DIR="$TMP_DIR/new"
 mkdir -p "$OLD_DIR" "$NEW_DIR"
 
-sanitize_title() {
-  sed -E 's/[^A-Za-z0-9._-]+/_/g; s/^_+//; s/_+$//'
-}
-
 extract_sections() {
   local report_file="$1"
   local output_dir="$2"
@@ -124,7 +125,8 @@ extract_sections() {
   awk -v outdir="$output_dir" '
     /^[0-9][0-9]\. / {
       section_no = substr($0, 1, 2) + 0
-      keep = section_no >= 3
+      keep = section_no >= 2
+      skip_recent_log_times = 0
       if (keep) {
         title = $0
         gsub(/[^A-Za-z0-9._-]+/, "_", title)
@@ -134,6 +136,14 @@ extract_sections() {
       } else {
         file = ""
       }
+      next
+    }
+    keep && section_no == 2 && /^## Recent 5 Occurrences Per Message/ {
+      skip_recent_log_times = 1
+      print "## Recent 5 Occurrences Per Message skipped for compare" > file
+      next
+    }
+    keep && section_no == 2 && skip_recent_log_times {
       next
     }
     keep && file != "" {
@@ -147,11 +157,34 @@ write_report() {
     echo "PostgreSQL Daily Check Compare"
     echo "old_report=$OLD_REPORT"
     echo "new_report=$NEW_REPORT"
-    echo "excluded_sections=00,01,02"
-    echo "compared_sections=03+"
+    echo "excluded_sections=00,01"
+    echo "compared_sections=02+"
+    echo "normalized=section_02_recent_occurrence_timestamps_skipped"
+    echo "compare_detail=$COMPARE_DETAIL"
+    echo "ask_detail=$ASK_DETAIL"
     echo "compare_started_at=$(date '+%Y-%m-%d %H:%M:%S %Z')"
     echo
   }
+}
+
+diff_counts() {
+  local old_section="$1"
+  local new_section="$2"
+
+  diff -u "$old_section" "$new_section" |
+    awk '
+      /^--- / || /^\+\+\+ / || /^@@ / { next }
+      /^\+/ { added++ }
+      /^-/ { removed++ }
+      END {
+        printf "+%d -%d", added + 0, removed + 0
+      }
+    '
+}
+
+section_label() {
+  local section_file="$1"
+  echo "$section_file" | sed -E 's/^[0-9][0-9]_//; s/\.section$//; s/_/ /g'
 }
 
 extract_sections "$OLD_REPORT" "$OLD_DIR"
@@ -174,36 +207,104 @@ if [ ! -s "$section_names" ]; then
   exit 0
 fi
 
+summary_file="$TMP_DIR/change_summary.txt"
+detail_file="$TMP_DIR/change_detail.txt"
+changed_count=0
+no_diff_count=0
+
+{
+  echo "================================================================================"
+  echo "Change Summary"
+  echo "================================================================================"
+  printf "%-55s %-14s %s\n" "title" "status" "changes"
+} > "$summary_file"
+
 while IFS= read -r section_file; do
   old_section="$OLD_DIR/$section_file"
   new_section="$NEW_DIR/$section_file"
-
-  echo "================================================================================"
-  echo "SECTION: $section_file"
-  echo "================================================================================"
+  title="$(section_label "$section_file")"
 
   if [ ! -f "$old_section" ]; then
-    echo "Only exists in new report."
-    echo
-    cat "$new_section"
-    echo
+    changed_count=$((changed_count + 1))
+    printf "%-55s %-14s %s\n" "$title" "NEW_ONLY" "all_new" >> "$summary_file"
+    {
+      echo "================================================================================"
+      echo "SECTION: $section_file"
+      echo "================================================================================"
+      echo "Only exists in new report."
+      echo
+      cat "$new_section"
+      echo
+    } >> "$detail_file"
     continue
   fi
 
   if [ ! -f "$new_section" ]; then
-    echo "Only exists in old report."
-    echo
-    cat "$old_section"
-    echo
+    changed_count=$((changed_count + 1))
+    printf "%-55s %-14s %s\n" "$title" "OLD_ONLY" "all_removed" >> "$summary_file"
+    {
+      echo "================================================================================"
+      echo "SECTION: $section_file"
+      echo "================================================================================"
+      echo "Only exists in old report."
+      echo
+      cat "$old_section"
+      echo
+    } >> "$detail_file"
     continue
   fi
 
-  if diff -u "$old_section" "$new_section"; then
+  if diff -q "$old_section" "$new_section" >/dev/null; then
+    no_diff_count=$((no_diff_count + 1))
+    printf "%-55s %-14s %s\n" "$title" "NO_DIFF" "-" >> "$summary_file"
+  else
+    changed_count=$((changed_count + 1))
+    changes="$(diff_counts "$old_section" "$new_section")"
+    printf "%-55s %-14s %s\n" "$title" "CHANGED" "$changes" >> "$summary_file"
+    {
+      echo "================================================================================"
+      echo "SECTION: $section_file"
+      echo "================================================================================"
+      diff -u "$old_section" "$new_section"
+      echo
+    } >> "$detail_file"
+  fi
+done < "$section_names"
+
+{
+  echo
+  echo "changed_sections=$changed_count"
+  echo "no_diff_sections=$no_diff_count"
+  echo
+} >> "$summary_file"
+
+cat "$summary_file"
+
+if [ -z "$OUTPUT_FILE" ] && [ "$COMPARE_DETAIL" != "true" ] && [ "$ASK_DETAIL" = "true" ] && [ -t 0 ]; then
+  printf "Show detailed unified diff? [y/N]: " >&2
+  read -r detail_answer
+  case "$detail_answer" in
+    y|Y|yes|YES) COMPARE_DETAIL="true" ;;
+  esac
+fi
+
+if [ "$COMPARE_DETAIL" = "true" ]; then
+  echo "================================================================================"
+  echo "Detailed Diff"
+  echo "================================================================================"
+  if [ -s "$detail_file" ]; then
+    cat "$detail_file"
+  else
     echo "NO_DIFF"
   fi
-
+else
+  if [ -n "$OUTPUT_FILE" ]; then
+    echo "Detailed diff is hidden. Run with COMPARE_DETAIL=true to include unified diff."
+  else
+    echo "Detailed diff is hidden."
+  fi
   echo
-done < "$section_names"
+fi
 
 echo "================================================================================"
 echo "Compare Finished"
