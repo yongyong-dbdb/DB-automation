@@ -1172,36 +1172,116 @@ apply_old_auth_to_new() {
 # Build Dependency Check
 # ============================================================
 
+detect_package_manager() {
+    if command -v dnf >/dev/null 2>&1; then
+        echo dnf
+    elif command -v yum >/dev/null 2>&1; then
+        echo yum
+    elif command -v apt-get >/dev/null 2>&1; then
+        echo apt
+    elif command -v zypper >/dev/null 2>&1; then
+        echo zypper
+    else
+        echo none
+    fi
+}
+
+
+build_dependency_packages() {
+    local manager="$1"
+
+    case "$manager" in
+        dnf|yum)
+            printf '%s\n' gcc make readline-devel zlib-devel openssl-devel
+            ;;
+        apt)
+            printf '%s\n' build-essential libreadline-dev zlib1g-dev libssl-dev
+            ;;
+        zypper)
+            printf '%s\n' gcc make readline-devel zlib-devel libopenssl-devel
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+
+package_is_installed() {
+    local manager="$1"
+    local pkg="$2"
+
+    case "$manager" in
+        apt)
+            dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null |
+                grep -q 'install ok installed'
+            ;;
+        dnf|yum|zypper)
+            rpm -q "$pkg" >/dev/null 2>&1
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+
+package_install_command() {
+    local manager="$1"
+    shift
+
+    case "$manager" in
+        apt)
+            printf 'apt-get install -y'
+            ;;
+        zypper)
+            printf 'zypper --non-interactive install'
+            ;;
+        dnf|yum)
+            printf '%s install -y' "$manager"
+            ;;
+    esac
+
+    printf ' %q' "$@"
+    echo
+}
+
+
+install_build_packages() {
+    local manager="$1"
+    shift
+
+    case "$manager" in
+        apt)
+            apt-get install -y "$@"
+            ;;
+        zypper)
+            zypper --non-interactive install "$@"
+            ;;
+        dnf|yum)
+            "$manager" install -y "$@"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+
 check_build_dependencies() {
+    local manager
     local missing=()
-
     local pkg
-
     local answer
 
+    manager="$(detect_package_manager)"
+    [[ "$manager" != none ]] || \
+        die "supported package manager not found; supported: dnf, yum, apt-get, zypper"
 
-    command -v gcc >/dev/null 2>&1 || \
-        missing+=("gcc")
-
-
-    command -v make >/dev/null 2>&1 || \
-        missing+=("make")
-
-
-    if command -v rpm >/dev/null 2>&1; then
-
-        rpm -q readline-devel >/dev/null 2>&1 || \
-            missing+=("readline-devel")
-
-
-        rpm -q zlib-devel >/dev/null 2>&1 || \
-            missing+=("zlib-devel")
-
-
-        rpm -q openssl-devel >/dev/null 2>&1 || \
-            missing+=("openssl-devel")
-
-    fi
+    while IFS= read -r pkg; do
+        [[ -n "$pkg" ]] || continue
+        package_is_installed "$manager" "$pkg" || missing+=("$pkg")
+    done < <(build_dependency_packages "$manager")
 
 
     if [[ ${#missing[@]} -eq 0 ]]; then
@@ -1230,22 +1310,6 @@ check_build_dependencies() {
     echo
 
 
-    if ! command -v dnf >/dev/null 2>&1; then
-
-        echo "Install the following packages manually:"
-
-        echo
-
-        echo "  ${missing[*]}"
-
-        echo
-
-
-        die "PostgreSQL build dependencies are missing"
-
-    fi
-
-
     #
     # 일반 계정이면 sudo 자동 수행 안 함.
     #
@@ -1260,7 +1324,8 @@ check_build_dependencies() {
 
         echo
 
-        echo "  dnf install -y ${missing[*]}"
+        printf '  '
+        package_install_command "$manager" "${missing[@]}"
 
         echo
 
@@ -1296,31 +1361,12 @@ check_build_dependencies() {
     log "installing PostgreSQL build dependencies"
 
 
-    dnf install -y "${missing[@]}"
+    install_build_packages "$manager" "${missing[@]}"
 
-
-    command -v gcc >/dev/null 2>&1 || \
-        die "gcc installation verification failed"
-
-
-    command -v make >/dev/null 2>&1 || \
-        die "make installation verification failed"
-
-
-    if command -v rpm >/dev/null 2>&1; then
-
-        rpm -q readline-devel >/dev/null 2>&1 || \
-            die "readline-devel installation verification failed"
-
-
-        rpm -q zlib-devel >/dev/null 2>&1 || \
-            die "zlib-devel installation verification failed"
-
-
-        rpm -q openssl-devel >/dev/null 2>&1 || \
-            die "openssl-devel installation verification failed"
-
-    fi
+    for pkg in "${missing[@]}"; do
+        package_is_installed "$manager" "$pkg" || \
+            die "$pkg installation verification failed"
+    done
 
 
     log "PostgreSQL build dependencies installed successfully"

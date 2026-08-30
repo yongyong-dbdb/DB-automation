@@ -1,7 +1,15 @@
 # PostgreSQL Major Upgrade Runbook
 
 이 문서는 PostgreSQL major version upgrade 자동화 스크립트 사용 방법을 정리한 문서이다.
-기본 경로는 `/home/postgres`, 기본 운영 포트는 `5444` 기준이다.
+PostgreSQL 버전, 설치 기준 경로 및 포트는 실행 시 입력하거나 환경변수로 지정한다.
+
+지원하는 Linux 패키지 관리자:
+
+- RHEL/CentOS/Rocky/Alma Linux: `dnf` 또는 `yum`
+- Debian/Ubuntu: `apt-get`
+- SUSE/openSUSE: `zypper`
+
+스크립트가 OS의 패키지 관리자를 자동 감지하고 GCC, Make, Readline, zlib 및 OpenSSL 개발 패키지를 해당 OS의 패키지명으로 검사한다. 누락 패키지는 root 실행 시 사용자 확인 후 설치하며, 일반 계정에서는 OS에 맞는 설치 명령을 안내하고 중단한다.
 
 ## 파일 구성
 
@@ -75,6 +83,8 @@ precheck -> build -> backup -> initdb
 
 - old 서버 버전, binary 버전, data directory, port 검증
 - source tar 압축 해제 및 build
+- OS별 build dependency 자동 감지 및 검사
+- 기존 OS에 맞는 OpenSSL 개발 패키지와 `--with-openssl` 적용
 - `make install`, `make -C contrib install`
 - `pg_dumpall` 백업 및 기존 conf 백업
 - old cluster와 동일한 checksum, encoding, locale 기준으로 new PGDATA 생성
