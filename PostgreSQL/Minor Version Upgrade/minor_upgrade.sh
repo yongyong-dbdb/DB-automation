@@ -561,9 +561,20 @@ comment_profile_lines() {
     local tmp="${file}.minor_upgrade.$$"
     local legacy_home="$BASE/pgsql"
 
-    awk -v marker="$marker" -v old_home="$PG_HOME_OLD" -v legacy_home="$legacy_home" '
+    awk -v marker="$marker" -v old_home="$PG_HOME_OLD" -v new_home="$PG_HOME_NEW" -v legacy_home="$legacy_home" '
         /^[[:space:]]*export[[:space:]]+(PG_HOME|PGHOME|PGDATA|PGPORT|PG_PORT)=/ { print marker " " $0; next }
-        /^[[:space:]]*export[[:space:]]+(PATH|LD_LIBRARY_PATH)=/ && (index($0, old_home) || index($0, legacy_home) || index($0, "$PG_HOME") || index($0, "$PGHOME")) { print marker " " $0; next }
+        /^[[:space:]]*export[[:space:]]+PATH=/ {
+            gsub(old_home "/bin", new_home "/bin")
+            gsub(legacy_home "/bin", new_home "/bin")
+            print
+            next
+        }
+        /^[[:space:]]*export[[:space:]]+LD_LIBRARY_PATH=/ {
+            gsub(old_home "/lib", new_home "/lib")
+            gsub(legacy_home "/lib", new_home "/lib")
+            print
+            next
+        }
         { print }
     ' "$file" > "$tmp"
     chmod --reference="$file" "$tmp"
@@ -595,8 +606,8 @@ export PGHOME=$PG_HOME_NEW
 export PGDATA=$PGDATA_NEW
 export PGPORT=$PGPORT
 export PG_PORT=$PGPORT
-export PATH=\$PG_HOME/bin:\$PATH
-export LD_LIBRARY_PATH=\$PG_HOME/lib:\${LD_LIBRARY_PATH:-}
+case ":\$PATH:" in *":\$PG_HOME/bin:"*) ;; *) export PATH=\$PG_HOME/bin:\$PATH ;; esac
+case ":\${LD_LIBRARY_PATH:-}:" in *":\$PG_HOME/lib:"*) ;; *) export LD_LIBRARY_PATH=\$PG_HOME/lib:\${LD_LIBRARY_PATH:-} ;; esac
 # End postgresql_minor_upgrade.sh
 EOF
 
