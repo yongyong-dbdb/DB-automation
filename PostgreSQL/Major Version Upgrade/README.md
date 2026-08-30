@@ -45,7 +45,11 @@ Enter old PostgreSQL data directory [current: /home/postgres/data]: /home/postgr
 Enter old PostgreSQL port [current: 5444]: 5444
 Enter new PostgreSQL version [current: 18.4]: 19beta1
 Enter new PostgreSQL port [current: 5444]: 5444
+Preserve compatible OLD postgresql.conf settings, including listen_addresses? [Y/n]:
+Copy OLD pg_hba.conf and pg_ident.conf as-is after pg_upgrade? [Y/n]:
 ```
+
+두 보존 질문의 기본값은 `Y`이다. 첫 번째 선택은 OLD 서버에서 실제 적용된 사용자 설정 중 NEW 버전이 지원하는 항목만 선별 이관하며 `listen_addresses`도 포함한다. 두 번째 선택은 인증 정책이 바뀌어 기존 애플리케이션 접속이 끊기지 않도록 OLD 인증 파일을 그대로 이관한다. `n`을 선택하면 해당 영역은 NEW initdb 기본 설정을 유지한다.
 
 이 경우 기본 경로는 다음처럼 계산된다.
 
@@ -89,6 +93,10 @@ precheck -> build -> backup -> initdb
 - `pg_dumpall` 백업 및 기존 conf 백업
 - old cluster와 동일한 checksum, encoding, locale 기준으로 new PGDATA 생성
 - new `postgresql.conf`에 `NEW_PORT` 반영
+- `pg_hba.conf`와 `pg_ident.conf`는 OLD 파일을 그대로 이관
+- `postgresql.conf`는 OLD 서버에서 실제 적용된 사용자 설정만 추출하고 NEW 바이너리가 지원하는 항목만 선별 이관
+- `data_directory`, port, 인증 파일 및 SSL 파일 경로는 신규 환경 기준으로 별도 처리
+- 설정 이관 결과를 `postgresql_settings.migrated`, `postgresql_settings.skipped`에 기록
 
 주의: old 서버가 18.4인데 `PG_HOME_OLD/bin/pg_dumpall`이 17.4이면 백업이 실패한다.
 스크립트는 이제 `server major`와 `pg_dumpall major`가 다르면 백업 전에 중단한다.

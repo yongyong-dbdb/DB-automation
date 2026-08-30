@@ -10,8 +10,8 @@
 # 자동으로 Bash로 재실행한다.
 # ============================================================
 
-if [ -z "${BASH_VERSION:-}" ]; then
-    exec bash "$0" "$@"
+if [ "${POSTGRESQL_MAJOR_BASH_REEXEC:-0}" != 1 ]; then
+    POSTGRESQL_MAJOR_BASH_REEXEC=1 exec /usr/bin/env bash "$0" "$@"
 fi
 
 set -Eeuo pipefail
@@ -43,6 +43,8 @@ PGPASSWORD="${PGPASSWORD:-}"
 
 JOBS="${JOBS:-}"
 USE_LINK="${USE_LINK:-}"
+PRESERVE_PG_SETTINGS="${PRESERVE_PG_SETTINGS:-}"
+PRESERVE_AUTH_CONFIG="${PRESERVE_AUTH_CONFIG:-}"
 
 BACKUP_DIR="${BACKUP_DIR:-}"
 WORK_DIR="${WORK_DIR:-}"
@@ -283,6 +285,10 @@ load_saved_config() {
     JOBS="${JOBS:-$(config_value JOBS "$UPGRADE_CONFIG_FILE")}"
 
     USE_LINK="${USE_LINK:-$(config_value USE_LINK "$UPGRADE_CONFIG_FILE")}"
+
+    PRESERVE_PG_SETTINGS="${PRESERVE_PG_SETTINGS:-$(config_value PRESERVE_PG_SETTINGS "$UPGRADE_CONFIG_FILE")}"
+
+    PRESERVE_AUTH_CONFIG="${PRESERVE_AUTH_CONFIG:-$(config_value PRESERVE_AUTH_CONFIG "$UPGRADE_CONFIG_FILE")}"
 }
 
 
@@ -306,6 +312,8 @@ PGDATA_NEW=$PGDATA_NEW
 WORK_DIR=$WORK_DIR
 JOBS=$JOBS
 USE_LINK=$USE_LINK
+PRESERVE_PG_SETTINGS=$PRESERVE_PG_SETTINGS
+PRESERVE_AUTH_CONFIG=$PRESERVE_AUTH_CONFIG
 EOF
 
 
@@ -641,6 +649,25 @@ prompt_initial_config() {
         NEW_PORT="$input"
 
     fi
+
+
+    echo
+    printf 'Preserve compatible OLD postgresql.conf settings, including listen_addresses? [Y/n]: '
+    read -r input
+    case "${input,,}" in
+        ""|y|yes) PRESERVE_PG_SETTINGS=true ;;
+        n|no) PRESERVE_PG_SETTINGS=false ;;
+        *) die "invalid selection: $input" ;;
+    esac
+
+
+    printf 'Copy OLD pg_hba.conf and pg_ident.conf as-is after pg_upgrade? [Y/n]: '
+    read -r input
+    case "${input,,}" in
+        ""|y|yes) PRESERVE_AUTH_CONFIG=true ;;
+        n|no) PRESERVE_AUTH_CONFIG=false ;;
+        *) die "invalid selection: $input" ;;
+    esac
 }
 
 
@@ -734,6 +761,10 @@ finalize_config() {
     JOBS="${JOBS:-2}"
 
     USE_LINK="${USE_LINK:-true}"
+
+    PRESERVE_PG_SETTINGS="${PRESERVE_PG_SETTINGS:-true}"
+
+    PRESERVE_AUTH_CONFIG="${PRESERVE_AUTH_CONFIG:-true}"
 
 
     save_config
@@ -1120,6 +1151,21 @@ apply_old_auth_to_new() {
     local new_ident="$PGDATA_NEW/pg_ident.conf"
 
 
+    if [[ "$PRESERVE_AUTH_CONFIG" != true ]]; then
+
+        [[ -f "$PGDATA_NEW/pg_hba.conf.before_pg_upgrade" ]] || \
+            die "NEW default pg_hba.conf backup not found"
+
+        cp -p \
+            "$PGDATA_NEW/pg_hba.conf.before_pg_upgrade" \
+            "$new_hba"
+
+        log "kept NEW default authentication configuration by user selection"
+        return 0
+
+    fi
+
+
     [[ -f "$old_hba" ]] || \
         die "OLD pg_hba.conf not found: $old_hba"
 
@@ -1425,6 +1471,76 @@ set_new_postgresql_conf_port() {
 
 
 # ============================================================
+# Compatible OLD postgresql.conf Settings
+# ============================================================
+
+migrate_compatible_old_settings() {
+    local conf_file="$PGDATA_NEW/postgresql.conf"
+    local marker_begin="# BEGIN postgresql_major_upgrade.sh migrated settings"
+    local marker_end="# END postgresql_major_upgrade.sh migrated settings"
+    local setting_line name
+    local migrated_file="$WORK_DIR/postgresql_settings.migrated"
+    local skipped_file="$WORK_DIR/postgresql_settings.skipped"
+
+    if [[ "$PRESERVE_PG_SETTINGS" != true ]]; then
+        log "kept NEW default postgresql.conf settings by user selection"
+        return 0
+    fi
+
+    [[ -f "$conf_file" ]] || die "NEW postgresql.conf not found: $conf_file"
+    mkdir -p "$WORK_DIR"
+    : > "$migrated_file"
+    : > "$skipped_file"
+
+    while IFS= read -r setting_line; do
+        [[ -n "$setting_line" ]] || continue
+        name="${setting_line%% = *}"
+
+        case "$name" in
+            data_directory|port|hba_file|ident_file|config_file|external_pid_file|ssl_cert_file|ssl_key_file|ssl_ca_file|ssl_crl_file)
+                echo "$setting_line" >> "$skipped_file"
+                continue
+                ;;
+        esac
+
+        if "$PG_HOME_NEW/bin/postgres" \
+            -D "$PGDATA_NEW" \
+            -C "$name" \
+            -c "config_file=$conf_file" \
+            >/dev/null 2>&1; then
+            echo "$setting_line" >> "$migrated_file"
+        else
+            echo "$setting_line" >> "$skipped_file"
+        fi
+    done < <(
+        psql_old_at \
+            "select name || ' = ' || quote_literal(setting) from pg_settings where source = 'configuration file' order by name;"
+    )
+
+    sed -i \
+        "/^$marker_begin$/,/^$marker_end$/d" \
+        "$conf_file"
+
+    {
+        echo
+        echo "$marker_begin"
+        cat "$migrated_file"
+        echo "$marker_end"
+    } >> "$conf_file"
+
+    "$PG_HOME_NEW/bin/postgres" \
+        -D "$PGDATA_NEW" \
+        -C data_directory \
+        -c "config_file=$conf_file" \
+        >/dev/null || die "NEW postgresql.conf validation failed"
+
+    log "compatible OLD postgresql.conf settings migrated"
+    log "  applied : $migrated_file"
+    log "  skipped : $skipped_file"
+}
+
+
+# ============================================================
 # Show Config
 # ============================================================
 
@@ -1444,6 +1560,8 @@ NEW_PORT=$NEW_PORT
 PGUSER_NAME=$PGUSER_NAME
 JOBS=$JOBS
 USE_LINK=$USE_LINK
+PRESERVE_PG_SETTINGS=$PRESERVE_PG_SETTINGS
+PRESERVE_AUTH_CONFIG=$PRESERVE_AUTH_CONFIG
 BACKUP_DIR=$BACKUP_DIR
 WORK_DIR=$WORK_DIR
 BASH_PROFILE=$BASH_PROFILE
@@ -1931,6 +2049,9 @@ initdb_new() {
 
 
     set_new_postgresql_conf_port
+
+
+    migrate_compatible_old_settings
 
 
     log "NEW PostgreSQL cluster initialized successfully"
