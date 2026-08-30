@@ -9,7 +9,8 @@ set -Eeuo pipefail
 BASE="${BASE:-$HOME}"
 PG_HOME_OLD="${PG_HOME_OLD:-${PG_HOME:-${PGHOME:-}}}"
 PG_HOME_NEW="${PG_HOME_NEW:-}"
-PGDATA="${PGDATA:-}"
+PGDATA_OLD="${PGDATA_OLD:-${PGDATA:-}}"
+PGDATA_NEW="${PGDATA_NEW:-}"
 PGPORT="${PGPORT:-${PG_PORT:-}}"
 PGUSER_NAME="${PGUSER_NAME:-postgres}"
 PGPASSWORD="${PGPASSWORD:-}"
@@ -139,8 +140,8 @@ detect_old_environment() {
         PG_HOME_OLD="$profile_value"
     fi
 
-    if [[ -z "$PGDATA" && -f "$BASH_PROFILE" ]]; then
-        PGDATA="$(/usr/bin/env bash --noprofile --norc -c 'source "$1" >/dev/null 2>&1 || true; printf "%s" "${PGDATA:-}"' _ "$BASH_PROFILE")"
+    if [[ -z "$PGDATA_OLD" && -f "$BASH_PROFILE" ]]; then
+        PGDATA_OLD="$(/usr/bin/env bash --noprofile --norc -c 'source "$1" >/dev/null 2>&1 || true; printf "%s" "${PGDATA:-}"' _ "$BASH_PROFILE")"
     fi
 
     if [[ -z "$PGPORT" && -f "$BASH_PROFILE" ]]; then
@@ -148,11 +149,11 @@ detect_old_environment() {
     fi
 
     [[ -n "$PG_HOME_OLD" ]] || die "could not detect PG_HOME_OLD"
-    [[ -n "$PGDATA" ]] || die "could not detect PGDATA"
+    [[ -n "$PGDATA_OLD" ]] || die "could not detect OLD PGDATA"
     [[ -n "$PGPORT" ]] || die "could not detect PGPORT"
     [[ -x "$PG_HOME_OLD/bin/postgres" ]] || die "OLD postgres not found"
     [[ -x "$PG_HOME_OLD/bin/pg_ctl" ]] || die "OLD pg_ctl not found"
-    [[ -f "$PGDATA/PG_VERSION" ]] || die "invalid PGDATA: $PGDATA"
+    [[ -f "$PGDATA_OLD/PG_VERSION" ]] || die "invalid OLD PGDATA: $PGDATA_OLD"
 }
 
 detect_target() {
@@ -200,6 +201,7 @@ detect_target() {
 
     SOURCE_DIR="${SOURCE_DIR:-$BASE/postgresql-$TARGET_VERSION}"
     PG_HOME_NEW="${PG_HOME_NEW:-$BASE/pgsql_$TARGET_VERSION}"
+    PGDATA_NEW="${PGDATA_NEW:-$BASE/data_$TARGET_VERSION}"
 }
 
 load_state() {
@@ -214,7 +216,8 @@ save_state() {
 BASE=$(printf '%q' "$BASE")
 PG_HOME_OLD=$(printf '%q' "$PG_HOME_OLD")
 PG_HOME_NEW=$(printf '%q' "$PG_HOME_NEW")
-PGDATA=$(printf '%q' "$PGDATA")
+PGDATA_OLD=$(printf '%q' "$PGDATA_OLD")
+PGDATA_NEW=$(printf '%q' "$PGDATA_NEW")
 PGPORT=$(printf '%q' "$PGPORT")
 PGUSER_NAME=$(printf '%q' "$PGUSER_NAME")
 TARGET_VERSION=$(printf '%q' "$TARGET_VERSION")
@@ -236,6 +239,7 @@ finalize_config() {
         SOURCE_TAR=""
         SOURCE_DIR=""
         PG_HOME_NEW=""
+        PGDATA_NEW=""
     fi
     detect_target
 
@@ -277,7 +281,7 @@ precheck_server() {
 
     [[ "$binary_version" == "$server_version" ]] || die "OLD binary/server mismatch: $binary_version / $server_version"
 
-    [[ "$(psql_old -d postgres -Atc 'show data_directory')" == "$PGDATA" ]] || die "running data_directory mismatch"
+    [[ "$(psql_old -d postgres -Atc 'show data_directory')" == "$PGDATA_OLD" ]] || die "running data_directory mismatch"
     [[ "$(psql_old -d postgres -Atc 'show port')" == "$PGPORT" ]] || die "running port mismatch"
 
     log "minor upgrade validated: $binary_version -> $TARGET_VERSION"
@@ -440,9 +444,9 @@ check_required_libraries() {
 backup_metadata() {
     local backup_dir="$WORK_DIR/backup_$(date +%Y%m%d_%H%M%S)"
     mkdir -p "$backup_dir"
-    cp -p "$PGDATA/postgresql.conf" "$backup_dir/"
-    [[ ! -f "$PGDATA/pg_hba.conf" ]] || cp -p "$PGDATA/pg_hba.conf" "$backup_dir/"
-    [[ ! -f "$PGDATA/pg_ident.conf" ]] || cp -p "$PGDATA/pg_ident.conf" "$backup_dir/"
+    cp -p "$PGDATA_OLD/postgresql.conf" "$backup_dir/"
+    [[ ! -f "$PGDATA_OLD/pg_hba.conf" ]] || cp -p "$PGDATA_OLD/pg_hba.conf" "$backup_dir/"
+    [[ ! -f "$PGDATA_OLD/pg_ident.conf" ]] || cp -p "$PGDATA_OLD/pg_ident.conf" "$backup_dir/"
     "$PG_HOME_OLD/bin/pg_dumpall" -p "$PGPORT" -U "$PGUSER_NAME" --globals-only > "$backup_dir/globals.sql"
     log "metadata backup saved: $backup_dir"
 }
@@ -459,9 +463,40 @@ prepare() {
     echo "NOTICE: the upgrade step stops PostgreSQL briefly and asks for MINOR UPGRADE confirmation."
 }
 
+prepare_new_data_directory() {
+    local required_kb available_kb safety_kb escaped_data
+
+    [[ "$PGDATA_NEW" != "$PGDATA_OLD" ]] || die "OLD and NEW PGDATA must be different"
+    [[ ! -e "$PGDATA_NEW" ]] || die "NEW PGDATA already exists: $PGDATA_NEW"
+
+    required_kb="$(du -sk "$PGDATA_OLD" | awk '{print $1}')"
+    available_kb="$(df -Pk "$(dirname "$PGDATA_NEW")" | awk 'NR==2 {print $4}')"
+    safety_kb=$((required_kb + required_kb / 10))
+    (( available_kb >= safety_kb )) || \
+        die "insufficient disk space: required=${safety_kb}KB available=${available_kb}KB"
+
+    mkdir -p "$PGDATA_NEW"
+    if ! cp -a "$PGDATA_OLD/." "$PGDATA_NEW/"; then
+        mv "$PGDATA_NEW" "$PGDATA_NEW.copy_failed_$(date +%Y%m%d_%H%M%S)" || true
+        die "failed to copy OLD PGDATA; partial copy was preserved for inspection"
+    fi
+
+    escaped_data="${PGDATA_NEW//\'/\'\'}"
+    cat >> "$PGDATA_NEW/postgresql.conf" <<EOF
+
+# Added by postgresql_minor_upgrade.sh
+data_directory = '$escaped_data'
+# End postgresql_minor_upgrade.sh data_directory
+EOF
+
+    log "OLD PGDATA preserved: $PGDATA_OLD"
+    log "NEW PGDATA copied: $PGDATA_NEW"
+}
+
 start_with_home() {
     local home="$1"
-    "$home/bin/pg_ctl" -w -D "$PGDATA" -l "$WORK_DIR/server.log" -o "-c config_file=$PGDATA/postgresql.conf" start
+    local data="$2"
+    "$home/bin/pg_ctl" -w -D "$data" -l "$WORK_DIR/server.log" -o "-c config_file=$data/postgresql.conf -c data_directory=$data" start
 }
 
 upgrade() {
@@ -469,13 +504,14 @@ upgrade() {
     old_version="$(old_binary_version)"
 
     [[ -x "$PG_HOME_NEW/bin/postgres" ]] || die "run prepare first"
-    confirm "MINOR UPGRADE" "Stop PostgreSQL $old_version and start $TARGET_VERSION with the same PGDATA?"
+    confirm "MINOR UPGRADE" "Stop PostgreSQL $old_version, preserve $PGDATA_OLD, copy it to $PGDATA_NEW, and start $TARGET_VERSION?"
 
-    "$PG_HOME_OLD/bin/pg_ctl" -w -D "$PGDATA" -m fast stop
+    "$PG_HOME_OLD/bin/pg_ctl" -w -D "$PGDATA_OLD" -m fast stop
+    prepare_new_data_directory
 
-    if ! start_with_home "$PG_HOME_NEW"; then
+    if ! start_with_home "$PG_HOME_NEW" "$PGDATA_NEW"; then
         echo "NEW PostgreSQL startup failed; restoring OLD binary startup" >&2
-        start_with_home "$PG_HOME_OLD" || die "automatic rollback startup also failed"
+        start_with_home "$PG_HOME_OLD" "$PGDATA_OLD" || die "automatic rollback startup also failed"
         die "minor upgrade failed and OLD PostgreSQL was restarted"
     fi
 
@@ -505,7 +541,7 @@ postcheck() {
     port="$(psql_new -d postgres -Atc 'show port')"
 
     [[ "$server_version" == "$TARGET_VERSION" ]] || die "server version mismatch: $server_version"
-    [[ "$data_directory" == "$PGDATA" ]] || die "data directory mismatch: $data_directory"
+    [[ "$data_directory" == "$PGDATA_NEW" ]] || die "data directory mismatch: $data_directory"
     [[ "$port" == "$PGPORT" ]] || die "port mismatch: $port"
 
     update_extensions
@@ -523,10 +559,11 @@ comment_profile_lines() {
     local file="$1"
     local marker="$2"
     local tmp="${file}.minor_upgrade.$$"
+    local legacy_home="$BASE/pgsql"
 
-    awk -v marker="$marker" -v old_home="$PG_HOME_OLD" '
+    awk -v marker="$marker" -v old_home="$PG_HOME_OLD" -v legacy_home="$legacy_home" '
         /^[[:space:]]*export[[:space:]]+(PG_HOME|PGHOME|PGDATA|PGPORT|PG_PORT)=/ { print marker " " $0; next }
-        /^[[:space:]]*export[[:space:]]+PATH=/ && (index($0, old_home) || index($0, "$PG_HOME") || index($0, "$PGHOME")) { print marker " " $0; next }
+        /^[[:space:]]*export[[:space:]]+(PATH|LD_LIBRARY_PATH)=/ && (index($0, old_home) || index($0, legacy_home) || index($0, "$PG_HOME") || index($0, "$PGHOME")) { print marker " " $0; next }
         { print }
     ' "$file" > "$tmp"
     chmod --reference="$file" "$tmp"
@@ -555,10 +592,11 @@ update_env() {
 # Added by postgresql_minor_upgrade.sh
 export PG_HOME=$PG_HOME_NEW
 export PGHOME=$PG_HOME_NEW
-export PGDATA=$PGDATA
+export PGDATA=$PGDATA_NEW
 export PGPORT=$PGPORT
 export PG_PORT=$PGPORT
 export PATH=\$PG_HOME/bin:\$PATH
+export LD_LIBRARY_PATH=\$PG_HOME/lib:\${LD_LIBRARY_PATH:-}
 # End postgresql_minor_upgrade.sh
 EOF
 
@@ -574,7 +612,7 @@ Usage:
 
 Steps:
   prepare    Validate, install dependencies, build and precheck while online
-  upgrade    Stop OLD and start NEW binaries with the same PGDATA
+  upgrade    Preserve OLD PGDATA, copy to versioned NEW PGDATA, and start NEW
   postcheck  Validate server and update installed extensions where required
   env        Preserve old profile lines as comments and activate NEW PG_HOME
 

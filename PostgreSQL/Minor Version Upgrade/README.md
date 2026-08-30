@@ -9,7 +9,8 @@ PostgreSQL 소스 tar 파일을 이용해 같은 메이저 버전 안에서 마�
 - 기존 `pg_config --configure` 옵션 계승 및 OpenSSL 기본 활성화
 - PostgreSQL 본체와 `contrib` 빌드·설치, `make check` 수행
 - DB 접속 및 비밀번호를 빌드 전에 검증
-- 같은 `PGDATA`를 신규 바이너리로 기동하며, 기동 실패 시 기존 바이너리 자동 재기동
+- 기존 `data_<OLD_VERSION>`을 보존하고 `data_<NEW_VERSION>`으로 전체 복사한 뒤 신규 바이너리 기동
+- 신규 기동 실패 시 보존된 OLD PGDATA와 기존 바이너리로 자동 재기동
 - 설치된 확장 모듈의 업데이트 필요 여부 확인 및 업데이트
 - 기존 프로필 경로를 주석 처리하고 신규 PostgreSQL 경로 등록
 
@@ -41,7 +42,7 @@ sh minor_upgrade.sh --source-tar /path/to/postgresql-VERSION.tar.gz prepare
 
 ### 2. upgrade
 
-기존 PostgreSQL을 중지하고 같은 `PGDATA`를 신규 바이너리로 시작합니다. 이 단계에서만 서비스 중단이 발생합니다. 진행하려면 화면에 표시된 확인 문구를 정확히 입력해야 합니다.
+기존 PostgreSQL을 중지하고 OLD PGDATA를 그대로 보존한 채 `data_<NEW_VERSION>`으로 전체 복사합니다. 신규 바이너리는 복사된 NEW PGDATA로 시작합니다. 복사 전 데이터 크기와 여유 공간을 확인하고 약 10%의 안전 여유를 요구합니다. 이 단계에서만 서비스 중단이 발생하며, 진행하려면 화면에 표시된 확인 문구를 정확히 입력해야 합니다.
 
 ### 3. postcheck
 
@@ -59,7 +60,8 @@ sh minor_upgrade.sh --source-tar /path/to/postgresql-VERSION.tar.gz prepare
 
 - `BASE`: PostgreSQL 소스와 설치 경로의 기준 디렉터리
 - `PG_HOME_OLD`: 현재 PostgreSQL 바이너리 경로
-- `PGDATA`: 데이터 디렉터리
+- `PGDATA_OLD`: 보존할 기존 데이터 디렉터리. 미지정 시 현재 `PGDATA` 사용
+- `PGDATA_NEW`: 신규 데이터 디렉터리. 기본값 `data_<NEW_VERSION>`
 - `PGPORT`: PostgreSQL 포트
 - `PGUSER_NAME`: 관리 사용자명, 기본값 `postgres`
 - `JOBS`: 병렬 빌드 작업 수

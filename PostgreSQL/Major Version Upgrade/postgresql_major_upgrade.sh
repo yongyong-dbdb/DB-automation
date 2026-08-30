@@ -2843,16 +2843,18 @@ update_env() {
 
         awk \
             -v marker="$disabled_marker" \
-            -v old_home="$PG_HOME_OLD" '
+            -v old_home="$PG_HOME_OLD" \
+            -v legacy_home="$BASE/pgsql" '
             function is_pg_export(line) {
                 return line ~ /^[[:space:]]*export[[:space:]]+(PG_HOME|PGHOME|PGDATA|PGPORT|PG_PORT)=/
             }
 
             function is_pg_path(line) {
-                if (line !~ /^[[:space:]]*export[[:space:]]+PATH=/)
+                if (line !~ /^[[:space:]]*export[[:space:]]+(PATH|LD_LIBRARY_PATH)=/)
                     return 0
 
                 return index(line, old_home) > 0 ||
+                       index(line, legacy_home) > 0 ||
                        index(line, "$PG_HOME") > 0 ||
                        index(line, "${PG_HOME}") > 0 ||
                        index(line, "$PGHOME") > 0 ||
@@ -2889,6 +2891,7 @@ export PGDATA=$PGDATA_NEW
 export PGPORT=$NEW_PORT
 export PG_PORT=$NEW_PORT
 export PATH=\$PG_HOME/bin:\$PATH
+export LD_LIBRARY_PATH=\$PG_HOME/lib:\${LD_LIBRARY_PATH:-}
 # End postgresql_major_upgrade.sh
 EOF
 
