@@ -614,7 +614,7 @@ prompt_initial_config() {
 
     else
 
-        printf 'Enter new PostgreSQL version, for example 15.9: '
+        printf 'Enter new PostgreSQL version: '
 
     fi
 
@@ -699,7 +699,7 @@ finalize_config() {
 
     if [[ -z "$PG_NEW_VERSION" ]]; then
 
-        printf 'Enter new PostgreSQL version, for example 15.9: '
+        printf 'Enter new PostgreSQL version: '
 
         read -r PG_NEW_VERSION
 
@@ -740,10 +740,10 @@ finalize_config() {
     #
     # NEW 경로는 전체 Version을 사용한다.
     #
-    # 15.9
+    # <NEW_VERSION>
     #
-    #   PG_HOME_NEW=/home/sherpa/pgsql_15.9
-    #   PGDATA_NEW=/home/sherpa/data_15.9
+    #   PG_HOME_NEW=$BASE/pgsql_<NEW_VERSION>
+    #   PGDATA_NEW=$BASE/data_<NEW_VERSION>
     #
 
     SRC_TAR="${SRC_TAR:-$BASE/postgresql-$PG_NEW_VERSION.tar.gz}"
@@ -3139,7 +3139,7 @@ Typical:
 
 Example:
 
-  sh $0 --old-port 5432 prepare
+  sh $0 --old-port PORT prepare
 EOF
 }
 
