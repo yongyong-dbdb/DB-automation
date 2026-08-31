@@ -1540,6 +1540,38 @@ migrate_compatible_old_settings() {
 }
 
 
+verify_migrated_settings() {
+    local migrated_file="$WORK_DIR/postgresql_settings.migrated"
+    local actual_file="$WORK_DIR/postgresql_settings.actual"
+    local setting_line
+    local failed=0
+
+    [[ "$PRESERVE_PG_SETTINGS" == true ]] || return 0
+    [[ -f "$migrated_file" ]] || die "migrated PostgreSQL settings file not found: $migrated_file"
+
+    "$PG_HOME_NEW/bin/psql" \
+        -X -A -t -v ON_ERROR_STOP=1 \
+        -p "$NEW_PORT" \
+        -U "$PGUSER_NAME" \
+        -d postgres \
+        -c "select name || ' = ' || quote_literal(setting) from pg_settings where source = 'configuration file' order by name;" \
+        > "$actual_file"
+
+    while IFS= read -r setting_line; do
+        [[ -n "$setting_line" ]] || continue
+        if ! grep -Fqx "$setting_line" "$actual_file"; then
+            echo "Migrated setting mismatch: $setting_line" >&2
+            failed=1
+        fi
+    done < "$migrated_file"
+
+    (( failed == 0 )) || die "one or more migrated PostgreSQL settings are not active"
+    log "all compatible OLD PostgreSQL settings are active on NEW PostgreSQL"
+    log "  expected: $migrated_file"
+    log "  actual  : $actual_file"
+}
+
+
 # ============================================================
 # Show Config
 # ============================================================
@@ -2728,6 +2760,9 @@ postcheck() {
         -U "$PGUSER_NAME" \
         -d postgres \
         -c "show data_checksums;"
+
+
+    verify_migrated_settings
 
 
     "$PG_HOME_NEW/bin/psql" \
