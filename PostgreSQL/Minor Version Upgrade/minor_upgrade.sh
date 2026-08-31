@@ -445,12 +445,25 @@ check_required_libraries() {
 
 backup_metadata() {
     local backup_dir="$WORK_DIR/backup_$(date +%Y%m%d_%H%M%S)"
+    local settings_file="$WORK_DIR/postgresql_settings.before"
     mkdir -p "$backup_dir"
     cp -p "$PGDATA_OLD/postgresql.conf" "$backup_dir/"
     [[ ! -f "$PGDATA_OLD/pg_hba.conf" ]] || cp -p "$PGDATA_OLD/pg_hba.conf" "$backup_dir/"
     [[ ! -f "$PGDATA_OLD/pg_ident.conf" ]] || cp -p "$PGDATA_OLD/pg_ident.conf" "$backup_dir/"
     "$PG_HOME_OLD/bin/pg_dumpall" -p "$PGPORT" -U "$PGUSER_NAME" --globals-only > "$backup_dir/globals.sql"
+    psql_old -d postgres -A -t -c "
+        select name || ' = ' || quote_literal(setting)
+        from pg_settings
+        where source = 'configuration file'
+          and name not in (
+              'data_directory', 'config_file', 'hba_file', 'ident_file',
+              'external_pid_file', 'ssl_cert_file', 'ssl_key_file',
+              'ssl_ca_file', 'ssl_crl_file'
+          )
+        order by name;
+    " > "$settings_file"
     log "metadata backup saved: $backup_dir"
+    log "active PostgreSQL settings saved: $settings_file"
 }
 
 prepare() {
@@ -528,6 +541,8 @@ update_extensions() {
 
 postcheck() {
     local server_version data_directory port
+    local settings_before="$WORK_DIR/postgresql_settings.before"
+    local settings_after="$WORK_DIR/postgresql_settings.after"
 
     ensure_password
     server_version="$(psql_new -d postgres -Atc 'show server_version')"
@@ -537,6 +552,27 @@ postcheck() {
     [[ "$server_version" == "$TARGET_VERSION" ]] || die "server version mismatch: $server_version"
     [[ "$data_directory" == "$PGDATA_NEW" ]] || die "data directory mismatch: $data_directory"
     [[ "$port" == "$PGPORT" ]] || die "port mismatch: $port"
+
+    [[ -f "$settings_before" ]] || die "OLD PostgreSQL settings snapshot not found: $settings_before"
+    psql_new -d postgres -A -t -c "
+        select name || ' = ' || quote_literal(setting)
+        from pg_settings
+        where source = 'configuration file'
+          and name not in (
+              'data_directory', 'config_file', 'hba_file', 'ident_file',
+              'external_pid_file', 'ssl_cert_file', 'ssl_key_file',
+              'ssl_ca_file', 'ssl_crl_file'
+          )
+        order by name;
+    " > "$settings_after"
+
+    if ! diff -u "$settings_before" "$settings_after"; then
+        die "PostgreSQL configuration values changed during minor upgrade"
+    fi
+
+    log "OLD PostgreSQL configuration values preserved"
+    log "  before: $settings_before"
+    log "  after : $settings_after"
 
     update_extensions
 
