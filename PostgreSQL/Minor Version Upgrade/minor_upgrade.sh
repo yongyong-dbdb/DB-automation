@@ -728,10 +728,16 @@ Typical:
 EOF
 }
 
-load_state
+parse_args "$@"
+
+case "$STEP" in
+    upgrade|postcheck|env)
+        load_state
+        ;;
+esac
+
 [[ "$TARGET_VERSION_EXPLICIT" != true ]] || TARGET_VERSION="$TARGET_VERSION_INPUT"
 [[ "$SOURCE_TAR_EXPLICIT" != true ]] || SOURCE_TAR="$SOURCE_TAR_INPUT"
-parse_args "$@"
 
 case "$STEP" in
     help) usage ;;
