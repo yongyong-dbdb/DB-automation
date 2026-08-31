@@ -201,7 +201,9 @@ detect_target() {
 
     SOURCE_DIR="${SOURCE_DIR:-$BASE/postgresql-$TARGET_VERSION}"
     PG_HOME_NEW="${PG_HOME_NEW:-$BASE/pgsql_$TARGET_VERSION}"
-    PGDATA_NEW="${PGDATA_NEW:-$BASE/data_$TARGET_VERSION}"
+    if [[ -z "$PGDATA_NEW" || "$PGDATA_NEW" == "$BASE/data_$TARGET_VERSION" ]]; then
+        PGDATA_NEW="$PG_HOME_NEW/data"
+    fi
 }
 
 load_state() {
@@ -464,7 +466,7 @@ prepare() {
 }
 
 prepare_new_data_directory() {
-    local required_kb available_kb safety_kb escaped_data
+    local required_kb available_kb safety_kb
 
     [[ "$PGDATA_NEW" != "$PGDATA_OLD" ]] || die "OLD and NEW PGDATA must be different"
     [[ ! -e "$PGDATA_NEW" ]] || die "NEW PGDATA already exists: $PGDATA_NEW"
@@ -480,14 +482,6 @@ prepare_new_data_directory() {
         mv "$PGDATA_NEW" "$PGDATA_NEW.copy_failed_$(date +%Y%m%d_%H%M%S)" || true
         die "failed to copy OLD PGDATA; partial copy was preserved for inspection"
     fi
-
-    escaped_data="${PGDATA_NEW//\'/\'\'}"
-    cat >> "$PGDATA_NEW/postgresql.conf" <<EOF
-
-# Added by postgresql_minor_upgrade.sh
-data_directory = '$escaped_data'
-# End postgresql_minor_upgrade.sh data_directory
-EOF
 
     log "OLD PGDATA preserved: $PGDATA_OLD"
     log "NEW PGDATA copied: $PGDATA_NEW"
