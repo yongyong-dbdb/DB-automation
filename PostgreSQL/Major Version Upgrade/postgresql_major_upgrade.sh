@@ -743,7 +743,7 @@ finalize_config() {
     # <NEW_VERSION>
     #
     #   PG_HOME_NEW=$BASE/pgsql_<NEW_VERSION>
-    #   PGDATA_NEW=$BASE/data_<NEW_VERSION>
+    #   PGDATA_NEW=$BASE/pgsql_<NEW_VERSION>/data
     #
 
     SRC_TAR="${SRC_TAR:-$BASE/postgresql-$PG_NEW_VERSION.tar.gz}"
@@ -752,7 +752,7 @@ finalize_config() {
 
     PG_HOME_NEW="${PG_HOME_NEW:-$BASE/pgsql_$PG_NEW_VERSION}"
 
-    PGDATA_NEW="${PGDATA_NEW:-$BASE/data_$PG_NEW_VERSION}"
+    PGDATA_NEW="${PGDATA_NEW:-$PG_HOME_NEW/data}"
 
     WORK_DIR="${WORK_DIR:-$BASE/pg_upgrade_work_$PG_NEW_VERSION}"
 
@@ -2779,11 +2779,13 @@ archive_old_postgresql_directories() {
 
     local old_home_archive
 
-    local old_data_archive
-
     local old_home_real
 
     local old_data_real
+
+    local old_data_relative
+
+    local archived_data_path
 
 
     old_version="$(
@@ -2797,27 +2799,22 @@ archive_old_postgresql_directories() {
 
     old_home_archive="$BASE/pgsql_$old_version"
 
-    old_data_archive="$BASE/data_$old_version"
-
 
     [[ "$old_home_archive" != "$PG_HOME_NEW" ]] || \
         die "OLD PG_HOME archive conflicts with NEW PG_HOME: $old_home_archive"
 
 
-    [[ "$old_data_archive" != "$PGDATA_NEW" ]] || \
-        die "OLD PGDATA archive conflicts with NEW PGDATA: $old_data_archive"
-
-
     if [[ ! -e "$PG_HOME_OLD" &&
           ! -e "$PGDATA_OLD" &&
-          -d "$old_home_archive" &&
-          -d "$old_data_archive" ]]; then
+          -d "$old_home_archive" ]]; then
 
-        log "OLD PostgreSQL directories already archived"
+        log "OLD PostgreSQL directory already archived"
 
         log "  PG_HOME : $old_home_archive"
 
-        log "  PGDATA  : $old_data_archive"
+        if [[ -d "$old_home_archive/data" ]]; then
+            log "  PGDATA  : $old_home_archive/data"
+        fi
 
         return 0
 
@@ -2862,10 +2859,6 @@ archive_old_postgresql_directories() {
         die "OLD PG_HOME archive target already exists: $old_home_archive"
 
 
-    [[ ! -e "$old_data_archive" ]] || \
-        die "OLD PGDATA archive target already exists: $old_data_archive"
-
-
     old_home_real="$(readlink -f "$PG_HOME_OLD")"
 
     old_data_real="$(readlink -f "$PGDATA_OLD")"
@@ -2875,12 +2868,9 @@ archive_old_postgresql_directories() {
 
         "$old_home_real"/*)
 
-            mv \
-                "$PGDATA_OLD" \
-                "$old_data_archive"
+            old_data_relative="${old_data_real#"$old_home_real"/}"
 
-
-            log "archived OLD PGDATA: $old_data_archive"
+            archived_data_path="$old_home_archive/$old_data_relative"
 
 
             mv \
@@ -2889,6 +2879,8 @@ archive_old_postgresql_directories() {
 
 
             log "archived OLD PG_HOME: $old_home_archive"
+
+            log "archived OLD PGDATA: $archived_data_path"
             ;;
 
 
@@ -2902,12 +2894,16 @@ archive_old_postgresql_directories() {
             log "archived OLD PG_HOME: $old_home_archive"
 
 
+            [[ ! -e "$old_home_archive/data" ]] || \
+                die "OLD PGDATA archive target already exists: $old_home_archive/data"
+
+
             mv \
                 "$PGDATA_OLD" \
-                "$old_data_archive"
+                "$old_home_archive/data"
 
 
-            log "archived OLD PGDATA: $old_data_archive"
+            log "archived OLD PGDATA: $old_home_archive/data"
             ;;
 
     esac
