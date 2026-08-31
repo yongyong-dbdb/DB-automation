@@ -2914,20 +2914,117 @@ archive_old_postgresql_directories() {
 }
 
 
+rewrite_profile_file() {
+    local shell_file="$1"
+    local activate_new="$2"
+    local tmp_file="${shell_file}.postgresql_major_upgrade.$$"
+
+    awk \
+        -v activate="$activate_new" \
+        -v old_home="$PG_HOME_OLD" \
+        -v new_home="$PG_HOME_NEW" \
+        -v new_data="$PGDATA_NEW" \
+        -v new_port="$NEW_PORT" \
+        -v legacy_home="$BASE/pgsql" '
+        function variable_name(line, value) {
+            value = line
+            sub(/^[[:space:]]*export[[:space:]]+/, "", value)
+            sub(/=.*/, "", value)
+            return value
+        }
+
+        function expected_line(name) {
+            if (name == "PG_HOME" || name == "PGHOME") return "export " name "=" new_home
+            if (name == "PGDATA") return "export PGDATA=" new_data
+            if (name == "PGPORT" || name == "PG_PORT") return "export " name "=" new_port
+            return ""
+        }
+
+        function is_pg_export(line) {
+            return line ~ /^[[:space:]]*export[[:space:]]+(PG_HOME|PGHOME|PGDATA|PGPORT|PG_PORT)=/
+        }
+
+        { source[NR] = $0 }
+
+        END {
+            for (i = 1; i <= NR; i++) {
+                if (is_pg_export(source[i])) {
+                    name = variable_name(source[i])
+                    if (source[i] == expected_line(name)) correct[name] = 1
+                }
+            }
+
+            for (i = 1; i <= NR; i++) {
+                line = source[i]
+
+                if (line ~ /^[[:space:]]*#[[:space:]]*Disabled by postgresql_(major|minor)_upgrade[.]sh .*:[[:space:]]*export[[:space:]]+(PG_HOME|PGHOME|PGDATA|PGPORT|PG_PORT)=/) {
+                    sub(/^[[:space:]]*#[[:space:]]*Disabled by postgresql_(major|minor)_upgrade[.]sh .*:[[:space:]]*/, "# ", line)
+                    print line
+                    name = line
+                    sub(/^[[:space:]]*#[[:space:]]*export[[:space:]]+/, "", name)
+                    sub(/=.*/, "", name)
+                    if (activate == "true" && !correct[name] && !active[name]) {
+                        print expected_line(name)
+                        active[name] = 1
+                    }
+                    continue
+                }
+
+                if (is_pg_export(line)) {
+                    name = variable_name(line)
+                    expected = expected_line(name)
+
+                    if (activate == "true" && line == expected && !active[name]) {
+                        print line
+                        active[name] = 1
+                    } else {
+                        print "# " line
+                        if (activate == "true" && !active[name]) {
+                            print expected
+                            active[name] = 1
+                        }
+                    }
+                    continue
+                }
+
+                if (line ~ /^[[:space:]]*export[[:space:]]+PATH=/) {
+                    gsub(old_home "/bin", new_home "/bin", line)
+                    gsub(legacy_home "/bin", new_home "/bin", line)
+                    print line
+                    continue
+                }
+
+                if (line ~ /^[[:space:]]*export[[:space:]]+LD_LIBRARY_PATH=/) {
+                    gsub(old_home "/lib", new_home "/lib", line)
+                    gsub(legacy_home "/lib", new_home "/lib", line)
+                    print line
+                    continue
+                }
+
+                print line
+            }
+
+            if (activate == "true") {
+                split("PG_HOME PGHOME PGDATA PGPORT PG_PORT", required, " ")
+                for (i = 1; i <= 5; i++) {
+                    name = required[i]
+                    if (!active[name]) print expected_line(name)
+                }
+            }
+        }
+    ' "$shell_file" > "$tmp_file"
+
+    chmod --reference="$shell_file" "$tmp_file"
+    mv "$tmp_file" "$shell_file"
+}
+
+
 update_env() {
     local shell_file
-
     local backup_suffix
-
-    local disabled_marker
-
-    local tmp_file
 
 
     backup_suffix="before_pg${PG_NEW_VERSION}_upgrade_$(date +%Y%m%d_%H%M%S)"
-
-    disabled_marker="# Disabled by postgresql_major_upgrade.sh $backup_suffix:"
-
 
     archive_old_postgresql_directories
 
@@ -2958,61 +3055,17 @@ update_env() {
             '/# Added by postgresql_major_upgrade.sh/,/# End postgresql_major_upgrade.sh/d' \
             "$shell_file"
 
-
-        tmp_file="${shell_file}.postgresql_major_upgrade.$$"
-
-
-        awk \
-            -v marker="$disabled_marker" \
-            -v old_home="$PG_HOME_OLD" \
-            -v new_home="$PG_HOME_NEW" \
-            -v legacy_home="$BASE/pgsql" '
-            function is_pg_export(line) {
-                return line ~ /^[[:space:]]*export[[:space:]]+(PG_HOME|PGHOME|PGDATA|PGPORT|PG_PORT)=/
-            }
-
-            {
-                if (is_pg_export($0)) {
-                    print marker " " $0
-                } else if ($0 ~ /^[[:space:]]*export[[:space:]]+PATH=/) {
-                    gsub(old_home "/bin", new_home "/bin")
-                    gsub(legacy_home "/bin", new_home "/bin")
-                    print
-                } else if ($0 ~ /^[[:space:]]*export[[:space:]]+LD_LIBRARY_PATH=/) {
-                    gsub(old_home "/lib", new_home "/lib")
-                    gsub(legacy_home "/lib", new_home "/lib")
-                    print
-                } else {
-                    print
-                }
-            }
-        ' "$shell_file" > "$tmp_file"
-
-
-        chmod \
-            --reference="$shell_file" \
-            "$tmp_file"
-
-
-        mv \
-            "$tmp_file" \
+        sed -i \
+            '/# Added by postgresql_minor_upgrade.sh/,/# End postgresql_minor_upgrade.sh/d' \
             "$shell_file"
 
+        if [[ "$shell_file" == "$BASH_PROFILE" ]]; then
+            rewrite_profile_file "$shell_file" true
+        else
+            rewrite_profile_file "$shell_file" false
+        fi
+
     done
-
-
-    cat >> "$BASH_PROFILE" <<EOF
-
-# Added by postgresql_major_upgrade.sh
-export PG_HOME=$PG_HOME_NEW
-export PGHOME=$PG_HOME_NEW
-export PGDATA=$PGDATA_NEW
-export PGPORT=$NEW_PORT
-export PG_PORT=$NEW_PORT
-case ":\$PATH:" in *":\$PG_HOME/bin:"*) ;; *) export PATH=\$PG_HOME/bin:\$PATH ;; esac
-case ":\${LD_LIBRARY_PATH:-}:" in *":\$PG_HOME/lib:"*) ;; *) export LD_LIBRARY_PATH=\$PG_HOME/lib:\${LD_LIBRARY_PATH:-} ;; esac
-# End postgresql_major_upgrade.sh
-EOF
 
 
     log "updated $BASH_PROFILE"
