@@ -400,14 +400,25 @@ configure_args() {
 
 build_new() {
     local args=()
+    local source_path base_path
 
     check_dependencies
 
-    if [[ ! -x "$SOURCE_DIR/configure" ]]; then
+    if [[ ! -x "$SOURCE_DIR/configure" || ! -f "$SOURCE_DIR/GNUmakefile.in" ]]; then
         [[ ! -e "$SOURCE_DIR" || -d "$SOURCE_DIR" ]] || die "source path is not a directory: $SOURCE_DIR"
+        if [[ -e "$SOURCE_DIR" || -L "$SOURCE_DIR" ]]; then
+            base_path="$(cd -- "$BASE" && pwd -P)" || die "cannot resolve BASE: $BASE"
+            source_path="$(readlink -m -- "$SOURCE_DIR")" || die "cannot resolve SOURCE_DIR: $SOURCE_DIR"
+            [[ "$TARGET_VERSION" =~ ^[0-9]+([.][0-9]+)+$ &&
+               "$source_path" == "${base_path%/}/postgresql-$TARGET_VERSION" &&
+               ! -L "${SOURCE_DIR%/}" ]] || die "unsafe source removal path: $SOURCE_DIR"
+            log "removing incomplete source directory: $source_path"
+            rm -rf -- "$source_path" || die "failed to remove incomplete source directory: $source_path"
+        fi
         tar -xf "$SOURCE_TAR" -C "$BASE"
     fi
     [[ -x "$SOURCE_DIR/configure" ]] || die "source extraction failed: $SOURCE_DIR/configure not found"
+    [[ -f "$SOURCE_DIR/GNUmakefile.in" ]] || die "source extraction failed: $SOURCE_DIR/GNUmakefile.in not found"
 
     cd "$SOURCE_DIR"
     [[ ! -f config.status ]] || make distclean
