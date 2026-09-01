@@ -6,7 +6,7 @@ fi
 
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.0.1"
 STEP=""
 BASE="${BASE:-/home/mysql}"
 BUNDLE_TAR="${BUNDLE_TAR:-}"
@@ -21,6 +21,7 @@ BACKUP_ROOT="${BACKUP_ROOT:-}"
 STATE_FILE="${STATE_FILE:-}"
 LOG_DIR="${LOG_DIR:-}"
 ALLOW_UNVERIFIED_PATH="${ALLOW_UNVERIFIED_PATH:-false}"
+ALLOW_REPLICATION_TOPOLOGY="${ALLOW_REPLICATION_TOPOLOGY:-false}"
 SKIP_PHYSICAL_BACKUP="${SKIP_PHYSICAL_BACKUP:-false}"
 DRY_RUN="${DRY_RUN:-false}"
 CURRENT_VERSION="${CURRENT_VERSION:-}"
@@ -65,6 +66,8 @@ Options:
   --backup-root PATH        Backup parent directory.
   --work-dir PATH           RPM extraction and metadata directory.
   --allow-unverified-path   Permit a path not in the built-in safe matrix.
+  --allow-replication-topology
+                            Permit execution when replication/Group Replication is detected.
   --skip-physical-backup    Skip physical backup. Not recommended.
   --dry-run                 Print mutating commands without executing them.
   --version                 Print script version.
@@ -205,6 +208,7 @@ parse_args() {
                 ;;
             --work-dir=*) WORK_DIR="${1#*=}"; shift ;;
             --allow-unverified-path) ALLOW_UNVERIFIED_PATH=true; shift ;;
+            --allow-replication-topology) ALLOW_REPLICATION_TOPOLOGY=true; shift ;;
             --skip-physical-backup) SKIP_PHYSICAL_BACKUP=true; shift ;;
             --dry-run) DRY_RUN=true; shift ;;
             --version) printf '%s\n' "$SCRIPT_VERSION"; exit 0 ;;
@@ -233,6 +237,7 @@ init_paths() {
     [[ -z "$BUNDLE_TAR" ]] || BUNDLE_TAR="$(absolute_path "$BUNDLE_TAR")"
     [[ -z "$OLD_BUNDLE_TAR" ]] || OLD_BUNDLE_TAR="$(absolute_path "$OLD_BUNDLE_TAR")"
     ALLOW_UNVERIFIED_PATH="$(bool_value "$ALLOW_UNVERIFIED_PATH")"
+    ALLOW_REPLICATION_TOPOLOGY="$(bool_value "$ALLOW_REPLICATION_TOPOLOGY")"
     SKIP_PHYSICAL_BACKUP="$(bool_value "$SKIP_PHYSICAL_BACKUP")"
     DRY_RUN="$(bool_value "$DRY_RUN")"
 }
@@ -351,6 +356,7 @@ load_defaults_value() {
 }
 
 detect_paths() {
+    local resolved_datadir resolved_backup
     [[ -f "$MYSQL_CNF" ]] || die "MySQL config not found: $MYSQL_CNF"
     DATADIR="${DATADIR:-$(load_defaults_value mysqld datadir)}"
     MYSQL_SOCKET="${MYSQL_SOCKET:-$(load_defaults_value mysqld socket)}"
@@ -362,6 +368,11 @@ detect_paths() {
     PID_FILE="${PID_FILE:-/var/run/mysqld/mysqld.pid}"
     [[ "$DATADIR" == /* ]] || die "datadir must be an absolute path: $DATADIR"
     [[ -d "$DATADIR" ]] || die "datadir not found: $DATADIR"
+    [[ -f "$DATADIR/auto.cnf" ]] || die "MySQL auto.cnf not found in datadir: $DATADIR"
+    [[ -d "$DATADIR/mysql" ]] || die "mysql system schema directory not found in datadir: $DATADIR/mysql"
+    resolved_datadir="$(readlink -m -- "$DATADIR")"
+    resolved_backup="$(readlink -m -- "$BACKUP_ROOT")"
+    [[ "$resolved_backup" != "$resolved_datadir" && "$resolved_backup" != "$resolved_datadir"/* ]] || die "backup root must not be inside datadir: $BACKUP_ROOT"
 }
 
 create_mysql_login_file() {
@@ -402,6 +413,32 @@ validate_sql_access() {
     local result
     result="$(mysql_query_value 'SELECT 1;')" || die "MySQL SQL connection failed"
     [[ "$result" == "1" ]] || die "unexpected SQL validation result: $result"
+}
+
+check_mysql_topology() {
+    local async_channels group_members
+    async_channels="$(mysql_query_value 'SELECT COUNT(*) FROM performance_schema.replication_connection_configuration;')"
+    group_members="$(mysql_query_value 'SELECT COUNT(*) FROM performance_schema.replication_group_members;')"
+    [[ "$async_channels" =~ ^[0-9]+$ ]] || die "could not determine asynchronous replication topology"
+    [[ "$group_members" =~ ^[0-9]+$ ]] || die "could not determine Group Replication topology"
+
+    if (( async_channels > 0 || group_members > 0 )); then
+        if [[ "$ALLOW_REPLICATION_TOPOLOGY" == "true" ]]; then
+            warn "replication topology detected and explicitly allowed: channels=$async_channels group_members=$group_members"
+            warn "single-server execution does not implement rolling topology orchestration"
+        else
+            die "replication topology detected: channels=$async_channels group_members=$group_members; use a topology-specific rolling upgrade plan"
+        fi
+    else
+        log "single-server topology check passed"
+    fi
+}
+
+check_prepared_xa() {
+    local xa_output
+    xa_output="$(mysql_query 'XA RECOVER;' || true)"
+    [[ -z "$xa_output" ]] || die "prepared XA transactions exist; resolve them before upgrade"
+    log "no prepared XA transactions detected"
 }
 
 validate_path() {
@@ -532,6 +569,7 @@ save_state() {
         printf 'STATE_FILE=%q\n' "$STATE_FILE"
         printf 'LOG_DIR=%q\n' "$LOG_DIR"
         printf 'ALLOW_UNVERIFIED_PATH=%q\n' "$ALLOW_UNVERIFIED_PATH"
+        printf 'ALLOW_REPLICATION_TOPOLOGY=%q\n' "$ALLOW_REPLICATION_TOPOLOGY"
         printf 'SKIP_PHYSICAL_BACKUP=%q\n' "$SKIP_PHYSICAL_BACKUP"
         printf 'CURRENT_VERSION=%q\n' "$CURRENT_VERSION"
         printf 'TARGET_VERSION=%q\n' "$TARGET_VERSION"
@@ -584,6 +622,8 @@ do_precheck() {
     validate_bundle_contents "$BUNDLE_TAR" "$TARGET_VERSION"
     check_service
     validate_sql_access
+    check_mysql_topology
+    check_prepared_xa
     mysqlcheck --defaults-extra-file="$MYSQL_LOGIN_FILE" --all-databases --check-upgrade
     if command -v mysqlsh >/dev/null 2>&1; then
         log "mysqlsh detected; run Upgrade Checker for target $TARGET_VERSION and archive its result before upgrade"
