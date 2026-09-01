@@ -5,7 +5,7 @@
 
 set -u
 
-SCRIPT_VERSION="1.0.2"
+SCRIPT_VERSION="1.0.3"
 SERVICE_NAME="mysqld"
 CONFIG_FILE="/etc/my.cnf"
 WORK_ROOT=""
@@ -133,7 +133,8 @@ collect_inputs() {
     [ -n "$LOG_ERROR" ] || LOG_ERROR=$(mysql_cmd -NBe "SELECT @@log_error" 2>/dev/null || true)
     OS_SERVICE_USER=$(stat -c '%U' "$DATADIR") || die "datadir 소유자 조회 실패"
     OS_SERVICE_GROUP=$(stat -c '%G' "$DATADIR") || die "datadir 그룹 조회 실패"
-    WORK_ROOT=$(prompt_default "작업 및 백업 상위 경로" "$(dirname "$DATADIR")/mysql_upgrade")
+    printf '%s\n' '' '업그레이드 결과 및 백업 저장 경로' '  - Upgrade Checker, 로그, 사전/사후 상태, Logical/Physical Backup 저장' '  - RPM Bundle 또는 RPM 파일 경로는 다음 Package Source 단계에서 별도 입력' >&2
+    WORK_ROOT=$(prompt_default "결과 및 백업 저장 상위 경로" "$(dirname "$DATADIR")/mysql_upgrade")
     _data_real=$(readlink -f "$DATADIR") || die "datadir 실제 경로 확인 실패"
     _work_real=$(readlink -m "$WORK_ROOT") || die "작업 경로 확인 실패"
     case "$_work_real/" in "$_data_real"/*) die "작업 경로를 datadir 내부에 지정할 수 없음" ;; esac

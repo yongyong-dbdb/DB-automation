@@ -25,7 +25,7 @@ sh upgrade.sh
 - systemd service 자동 감지 (`mysqld`, 기본 unit이 없을 때만 직접 입력)
 - MySQL 접속용 DB 관리자 계정(OS 서비스 계정과 별개)
 - Unix Socket 또는 TCP/IP 접속 정보
-- 작업 및 백업 경로
+- 업그레이드 결과 및 백업 저장 경로(RPM Package Source 경로와 별개)
 - Package Source
 - Backup Method
 - RPM GPG signature 검증 여부
