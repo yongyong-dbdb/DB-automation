@@ -58,6 +58,8 @@ RPM Bundle 디렉터리에서 Bundle 1개 발견 시 자동 선택, 여러 개 �
 ## 주요 안전 검사
 
 - Upgrade Checker Utility의 `Errors: 0` 확인
+- Upgrade Checker Error 발생 시 원문 전체 출력 후 중단
+- Error가 없으면 Warning/Notice 검사명·설명·영향 대상 요약 출력, 전체 원문은 결과 파일로 보존
 - `mysqlcheck --all-databases --check-upgrade`
 - Native Partitioning 미지원 Storage Engine 검사
 - Logical/Physical Backup 완료 및 SHA-256 생성
@@ -69,6 +71,10 @@ RPM Bundle 디렉터리에서 Bundle 1개 발견 시 자동 선택, 여러 개 �
 - 새 `mysqld --validate-config` 통과 전 서비스 기동 차단
 - datadir 경로 및 소유권 변경 검사
 - 첫 기동 후 실행 버전, `mysqlcheck`, RPM, 스키마·계정·플러그인 상태 저장
+- 첫 기동 후 `basedir`, `datadir`, `port`, `socket`, `server_id`를 업그레이드 전 기준값과 자동 비교
+- 최종 결과를 Package Upgrade, Automatic Upgrade, Post-upgrade Validation 상태로 분리
+- 런타임 값 변경은 실패 처리하지 않고 ASIS·TOBE 값과 `REVIEW`를 출력하여 사용자 조치 대상으로 표시
+- `mysqlcheck` 사후 검증 실패 시 서비스 자동 종료·자동 Rollback 없이 실패 종료코드와 보고서 제공
 
 ## 결과 경로
 

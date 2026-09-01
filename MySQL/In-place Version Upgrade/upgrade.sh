@@ -5,7 +5,7 @@
 
 set -u
 
-SCRIPT_VERSION="1.0.4"
+SCRIPT_VERSION="1.0.6"
 SERVICE_NAME="mysqld"
 CONFIG_FILE="/etc/my.cnf"
 WORK_ROOT=""
@@ -19,6 +19,11 @@ PACKAGE_SOURCE=""
 PACKAGE_PATH=""
 TARGET_VERSION=""
 CURRENT_VERSION=""
+BEFORE_BASEDIR=""
+BEFORE_DATADIR=""
+BEFORE_PORT=""
+BEFORE_SOCKET=""
+BEFORE_SERVER_ID=""
 DATADIR=""
 LOG_ERROR=""
 OS_SERVICE_USER=""
@@ -128,7 +133,12 @@ collect_inputs() {
     create_login_file
     mysql_cmd -NBe "SELECT 1" >/dev/null 2>&1 || die "MySQL 접속 실패"
     CURRENT_VERSION=$(mysql_cmd -NBe "SELECT VERSION()") || die "현재 버전 조회 실패"
-    DATADIR=$(mysql_cmd -NBe "SELECT @@datadir") || die "datadir 조회 실패"
+    BEFORE_BASEDIR=$(mysql_cmd -NBe "SELECT @@basedir") || die "basedir 조회 실패"
+    BEFORE_DATADIR=$(mysql_cmd -NBe "SELECT @@datadir") || die "datadir 조회 실패"
+    BEFORE_PORT=$(mysql_cmd -NBe "SELECT @@port") || die "port 조회 실패"
+    BEFORE_SOCKET=$(mysql_cmd -NBe "SELECT @@socket") || die "socket 조회 실패"
+    BEFORE_SERVER_ID=$(mysql_cmd -NBe "SELECT @@server_id") || die "server_id 조회 실패"
+    DATADIR=$BEFORE_DATADIR
     LOG_ERROR=$(my_print_defaults mysqld 2>/dev/null | sed -n 's/^--log-error=//p' | tail -n 1)
     [ -n "$LOG_ERROR" ] || LOG_ERROR=$(mysql_cmd -NBe "SELECT @@log_error" 2>/dev/null || true)
     OS_SERVICE_USER=$(stat -c '%U' "$DATADIR") || die "datadir 소유자 조회 실패"
@@ -265,11 +275,48 @@ run_upgrade_checker() {
     _checker="$BACKUP_DIR/upgrade_check_${CURRENT_VERSION}_to_${TARGET_VERSION}.txt"
     info "Upgrade Checker Utility 실행"
     if [ "$CONNECTION_MODE" = "socket" ]; then
-        mysqlsh --socket="$DB_SOCKET" --user="$DB_USER" -- util check-for-server-upgrade --target-version="$TARGET_VERSION" --config-path="$CONFIG_FILE" 2>&1 | tee "$_checker"
+        mysqlsh --socket="$DB_SOCKET" --user="$DB_USER" -- util check-for-server-upgrade --target-version="$TARGET_VERSION" --config-path="$CONFIG_FILE" > "$_checker" 2>&1
+        _checker_status=$?
     else
-        mysqlsh --host="$DB_HOST" --port="$DB_PORT" --user="$DB_USER" -- util check-for-server-upgrade --target-version="$TARGET_VERSION" --config-path="$CONFIG_FILE" 2>&1 | tee "$_checker"
+        mysqlsh --host="$DB_HOST" --port="$DB_PORT" --user="$DB_USER" -- util check-for-server-upgrade --target-version="$TARGET_VERSION" --config-path="$CONFIG_FILE" > "$_checker" 2>&1
+        _checker_status=$?
     fi
-    grep -Eq 'Errors:[[:space:]]+0' "$_checker" || die "Upgrade Checker 오류 존재"
+    [ -s "$_checker" ] || die "Upgrade Checker 결과 파일 생성 실패"
+
+    _errors=$(sed -n 's/^Errors:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$_checker" | tail -n 1)
+    _warnings=$(sed -n 's/^Warnings:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$_checker" | tail -n 1)
+    _notices=$(sed -n 's/^Notices:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$_checker" | tail -n 1)
+    _errors=${_errors:-unknown}
+    _warnings=${_warnings:-unknown}
+    _notices=${_notices:-unknown}
+
+    if [ "$_checker_status" -ne 0 ] || [ "$_errors" != "0" ]; then
+        printf '%s\n' '' '===== Upgrade Checker 전체 결과(Error 포함) ====='
+        sed -n '1,2000p' "$_checker"
+        printf '%s\n' "Upgrade Checker 원문: $_checker"
+        die "Upgrade Checker 실행 실패 또는 호환성 Error 존재 (Errors: $_errors)"
+    fi
+
+    printf '%s\n' '' '===== Upgrade Checker Warning/Notice 요약 ====='
+    awk '
+        /^[0-9]+\)/ { section=$0; next }
+        /^[[:space:]]+(Warning|Notice):/ {
+            if (section != printed_section) {
+                if (printed_section != "") print ""
+                print section
+                printed_section=section
+            }
+            sub(/^[[:space:]]+/, "")
+            print "  " $0
+            detail=1
+            next
+        }
+        detail && /^[[:space:]]*-[[:space:]]/ { print; next }
+        detail && /^[[:space:]]+(Solution:|[A-Za-z0-9_].*:)/ { print; next }
+        /^[[:space:]]*$/ { detail=0 }
+    ' "$_checker"
+    printf '\nErrors: %s, Warnings: %s, Notices: %s\n' "$_errors" "$_warnings" "$_notices"
+    printf 'Upgrade Checker 원문: %s\n' "$_checker"
     confirm "Upgrade Checker Warning/Notice 검토 완료 후 계속 진행할까요?" || die "사용자 중단"
 }
 
@@ -450,13 +497,64 @@ start_and_wait() {
 postcheck() {
     info "업그레이드 후 검증"
     mysql_cmd --table -e "SELECT 'SERVER_INFO' AS section; SELECT VERSION() version,@@version_comment edition,@@basedir basedir,@@datadir datadir,@@port port,@@socket socket,@@server_id server_id; SELECT 'SCHEMA_TABLE_COUNT' AS section; SELECT TABLE_SCHEMA,COUNT(*) table_count FROM INFORMATION_SCHEMA.TABLES GROUP BY TABLE_SCHEMA ORDER BY TABLE_SCHEMA; SELECT 'SCHEMA_SIZE' AS section; SELECT TABLE_SCHEMA,COUNT(*) table_count,COALESCE(SUM(TABLE_ROWS),0) estimated_rows,COALESCE(SUM(DATA_LENGTH),0) data_bytes,COALESCE(SUM(INDEX_LENGTH),0) index_bytes FROM INFORMATION_SCHEMA.TABLES GROUP BY TABLE_SCHEMA ORDER BY TABLE_SCHEMA; SELECT 'USERS' AS section; SELECT user,host,plugin,account_locked FROM mysql.user ORDER BY user,host; SELECT 'ACTIVE_PLUGINS' AS section; SELECT PLUGIN_NAME,PLUGIN_VERSION,PLUGIN_STATUS,PLUGIN_TYPE,COALESCE(PLUGIN_LIBRARY,'BUILT-IN') plugin_library FROM INFORMATION_SCHEMA.PLUGINS WHERE PLUGIN_STATUS='ACTIVE' ORDER BY PLUGIN_TYPE,PLUGIN_NAME;" > "$BACKUP_DIR/mysql_state_${TARGET_VERSION}.after.txt" || die "업그레이드 후 상태 저장 실패"
-    mysqlcheck_cmd --all-databases --check-upgrade > "$BACKUP_DIR/mysqlcheck_${TARGET_VERSION}.after.txt" 2>&1 || die "mysqlcheck --check-upgrade 실패"
+    _after_version=$(mysql_cmd -NBe "SELECT VERSION()") || die "업그레이드 후 version 조회 실패"
+    _after_basedir=$(mysql_cmd -NBe "SELECT @@basedir") || die "업그레이드 후 basedir 조회 실패"
+    _after_datadir=$(mysql_cmd -NBe "SELECT @@datadir") || die "업그레이드 후 datadir 조회 실패"
+    _after_port=$(mysql_cmd -NBe "SELECT @@port") || die "업그레이드 후 port 조회 실패"
+    _after_socket=$(mysql_cmd -NBe "SELECT @@socket") || die "업그레이드 후 socket 조회 실패"
+    _after_server_id=$(mysql_cmd -NBe "SELECT @@server_id") || die "업그레이드 후 server_id 조회 실패"
+    _validation_file="$BACKUP_DIR/runtime_comparison_${CURRENT_VERSION}_to_${TARGET_VERSION}.txt"
+    _validation_failed=0
+    _runtime_changed=0
+    {
+        printf 'Field\tASIS\tTOBE\tResult\n'
+        printf 'version\t%s\t%s\tEXPECTED\n' "$CURRENT_VERSION" "$_after_version"
+        compare_runtime_value basedir "$BEFORE_BASEDIR" "$_after_basedir" || _runtime_changed=1
+        compare_runtime_value datadir "${BEFORE_DATADIR%/}" "${_after_datadir%/}" || _runtime_changed=1
+        compare_runtime_value port "$BEFORE_PORT" "$_after_port" || _runtime_changed=1
+        compare_runtime_value socket "$BEFORE_SOCKET" "$_after_socket" || _runtime_changed=1
+        compare_runtime_value server_id "$BEFORE_SERVER_ID" "$_after_server_id" || _runtime_changed=1
+    } > "$_validation_file"
+    if ! mysqlcheck_cmd --all-databases --check-upgrade > "$BACKUP_DIR/mysqlcheck_${TARGET_VERSION}.after.txt" 2>&1; then
+        _validation_failed=1
+        printf 'mysqlcheck\tPASS required\tFAILED\tFAILED\n' >> "$_validation_file"
+    fi
     rpm -qa --qf '%{NAME} %{VERSION}-%{RELEASE}.%{ARCH}\n' | grep '^mysql' | sort > "$BACKUP_DIR/rpm_${TARGET_VERSION}.after.txt"
     cp -a "$CONFIG_FILE" "$BACKUP_DIR/my.cnf.${TARGET_VERSION}.after"
     chown -R "$OS_SERVICE_USER:$OS_SERVICE_GROUP" "$BACKUP_DIR" 2>/dev/null || warn "결과 파일 소유권 변경 실패"
     line
-    printf 'Upgrade Completed\nCurrent Version : %s\nTarget Version  : %s\nResult Directory: %s\n' "$CURRENT_VERSION" "$TARGET_VERSION" "$BACKUP_DIR"
+    printf '%s\n' 'Runtime Value Comparison:'
+    awk -F '\t' '{printf "  %-12s | ASIS: %-35s | TOBE: %-35s | %s\n", $1, $2, $3, $4}' "$_validation_file"
+    if [ "$_validation_failed" -eq 0 ]; then
+        printf 'Package Upgrade         : COMPLETED\nAutomatic Upgrade       : COMPLETED\nPost-upgrade Validation : PASSED\n'
+        if [ "$_runtime_changed" -eq 0 ]; then
+            printf 'Runtime Value Review    : NO CHANGE\n'
+        else
+            printf 'Runtime Value Review    : USER ACTION REQUIRED\n'
+            warn "업그레이드 전후 런타임 값 변경 감지. 비교 결과 확인 후 사용자가 조치"
+        fi
+        printf 'Current Version         : %s\nTarget Version          : %s\nResult Directory        : %s\n' "$CURRENT_VERSION" "$TARGET_VERSION" "$BACKUP_DIR"
+    else
+        printf 'Package Upgrade         : COMPLETED\nAutomatic Upgrade       : COMPLETED\nPost-upgrade Validation : FAILED\nDatabase Service        : RUNNING (자동 종료 안 함)\nComparison Result       : %s\nResult Directory        : %s\n' "$_validation_file" "$BACKUP_DIR"
+        printf '%s\n' '확인 필요 항목:'
+        awk -F '\t' 'NR==1 || $4=="FAILED"' "$_validation_file"
+        line
+        warn "패키지 업그레이드는 적용됐지만 사후 검증 실패. 자동 Rollback 또는 서비스 종료는 수행하지 않음"
+        return 1
+    fi
     line
+}
+
+compare_runtime_value() {
+    _compare_name=$1
+    _compare_expected=$2
+    _compare_actual=$3
+    if [ "$_compare_expected" = "$_compare_actual" ]; then
+        printf '%s\t%s\t%s\tUNCHANGED\n' "$_compare_name" "$_compare_expected" "$_compare_actual"
+        return 0
+    fi
+    printf '%s\t%s\t%s\tREVIEW\n' "$_compare_name" "$_compare_expected" "$_compare_actual"
+    return 1
 }
 
 main() {
