@@ -22,8 +22,8 @@ sh upgrade.sh
 실행 초기에 다음 항목 입력.
 
 - MySQL option file
-- systemd service 이름
-- MySQL DB 관리자 계정
+- systemd service 자동 감지 (`mysqld`, 기본 unit이 없을 때만 직접 입력)
+- MySQL 접속용 DB 관리자 계정(OS 서비스 계정과 별개)
 - Unix Socket 또는 TCP/IP 접속 정보
 - 작업 및 백업 경로
 - Package Source

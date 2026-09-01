@@ -5,7 +5,7 @@
 
 set -u
 
-SCRIPT_VERSION="1.0.1"
+SCRIPT_VERSION="1.0.2"
 SERVICE_NAME="mysqld"
 CONFIG_FILE="/etc/my.cnf"
 WORK_ROOT=""
@@ -105,8 +105,13 @@ collect_inputs() {
     printf 'MySQL RPM Package-based In-place Upgrade Automation v%s\n' "$SCRIPT_VERSION"
     line
     CONFIG_FILE=$(prompt_default "MySQL option file 경로" "$CONFIG_FILE")
-    SERVICE_NAME=$(prompt_default "systemd service 이름" "$SERVICE_NAME")
-    DB_USER=$(prompt_default "MySQL DB 관리자 계정" "root")
+    if systemctl cat "$SERVICE_NAME" >/dev/null 2>&1; then
+        info "systemd service 자동 감지: $SERVICE_NAME"
+    else
+        SERVICE_NAME=$(prompt_default "systemd service 이름" "$SERVICE_NAME")
+        systemctl cat "$SERVICE_NAME" >/dev/null 2>&1 || die "systemd service unit 없음: $SERVICE_NAME"
+    fi
+    DB_USER=$(prompt_default "MySQL 접속용 DB 관리자 계정 (OS 계정 아님)" "root")
 
     printf '\n접속 방식\n1) Unix Socket\n2) TCP/IP\n선택 [1]: '
     IFS= read -r _mode
