@@ -31,6 +31,10 @@ pid-file   : /home/mysql/mysqld/mysqld.pid
 - `innodb_fast_shutdown=0` 적용 후 정상 종료
 - ASIS에서 `mysqlcheck --check-upgrade` 수행
 - MySQL이 정지된 상태에서 물리 백업 생성
+- `auto.cnf`와 `mysql` System Schema Directory로 실제 MySQL `datadir` 검증
+- Backup 경로가 `datadir` 내부이면 차단
+- 비동기 Replication Channel과 Group Replication Member 자동 감지 및 기본 차단
+- Prepared XA Transaction이 남아 있으면 차단
 - 기존 `my.cnf`, RPM 목록, Runtime 정보, 계정, Plugin, SELinux Context 저장
 - 새 버전 최초 기동 실패 시 기존 Binary로 `datadir`을 자동 기동하지 않음
 - 별도 `rollback` 단계에서 Old Bundle과 오프라인 백업을 사용
@@ -165,8 +169,11 @@ sh mysql_inplace_upgrade.sh precheck
 | `--backup-root` | 오프라인 백업 상위 경로 | `/home/mysql/mysql_inplace_upgrade_backup` |
 | `--work-dir` | RPM 및 Metadata 작업 경로 | `/home/mysql/mysql_inplace_upgrade_work` |
 | `--allow-unverified-path` | 기본 Matrix 외 경로 허용 | 비활성화 |
+| `--allow-replication-topology` | Replication 감지 시 예외 허용 | 비활성화 |
 | `--skip-physical-backup` | 물리 백업 생략 | 비활성화 |
 | `--dry-run` | 변경 명령 출력만 수행 | 비활성화 |
+
+`--allow-replication-topology`는 단일 서버 Script가 Rolling Upgrade를 자동 수행한다는 의미가 아닙니다. Topology별 Upgrade 순서와 Failover가 별도 통제되는 경우에만 예외적으로 사용합니다.
 
 ## 상태와 로그
 
@@ -223,16 +230,20 @@ sh mysql_inplace_upgrade.sh precheck
 
 ## 버전
 
-현재 스크립트 버전: `1.0.0`
+현재 스크립트 버전: `1.0.1`
 
 ## 개발 검증
 
 저장소의 테스트는 실제 MySQL Package를 변경하지 않습니다.
 
 ```bash
-bash tests/version_paths_test.sh
-bash tests/precheck_mock_test.sh
+bash tests/test_mysql_inplace_upgrade.sh
 ```
 
-- `version_paths_test.sh`: 지원/차단 Upgrade Path와 Bundle 파일명 Parser 검증
-- `precheck_mock_test.sh`: Mock 명령과 가상 RPM Bundle로 `8.0.46 → 8.4.11` Precheck 전체 흐름 검증
+하나의 테스트 Shell에서 다음 항목을 모두 검증합니다.
+
+- 지원/차단 Upgrade Path
+- Bundle 파일명 Parser
+- Mock 명령과 가상 RPM Bundle 기반 `8.0.46 → 8.4.11` Precheck
+- 필수 Target RPM 6종 선택
+- Prepare 및 Dry-run Upgrade 전체 흐름
