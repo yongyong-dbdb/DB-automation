@@ -5,7 +5,7 @@
 
 set -u
 
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.0.1"
 SERVICE_NAME="mysqld"
 CONFIG_FILE="/etc/my.cnf"
 WORK_ROOT=""

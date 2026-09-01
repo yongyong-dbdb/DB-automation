@@ -16,7 +16,7 @@ Generic Binary Distribution과 Source Installation은 범위 제외.
 
 ```sh
 su -
-sh mysql_inplace_upgrade.sh
+sh upgrade.sh
 ```
 
 실행 초기에 다음 항목 입력.
