@@ -5,7 +5,7 @@
 
 set -u
 
-SCRIPT_VERSION="1.0.3"
+SCRIPT_VERSION="1.0.4"
 SERVICE_NAME="mysqld"
 CONFIG_FILE="/etc/my.cnf"
 WORK_ROOT=""
@@ -23,7 +23,7 @@ DATADIR=""
 LOG_ERROR=""
 OS_SERVICE_USER=""
 OS_SERVICE_GROUP=""
-GPG_CHECK="yes"
+GPG_CHECK="no"
 TMP_DIR=""
 MYSQL_CNF=""
 RUN_ID="$(date '+%Y%m%d_%H%M%S')"
@@ -151,8 +151,14 @@ select_package_source() {
     IFS= read -r PACKAGE_SOURCE
     PACKAGE_SOURCE=${PACKAGE_SOURCE:-2}
     case $PACKAGE_SOURCE in
-        1) TARGET_VERSION=$(prompt_default "목표 MySQL 버전" "9.7.2") ;;
-        2) PACKAGE_PATH=$(prompt_default "RPM Bundle 절대 경로" ""); [ -f "$PACKAGE_PATH" ] || die "RPM Bundle 파일 없음: $PACKAGE_PATH" ;;
+        1)
+            TARGET_VERSION=$(prompt_default "목표 MySQL 버전 (예: 8.4.11)" "")
+            [ -n "$TARGET_VERSION" ] || die "목표 MySQL 버전 입력 필요"
+            ;;
+        2)
+            PACKAGE_PATH=$(prompt_default "RPM Bundle 파일 또는 Bundle 보관 디렉터리 절대 경로" "")
+            select_bundle_file "$PACKAGE_PATH"
+            ;;
         3)
             PACKAGE_PATH=$(prompt_default "Local RPM Directory 절대 경로" "")
             [ -d "$PACKAGE_PATH" ] || die "RPM 디렉터리 없음: $PACKAGE_PATH"
@@ -160,6 +166,41 @@ select_package_source() {
             ;;
         *) die "지원하지 않는 Package Source" ;;
     esac
+}
+
+select_bundle_file() {
+    _bundle_input=$1
+    if [ -f "$_bundle_input" ]; then
+        case $_bundle_input in
+            *.rpm-bundle.tar|*bundle.tar) PACKAGE_PATH=$_bundle_input ;;
+            *) die "RPM Bundle TAR 형식 아님: $_bundle_input" ;;
+        esac
+        return 0
+    fi
+    [ -d "$_bundle_input" ] || die "RPM Bundle 파일 또는 디렉터리 없음: $_bundle_input"
+
+    _bundle_list=$(mktemp /tmp/mysql-bundle-list.XXXXXX) || die "Bundle 목록 임시 파일 생성 실패"
+    find "$_bundle_input" -maxdepth 1 -type f \( -name 'mysql-*.rpm-bundle.tar' -o -name 'mysql-*-bundle.tar' \) -print | sort -V > "$_bundle_list"
+    _bundle_count=$(wc -l < "$_bundle_list" | tr -d ' ')
+    if [ "$_bundle_count" -eq 0 ]; then
+        rm -f "$_bundle_list"
+        die "디렉터리에 MySQL RPM Bundle 없음: $_bundle_input"
+    fi
+    if [ "$_bundle_count" -eq 1 ]; then
+        PACKAGE_PATH=$(sed -n '1p' "$_bundle_list")
+        rm -f "$_bundle_list"
+        info "RPM Bundle 자동 선택: $PACKAGE_PATH"
+        return 0
+    fi
+
+    printf '%s\n' '' '발견된 MySQL RPM Bundle:'
+    awk '{printf "  %d) %s\n", NR, $0}' "$_bundle_list"
+    printf '선택 번호: '
+    IFS= read -r _bundle_no
+    case $_bundle_no in *[!0-9]*|'') rm -f "$_bundle_list"; die "올바른 선택 번호 필요" ;; esac
+    PACKAGE_PATH=$(sed -n "${_bundle_no}p" "$_bundle_list")
+    rm -f "$_bundle_list"
+    [ -n "$PACKAGE_PATH" ] || die "선택 범위를 벗어난 번호: $_bundle_no"
 }
 
 prepare_local_rpms() {
@@ -192,12 +233,8 @@ prepare_local_rpms() {
 
 version_guard() {
     [ "$CURRENT_VERSION" != "$TARGET_VERSION" ] || die "현재 버전과 목표 버전 동일: $CURRENT_VERSION"
-    _cur_mm=$(printf '%s' "$CURRENT_VERSION" | awk -F. '{print $1"."$2}')
-    _tgt_mm=$(printf '%s' "$TARGET_VERSION" | awk -F. '{print $1"."$2}')
-    case "$_cur_mm:$_tgt_mm" in
-        8.0:8.4|8.4:9.7|8.0:8.0|8.4:8.4|9.7:9.7) ;;
-        *) die "자동 승인되지 않은 Upgrade Path: $CURRENT_VERSION -> $TARGET_VERSION" ;;
-    esac
+    _lowest=$(printf '%s\n%s\n' "$CURRENT_VERSION" "$TARGET_VERSION" | sort -V | sed -n '1p')
+    [ "$_lowest" = "$CURRENT_VERSION" ] || die "다운그레이드 또는 잘못된 버전 순서: $CURRENT_VERSION -> $TARGET_VERSION"
 }
 
 setup_run_paths() {
@@ -325,15 +362,23 @@ perform_backups_and_stop() {
 }
 
 choose_gpg_policy() {
-    printf 'RPM GPG signature 검증 사용 [Y/n]: '
+    printf '%s\n' '' 'RPM GPG Signature Verification' '  - Y: RPM DB에 등록된 공개 키로 패키지 서명 검증' '  - N: 서명 검증 생략, RPM digest 및 Yum transaction test는 계속 수행'
+    printf 'RPM GPG signature 검증 사용 [y/N]: '
     IFS= read -r _gpg
-    case ${_gpg:-Y} in y|Y|yes|YES) GPG_CHECK=yes ;; *) GPG_CHECK=no; warn "RPM GPG signature 검증 생략" ;; esac
+    case ${_gpg:-N} in y|Y|yes|YES) GPG_CHECK=yes ;; *) GPG_CHECK=no; warn "RPM GPG signature 검증 생략; digest 검증은 수행" ;; esac
 }
 
 verify_local_rpms() {
     [ "$PACKAGE_SOURCE" = "1" ] && return 0
     if [ "$GPG_CHECK" = "yes" ]; then
-        while IFS= read -r _rpm; do rpm -K "$_rpm" | tee -a "$LOG_FILE" | grep -q 'signatures OK' || die "RPM 서명 검증 실패: $_rpm"; done < "$RPM_LIST_FILE"
+        while IFS= read -r _rpm; do
+            _verify_output=$(rpm -Kv "$_rpm" 2>&1)
+            printf '%s\n' "$_verify_output" | tee -a "$LOG_FILE"
+            if printf '%s\n' "$_verify_output" | grep -q 'NOKEY'; then
+                die "RPM 서명 공개 키 미등록(NOKEY): $_rpm (공개 키 등록 후 재실행하거나 GPG 검증 N 선택)"
+            fi
+            printf '%s\n' "$_verify_output" | grep -q 'Signature.*OK' || die "RPM 서명 검증 실패: $_rpm"
+        done < "$RPM_LIST_FILE"
     else
         while IFS= read -r _rpm; do rpm -K --nosignature "$_rpm" | tee -a "$LOG_FILE" | grep -q 'digests OK' || die "RPM digest 검증 실패: $_rpm"; done < "$RPM_LIST_FILE"
     fi

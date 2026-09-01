@@ -6,7 +6,8 @@ Oracle MySQL Community RPM 설치 환경의 대화형 In-place Upgrade 자동화
 
 - Enterprise Linux 8/9 계열
 - Oracle MySQL Community RPM Package-based Installation
-- 지원 경로: `8.0 → 8.4`, `8.4 → 9.7`, 동일 LTS/Bugfix series 내부
+- 현재 버전은 실행 중인 서버에서, 목표 버전은 선택한 RPM metadata에서 자동 확인
+- 특정 MySQL 버전 또는 Upgrade Path를 코드에 고정하지 않음. 버전 상승 여부와 MySQL Shell Upgrade Checker 결과로 진행 통제
 - `/bin/sh` 실행
 - root 실행
 
@@ -28,17 +29,17 @@ sh upgrade.sh
 - 업그레이드 결과 및 백업 저장 경로(RPM Package Source 경로와 별개)
 - Package Source
 - Backup Method
-- RPM GPG signature 검증 여부
+- RPM GPG signature 검증 여부(기본값 N). 생략 시에도 RPM digest 검증과 Yum transaction test 수행
 
 OS 서비스 계정과 MySQL DB 계정의 동일 여부를 가정하지 않음. datadir 소유자와 그룹은 실행 환경에서 확인.
 
 ## Package Source
 
 1. MySQL Yum Repository
-2. RPM Bundle (`*.rpm-bundle.tar`)
+2. RPM Bundle (`*.rpm-bundle.tar` 파일 또는 Bundle 보관 디렉터리)
 3. Local RPM Directory
 
-RPM Bundle과 Local RPM Directory는 현재 설치된 `mysql-community-*` 패키지와 이름이 일치하는 목표 RPM만 선별.
+RPM Bundle 디렉터리에서 Bundle 1개 발견 시 자동 선택, 여러 개 발견 시 번호 선택. RPM Bundle과 Local RPM Directory는 현재 설치된 `mysql-community-*` 패키지와 이름이 일치하는 목표 RPM만 선별.
 
 ## Backup Method
 
