@@ -5,7 +5,7 @@
 
 set -u
 
-SCRIPT_VERSION="1.0.9"
+SCRIPT_VERSION="1.0.10"
 SERVICE_NAME="mysqld"
 CONFIG_FILE=""
 WORK_ROOT=""
@@ -104,6 +104,7 @@ create_login_file() {
 mysql_cmd() { mysql --defaults-extra-file="$MYSQL_CNF" "$@"; }
 mysqldump_cmd() { mysqldump --defaults-extra-file="$MYSQL_CNF" "$@"; }
 mysqlcheck_cmd() { mysqlcheck --defaults-extra-file="$MYSQL_CNF" "$@"; }
+my_print_defaults_cmd() { my_print_defaults --defaults-file="$CONFIG_FILE" mysqld; }
 
 select_config_file() {
     _config_all=$(mktemp /tmp/mysql-config-all.XXXXXX) || die "설정 파일 후보 임시 파일 생성 실패"
@@ -190,7 +191,7 @@ collect_inputs() {
     IFS= read -r _mode
     case ${_mode:-1} in
         1)
-            _socket_default=$(my_print_defaults mysqld 2>/dev/null | sed -n 's/^--socket=//p' | tail -n 1)
+            _socket_default=$(my_print_defaults_cmd 2>/dev/null | sed -n 's/^--socket=//p' | tail -n 1)
             [ -n "$_socket_default" ] || _socket_default="/var/lib/mysql/mysql.sock"
             CONNECTION_MODE="socket"
             DB_SOCKET=$(prompt_default "Unix Socket 경로" "$_socket_default")
@@ -198,7 +199,7 @@ collect_inputs() {
         2)
             CONNECTION_MODE="tcp"
             _host_default="localhost"
-            _port_default=$(my_print_defaults mysqld 2>/dev/null | sed -n 's/^--port=//p' | tail -n 1)
+            _port_default=$(my_print_defaults_cmd 2>/dev/null | sed -n 's/^--port=//p' | tail -n 1)
             [ -n "$_port_default" ] || _port_default="3306"
             DB_HOST=$(prompt_default "Host" "$_host_default")
             DB_PORT=$(prompt_default "Port" "$_port_default")
@@ -214,7 +215,7 @@ collect_inputs() {
     BEFORE_SOCKET=$(mysql_cmd -NBe "SELECT @@socket") || die "socket 조회 실패"
     BEFORE_SERVER_ID=$(mysql_cmd -NBe "SELECT @@server_id") || die "server_id 조회 실패"
     DATADIR=$BEFORE_DATADIR
-    LOG_ERROR=$(my_print_defaults mysqld 2>/dev/null | sed -n 's/^--log-error=//p' | tail -n 1)
+    LOG_ERROR=$(my_print_defaults_cmd 2>/dev/null | sed -n 's/^--log-error=//p' | tail -n 1)
     [ -n "$LOG_ERROR" ] || LOG_ERROR=$(mysql_cmd -NBe "SELECT @@log_error" 2>/dev/null || true)
     OS_SERVICE_USER=$(stat -c '%U' "$DATADIR") || die "datadir 소유자 조회 실패"
     OS_SERVICE_GROUP=$(stat -c '%G' "$DATADIR") || die "datadir 그룹 조회 실패"
@@ -384,7 +385,7 @@ collect_precheck() {
     mysql_cmd --table -e "SELECT 'SERVER_INFO' AS section; SELECT VERSION() version,@@version_comment edition,@@basedir basedir,@@datadir datadir,@@port port,@@socket socket,@@server_id server_id; SELECT 'SCHEMA_TABLE_COUNT' AS section; SELECT TABLE_SCHEMA,COUNT(*) table_count FROM INFORMATION_SCHEMA.TABLES GROUP BY TABLE_SCHEMA ORDER BY TABLE_SCHEMA; SELECT 'SCHEMA_SIZE' AS section; SELECT TABLE_SCHEMA,COUNT(*) table_count,COALESCE(SUM(TABLE_ROWS),0) estimated_rows,COALESCE(SUM(DATA_LENGTH),0) data_bytes,COALESCE(SUM(INDEX_LENGTH),0) index_bytes FROM INFORMATION_SCHEMA.TABLES GROUP BY TABLE_SCHEMA ORDER BY TABLE_SCHEMA; SELECT 'USERS' AS section; SELECT user,host,plugin,account_locked FROM mysql.user ORDER BY user,host; SELECT 'ACTIVE_PLUGINS' AS section; SELECT PLUGIN_NAME,PLUGIN_VERSION,PLUGIN_STATUS,PLUGIN_TYPE,COALESCE(PLUGIN_LIBRARY,'BUILT-IN') plugin_library FROM INFORMATION_SCHEMA.PLUGINS WHERE PLUGIN_STATUS='ACTIVE' ORDER BY PLUGIN_TYPE,PLUGIN_NAME;" > "$BACKUP_DIR/mysql_state_${CURRENT_VERSION}.before.txt" || die "DB 상태 저장 실패"
     {
         printf '===== RPM PACKAGES =====\n'; rpm -qa --qf '%{NAME} %{VERSION}-%{RELEASE}.%{ARCH}\n' | grep '^mysql' | sort
-        printf '\n===== MYSQLD DEFAULTS =====\n'; my_print_defaults mysqld
+        printf '\n===== MYSQLD DEFAULTS =====\n'; my_print_defaults_cmd
         printf '\n===== SERVICE =====\n'; systemctl status "$SERVICE_NAME" --no-pager || true
         printf '\n===== OPTION FILE =====\n'; sed -n '1,400p' "$CONFIG_FILE"
     } > "$BACKUP_DIR/os_state_${CURRENT_VERSION}.before.txt"
@@ -530,7 +531,7 @@ validate_config_after_rpm() {
     if [ -f "${CONFIG_FILE}.rpmnew" ]; then cp -a "${CONFIG_FILE}.rpmnew" "$BACKUP_DIR/my.cnf.${TARGET_VERSION}.rpmnew" || die "rpmnew 보관 실패"; fi
     cmp -s "$BACKUP_DIR/my.cnf.${CURRENT_VERSION}.before" "$CONFIG_FILE" || die "기존 option file 변경 감지: $CONFIG_FILE"
     mysqld --defaults-file="$CONFIG_FILE" --validate-config --user="$OS_SERVICE_USER" >> "$LOG_FILE" 2>&1 || die "새 mysqld의 기존 option file 검증 실패"
-    _new_datadir=$(my_print_defaults mysqld | sed -n 's/^--datadir=//p' | tail -n 1)
+    _new_datadir=$(my_print_defaults_cmd | sed -n 's/^--datadir=//p' | tail -n 1)
     [ "${_new_datadir%/}" = "${DATADIR%/}" ] || die "datadir 변경 감지: $DATADIR -> $_new_datadir"
     [ "$(stat -c '%U:%G' "$DATADIR")" = "$OS_SERVICE_USER:$OS_SERVICE_GROUP" ] || die "datadir 소유권 변경 감지"
 }
