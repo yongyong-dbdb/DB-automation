@@ -5,7 +5,7 @@
 
 set -u
 
-SCRIPT_VERSION="1.0.20"
+SCRIPT_VERSION="1.0.21"
 SERVICE_NAME="${SERVICE_NAME:-}"
 CONFIG_FILE=""
 WORK_ROOT=""
@@ -567,14 +567,50 @@ snapshot_validation_state() {
     { mysql_cmd -NBe "SELECT @@gtid_mode,@@enforce_gtid_consistency,@@global.gtid_executed,@@global.gtid_purged" 2>/dev/null || true; mysql_cmd -e "SHOW REPLICA STATUS\G" 2>/dev/null || true; } > "$VALIDATION_DIR/replication_${_suffix}.txt"
 }
 
-compare_validation_file() {
-    _label=$1; _before=$2; _after=$3; _diff=$4
-    if cmp -s "$_before" "$_after"; then printf '%-28s : PASSED\n' "$_label" >> "$VALIDATION_DIR/validation_summary.txt"; return 0; fi
-    diff -u "$_before" "$_after" > "$_diff" 2>/dev/null || true
-    printf '%-28s : REVIEW (%s)\n' "$_label" "$_diff" >> "$VALIDATION_DIR/validation_summary.txt"
+compare_keyed_validation() {
+    _label=$1; _before=$2; _after=$3; _detail=$4; _mode=$5
+    _stats="${_detail}.stats"
+    awk -F '\t' -v OFS='\t' -v mode="$_mode" -v stats="$_stats" '
+        function make_key(   k) {
+            if (mode == "objects" || mode == "accounts") return $1 FS $2
+            return $1
+        }
+        function make_value(   p) {
+            if (mode == "objects") return $3
+            if (mode == "accounts") { p=index($0, FS); p=index(substr($0,p+1),FS)+p; return substr($0,p+1) }
+            p=index($0, FS); return p ? substr($0,p+1) : ""
+        }
+        NR==FNR { k=make_key(); a[k]=make_value(); keys[k]=1; next }
+        { k=make_key(); b[k]=make_value(); keys[k]=1 }
+        END {
+            if (mode=="objects") print "Schema","Object_Type","ASIS","TOBE","Delta","Result"
+            else if (mode=="accounts") print "User","Host","ASIS","TOBE","Result"
+            else print "Item","ASIS","TOBE","Result"
+            for (k in a) { if (mode=="objects") total_a+=a[k]+0; else total_a++ }
+            for (k in b) { if (mode=="objects") total_b+=b[k]+0; else total_b++ }
+            for (k in keys) {
+                if (!(k in a)) { added++; result="ADDED"; av="MISSING"; bv=b[k] }
+                else if (!(k in b)) { removed++; result="REMOVED"; av=a[k]; bv="MISSING" }
+                else if (a[k] != b[k]) { changed++; result="CHANGED"; av=a[k]; bv=b[k] }
+                else continue
+                if (mode=="objects") { split(k,p,FS); print p[1],p[2],av,bv,(av=="MISSING"||bv=="MISSING" ? "-" : bv-av),result }
+                else if (mode=="accounts") { split(k,p,FS); print p[1],p[2],av,bv,result }
+                else print k,av,bv,result
+            }
+            print total_a+0,total_b+0,added+0,removed+0,changed+0 > stats
+        }
+    ' "$_before" "$_after" > "$_detail" || die "상세 비교 생성 실패: $_label"
+    set -- $(cat "$_stats")
+    _asis_count=$1; _tobe_count=$2; _added=$3; _removed=$4; _changed=$5
+    rm -f "$_stats"
+    if [ "$_added" -eq 0 ] && [ "$_removed" -eq 0 ] && [ "$_changed" -eq 0 ]; then
+        printf '%-28s : PASSED (ASIS=%s, TOBE=%s)\n' "$_label" "$_asis_count" "$_tobe_count" >> "$VALIDATION_DIR/validation_summary.txt"
+        return 0
+    fi
+    printf '%-28s : REVIEW (ASIS=%s, TOBE=%s, Added=%s, Removed=%s, Changed=%s)\n' "$_label" "$_asis_count" "$_tobe_count" "$_added" "$_removed" "$_changed" >> "$VALIDATION_DIR/validation_summary.txt"
+    printf '  Detail: %s\n' "$_detail" >> "$VALIDATION_DIR/validation_summary.txt"
     EXTENDED_REVIEW=1; return 1
 }
-
 validate_config_files_unchanged() {
     while IFS="$(printf '\t')" read -r _original _saved; do
         [ -f "$_original" ] || die "업그레이드 전 Config 원본 파일 없음: $_original"
@@ -594,8 +630,8 @@ validate_replication_state() {
 validate_new_error_log() {
     _result="$VALIDATION_DIR/error_log_${TARGET_VERSION}.after.txt"; : > "$_result"
     if [ -n "$LOG_ERROR" ] && [ -f "$LOG_ERROR" ]; then _start=$((BEFORE_ERROR_LOG_LINES + 1)); tail -n "+$_start" "$LOG_ERROR" > "$_result" 2>/dev/null || true; fi
-    if grep -Ei '\[ERROR\]|fatal|abort|upgrade[^[:alnum:]]+fail|fail[^[:alnum:]]+upgrade' "$_result" > "$VALIDATION_DIR/error_log_critical_${TARGET_VERSION}.txt" 2>/dev/null; then printf '%-28s : FAILED\n' "Error Log" >> "$VALIDATION_DIR/validation_summary.txt"; EXTENDED_FAILED=1; return 1; fi
-    if grep -Ei 'warning|deprecated' "$_result" > "$VALIDATION_DIR/error_log_review_${TARGET_VERSION}.txt" 2>/dev/null; then printf '%-28s : REVIEW\n' "Error Log" >> "$VALIDATION_DIR/validation_summary.txt"; EXTENDED_REVIEW=1; return 0; fi
+    if grep -Ei '\[ERROR\]|fatal|abort|upgrade[^[:alnum:]]+fail|fail[^[:alnum:]]+upgrade' "$_result" > "$VALIDATION_DIR/error_log_critical_${TARGET_VERSION}.txt" 2>/dev/null; then _critical_count=$(wc -l < "$VALIDATION_DIR/error_log_critical_${TARGET_VERSION}.txt" | tr -d ' '); printf '%-28s : FAILED (Critical=%s, Detail=%s)\n' "Error Log" "$_critical_count" "$VALIDATION_DIR/error_log_critical_${TARGET_VERSION}.txt" >> "$VALIDATION_DIR/validation_summary.txt"; EXTENDED_FAILED=1; return 1; fi
+    if grep -Ei 'warning|deprecated' "$_result" > "$VALIDATION_DIR/error_log_review_${TARGET_VERSION}.txt" 2>/dev/null; then _warning_count=$(wc -l < "$VALIDATION_DIR/error_log_review_${TARGET_VERSION}.txt" | tr -d ' '); printf '%-28s : REVIEW (Warnings=%s, Detail=%s)\n' "Error Log" "$_warning_count" "$VALIDATION_DIR/error_log_review_${TARGET_VERSION}.txt" >> "$VALIDATION_DIR/validation_summary.txt"; EXTENDED_REVIEW=1; return 0; fi
     printf '%-28s : PASSED\n' "Error Log" >> "$VALIDATION_DIR/validation_summary.txt"
 }
 
@@ -608,11 +644,11 @@ run_smoke_test() {
 run_extended_validation() {
     EXTENDED_FAILED=0; EXTENDED_REVIEW=0; : > "$VALIDATION_DIR/validation_summary.txt"
     printf 'MySQL Upgrade Validation Summary\nASIS=%s TOBE=%s Service=%s\n\n' "$CURRENT_VERSION" "$TARGET_VERSION" "$SERVICE_NAME" >> "$VALIDATION_DIR/validation_summary.txt"
-    compare_validation_file "User Objects" "$VALIDATION_DIR/user_objects_${CURRENT_VERSION}.before.txt" "$VALIDATION_DIR/user_objects_${TARGET_VERSION}.after.txt" "$VALIDATION_DIR/user_objects_${CURRENT_VERSION}_to_${TARGET_VERSION}.diff" || true
-    compare_validation_file "Schema Metrics (estimated)" "$VALIDATION_DIR/schema_metrics_${CURRENT_VERSION}.before.txt" "$VALIDATION_DIR/schema_metrics_${TARGET_VERSION}.after.txt" "$VALIDATION_DIR/schema_metrics_${CURRENT_VERSION}_to_${TARGET_VERSION}.diff" || true
-    compare_validation_file "Accounts" "$VALIDATION_DIR/accounts_${CURRENT_VERSION}.before.txt" "$VALIDATION_DIR/accounts_${TARGET_VERSION}.after.txt" "$VALIDATION_DIR/accounts_${CURRENT_VERSION}_to_${TARGET_VERSION}.diff" || true
-    compare_validation_file "Active Plugins" "$VALIDATION_DIR/plugins_${CURRENT_VERSION}.before.txt" "$VALIDATION_DIR/plugins_${TARGET_VERSION}.after.txt" "$VALIDATION_DIR/plugins_${CURRENT_VERSION}_to_${TARGET_VERSION}.diff" || true
-    compare_validation_file "Global Variables" "$VALIDATION_DIR/global_variables_${CURRENT_VERSION}.before.txt" "$VALIDATION_DIR/global_variables_${TARGET_VERSION}.after.txt" "$VALIDATION_DIR/global_variables_${CURRENT_VERSION}_to_${TARGET_VERSION}.diff" || true
+    compare_keyed_validation "User Objects" "$VALIDATION_DIR/user_objects_${CURRENT_VERSION}.before.txt" "$VALIDATION_DIR/user_objects_${TARGET_VERSION}.after.txt" "$VALIDATION_DIR/user_objects_${CURRENT_VERSION}_to_${TARGET_VERSION}.details.tsv" objects || true
+    compare_keyed_validation "Schema Metrics (estimated)" "$VALIDATION_DIR/schema_metrics_${CURRENT_VERSION}.before.txt" "$VALIDATION_DIR/schema_metrics_${TARGET_VERSION}.after.txt" "$VALIDATION_DIR/schema_metrics_${CURRENT_VERSION}_to_${TARGET_VERSION}.details.tsv" values || true
+    compare_keyed_validation "Accounts" "$VALIDATION_DIR/accounts_${CURRENT_VERSION}.before.txt" "$VALIDATION_DIR/accounts_${TARGET_VERSION}.after.txt" "$VALIDATION_DIR/accounts_${CURRENT_VERSION}_to_${TARGET_VERSION}.details.tsv" accounts || true
+    compare_keyed_validation "Active Plugins" "$VALIDATION_DIR/plugins_${CURRENT_VERSION}.before.txt" "$VALIDATION_DIR/plugins_${TARGET_VERSION}.after.txt" "$VALIDATION_DIR/plugins_${CURRENT_VERSION}_to_${TARGET_VERSION}.details.tsv" values || true
+    compare_keyed_validation "Global Variables" "$VALIDATION_DIR/global_variables_${CURRENT_VERSION}.before.txt" "$VALIDATION_DIR/global_variables_${TARGET_VERSION}.after.txt" "$VALIDATION_DIR/global_variables_${CURRENT_VERSION}_to_${TARGET_VERSION}.details.tsv" values || true
     if rpm -qa --qf '%{NAME}\t%{VERSION}\n' | awk -F '\t' -v target="$TARGET_VERSION" '$1 ~ /^mysql-community-/ && $2 != target {bad=1} END{exit bad}'; then printf '%-28s : PASSED\n' "RPM Packages" >> "$VALIDATION_DIR/validation_summary.txt"; else printf '%-28s : FAILED\n' "RPM Packages" >> "$VALIDATION_DIR/validation_summary.txt"; EXTENDED_FAILED=1; fi
     if [ "$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || true)" = "active" ] && [ "$(systemctl show "$SERVICE_NAME" --property=MainPID --value 2>/dev/null || true)" != "0" ]; then printf '%-28s : PASSED\n' "systemd Service" >> "$VALIDATION_DIR/validation_summary.txt"; else printf '%-28s : FAILED\n' "systemd Service" >> "$VALIDATION_DIR/validation_summary.txt"; EXTENDED_FAILED=1; fi
     printf '%-28s : PASSED\n' "Config Files" >> "$VALIDATION_DIR/validation_summary.txt"
@@ -836,6 +872,8 @@ postcheck() {
     line
     printf '%s\n' 'Runtime Value Comparison:'
     awk -F '\t' '{printf "  %-12s | ASIS: %-35s | TOBE: %-35s | %s\n", $1, $2, $3, $4}' "$_validation_file"
+    printf '\nExtended Validation:\n'
+    sed -n '1,300p' "$VALIDATION_DIR/validation_summary.txt"
     if [ "$_validation_failed" -eq 0 ]; then
         printf 'Package Upgrade         : COMPLETED\nAutomatic Upgrade       : COMPLETED\nPost-upgrade Validation : PASSED\n'
         if [ "$_runtime_changed" -eq 0 ]; then
