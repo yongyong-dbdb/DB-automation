@@ -5,7 +5,7 @@
 
 set -u
 
-SCRIPT_VERSION="1.0.14"
+SCRIPT_VERSION="1.0.15"
 SERVICE_NAME="${SERVICE_NAME:-}"
 CONFIG_FILE=""
 WORK_ROOT=""
@@ -130,13 +130,22 @@ select_service_name() {
     fi
 
     _service_candidates=$(mktemp /tmp/mysql-service-candidates.XXXXXX) || die "서비스 후보 임시 파일 생성 실패"
-    systemctl list-unit-files --type=service --no-legend 2>/dev/null |
-        awk '
-            $1 ~ /^(mysqld|mysql)(@[^[:space:]]*)?\.service$/ {
-                sub(/\.service$/, "", $1)
-                print $1
-            }
-        ' | awk '!seen[$0]++' > "$_service_candidates"
+    {
+        systemctl list-units --type=service --all --no-legend 2>/dev/null |
+            awk '
+                $1 ~ /^(mysqld|mysql)(@[^.[:space:]]+)?\.service$/ {
+                    sub(/\.service$/, "", $1)
+                    print $1
+                }
+            '
+        systemctl list-unit-files --type=service --no-legend 2>/dev/null |
+            awk '
+                $1 ~ /^(mysqld|mysql)\.service$/ {
+                    sub(/\.service$/, "", $1)
+                    print $1
+                }
+            '
+    } | awk '!seen[$0]++' > "$_service_candidates"
 
     _service_count=$(wc -l < "$_service_candidates" | tr -d ' ')
     if [ "$_service_count" -eq 0 ]; then
@@ -181,8 +190,8 @@ select_config_file() {
     }
 
     {
-        _mysqld_pid=$(pgrep -xo mysqld 2>/dev/null || true)
-        if [ -n "$_mysqld_pid" ]; then
+        _mysqld_pid=$(systemctl show "$SERVICE_NAME" --property=MainPID --value 2>/dev/null || true)
+        if [ -n "$_mysqld_pid" ] && [ "$_mysqld_pid" != "0" ]; then
             ps -ww -p "$_mysqld_pid" -o args= 2>/dev/null |
                 tr ' ' '\n' |
                 sed -n -e 's/^--defaults-file=//p' -e 's/^--defaults-extra-file=//p'
@@ -520,8 +529,9 @@ stop_server_cleanly() {
     mysql_cmd -e "SET GLOBAL innodb_fast_shutdown=0" || die "innodb_fast_shutdown 설정 실패"
     info "MySQL 정상 종료"
     systemctl stop "$SERVICE_NAME" || die "서비스 종료 실패"
-    [ "$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || true)" != "active" ] || die "서비스가 계속 실행 중"
-    pgrep -x mysqld >/dev/null 2>&1 && die "mysqld 프로세스 잔존"
+    [ "$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || true)" != "active" ] || die "선택한 서비스가 계속 실행 중: $SERVICE_NAME"
+    _remaining_pid=$(systemctl show "$SERVICE_NAME" --property=MainPID --value 2>/dev/null || true)
+    [ -z "$_remaining_pid" ] || [ "$_remaining_pid" = "0" ] || die "선택한 서비스의 mysqld 프로세스 잔존: service=$SERVICE_NAME pid=$_remaining_pid"
 }
 
 physical_backup() {
