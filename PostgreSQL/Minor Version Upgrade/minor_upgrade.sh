@@ -27,6 +27,9 @@ RUN_MAKE_CHECK="${RUN_MAKE_CHECK:-true}"
 BASH_PROFILE="${BASH_PROFILE:-$HOME/.bash_profile}"
 STATE_FILE="${STATE_FILE:-$BASE/.postgresql_minor_upgrade.conf}"
 WORK_DIR="${WORK_DIR:-$BASE/minor_upgrade_work}"
+UPGRADE_MODE="${UPGRADE_MODE:-}"
+PGDATA_ACTIVE="${PGDATA_ACTIVE:-}"
+PGDATA_BACKUP="${PGDATA_BACKUP:-}"
 STEP=""
 
 log() {
@@ -230,6 +233,9 @@ ENABLE_OPENSSL=$(printf '%q' "$ENABLE_OPENSSL")
 RUN_MAKE_CHECK=$(printf '%q' "$RUN_MAKE_CHECK")
 BASH_PROFILE=$(printf '%q' "$BASH_PROFILE")
 WORK_DIR=$(printf '%q' "$WORK_DIR")
+UPGRADE_MODE=$(printf '%q' "$UPGRADE_MODE")
+PGDATA_ACTIVE=$(printf '%q' "$PGDATA_ACTIVE")
+PGDATA_BACKUP=$(printf '%q' "$PGDATA_BACKUP")
 EOF
 }
 
@@ -489,17 +495,45 @@ prepare() {
     echo "NOTICE: the upgrade step stops PostgreSQL briefly and asks for MINOR UPGRADE confirmation."
 }
 
-prepare_new_data_directory() {
-    local required_kb available_kb safety_kb
+human_size_kb() {
+    if command -v numfmt >/dev/null 2>&1; then
+        numfmt --to=iec --suffix=B --from-unit=1024 "$1"
+    else
+        printf '%s KB\n' "$1"
+    fi
+}
 
-    [[ "$PGDATA_NEW" != "$PGDATA_OLD" ]] || die "OLD and NEW PGDATA must be different"
-    [[ ! -e "$PGDATA_NEW" ]] || die "NEW PGDATA already exists: $PGDATA_NEW"
+check_copy_space() {
+    local destination="$1"
+    local label="$2"
+    local required_kb available_kb safety_kb parent
+
+    parent="$(dirname "$destination")"
+    [[ -d "$parent" ]] || mkdir -p "$parent"
 
     required_kb="$(du -sk "$PGDATA_OLD" | awk '{print $1}')"
-    available_kb="$(df -Pk "$(dirname "$PGDATA_NEW")" | awk 'NR==2 {print $4}')"
+    available_kb="$(df -Pk "$parent" | awk 'NR==2 {print $4}')"
     safety_kb=$((required_kb + required_kb / 10))
+
+    echo
+    echo "============================================================"
+    echo "PGDATA Capacity Check - $label"
+    echo "============================================================"
+    printf 'Current PGDATA size : %s\n' "$(human_size_kb "$required_kb")"
+    printf 'Required free space : %s (PGDATA + 10%%)\n' "$(human_size_kb "$safety_kb")"
+    printf 'Available space     : %s\n' "$(human_size_kb "$available_kb")"
+    printf 'Destination         : %s\n' "$destination"
+    echo
+    echo "NOTICE: A full PGDATA copy can require substantial disk space."
+    echo "        Verify filesystem capacity before continuing, especially for large databases."
+
     (( available_kb >= safety_kb )) || \
-        die "insufficient disk space: required=${safety_kb}KB available=${available_kb}KB"
+        die "insufficient disk space for $label: required=${safety_kb}KB available=${available_kb}KB"
+}
+
+prepare_new_data_directory() {
+    [[ "$PGDATA_NEW" != "$PGDATA_OLD" ]] || die "OLD and NEW PGDATA must be different"
+    [[ ! -e "$PGDATA_NEW" ]] || die "NEW PGDATA already exists: $PGDATA_NEW"
 
     mkdir -p "$PGDATA_NEW"
     if ! cp -a "$PGDATA_OLD/." "$PGDATA_NEW/"; then
@@ -511,6 +545,79 @@ prepare_new_data_directory() {
     log "NEW PGDATA copied: $PGDATA_NEW"
 }
 
+prepare_pgdata_backup() {
+    [[ -n "$PGDATA_BACKUP" ]] || die "PGDATA backup path is empty"
+    [[ ! -e "$PGDATA_BACKUP" ]] || die "PGDATA backup path already exists: $PGDATA_BACKUP"
+
+    mkdir -p "$PGDATA_BACKUP"
+    if ! cp -a "$PGDATA_OLD/." "$PGDATA_BACKUP/"; then
+        mv "$PGDATA_BACKUP" "$PGDATA_BACKUP.copy_failed_$(date +%Y%m%d_%H%M%S)" || true
+        die "failed to back up OLD PGDATA; partial backup was preserved for inspection"
+    fi
+
+    log "PGDATA backup completed: $PGDATA_BACKUP"
+}
+
+select_upgrade_mode() {
+    local selection timestamp
+
+    echo
+    echo "============================================================"
+    echo "PostgreSQL Minor Upgrade Mode"
+    echo "============================================================"
+    printf 'Current version : %s\n' "$(old_binary_version)"
+    printf 'Target version  : %s\n' "$TARGET_VERSION"
+    printf 'OLD PG_HOME     : %s\n' "$PG_HOME_OLD"
+    printf 'NEW PG_HOME     : %s\n' "$PG_HOME_NEW"
+    printf 'OLD PGDATA      : %s\n' "$PGDATA_OLD"
+    echo
+    echo "1) Binary only"
+    echo "   - Upgrade PostgreSQL binaries only."
+    echo "   - Start the existing PGDATA with the new PostgreSQL binary."
+    echo "   - No full PGDATA copy or backup is created."
+    echo
+    echo "2) Binary + PGDATA backup"
+    echo "   - Upgrade PostgreSQL binaries and create a full backup of the existing PGDATA."
+    echo "   - Start the original PGDATA with the new PostgreSQL binary."
+    echo "   - WARNING: Requires additional disk space approximately equal to PGDATA size."
+    echo "   - Backup time is included in database downtime."
+    echo
+    echo "3) Binary + PGDATA copy & switch"
+    echo "   - Upgrade PostgreSQL binaries and copy PGDATA to the new versioned path."
+    echo "   - Start the copied PGDATA with the new PostgreSQL binary."
+    echo "   - WARNING: Requires additional disk space approximately equal to PGDATA size."
+    echo "   - Copy time is included in database downtime."
+    echo
+    printf 'Select [1-3]: '
+    read -r selection
+
+    case "$selection" in
+        1)
+            UPGRADE_MODE="binary"
+            PGDATA_ACTIVE="$PGDATA_OLD"
+            PGDATA_BACKUP=""
+            ;;
+        2)
+            UPGRADE_MODE="backup"
+            PGDATA_ACTIVE="$PGDATA_OLD"
+            timestamp="$(date +%Y%m%d_%H%M%S)"
+            PGDATA_BACKUP="$BASE/backup_pg_minor_$(old_binary_version)_$timestamp"
+            check_copy_space "$PGDATA_BACKUP" "PGDATA backup"
+            ;;
+        3)
+            UPGRADE_MODE="copy"
+            PGDATA_ACTIVE="$PGDATA_NEW"
+            PGDATA_BACKUP=""
+            check_copy_space "$PGDATA_NEW" "NEW PGDATA copy"
+            ;;
+        *)
+            die "invalid upgrade mode: $selection"
+            ;;
+    esac
+
+    save_state
+}
+
 start_with_home() {
     local home="$1"
     local data="$2"
@@ -518,22 +625,53 @@ start_with_home() {
 }
 
 upgrade() {
-    local old_version
+    local old_version mode_text
     old_version="$(old_binary_version)"
 
     [[ -x "$PG_HOME_NEW/bin/postgres" ]] || die "run prepare first"
-    confirm "MINOR UPGRADE" "Stop PostgreSQL $old_version, preserve $PGDATA_OLD, copy it to $PGDATA_NEW, and start $TARGET_VERSION?"
+
+    select_upgrade_mode
+
+    case "$UPGRADE_MODE" in
+        binary)
+            mode_text="Binary only; keep current PGDATA: $PGDATA_OLD"
+            ;;
+        backup)
+            mode_text="Binary + PGDATA backup: $PGDATA_BACKUP; keep current PGDATA active"
+            ;;
+        copy)
+            mode_text="Binary + PGDATA copy & switch: $PGDATA_OLD -> $PGDATA_NEW"
+            ;;
+        *)
+            die "invalid saved upgrade mode: $UPGRADE_MODE"
+            ;;
+    esac
+
+    confirm "MINOR UPGRADE" "Stop PostgreSQL $old_version and run mode [$UPGRADE_MODE]? $mode_text"
 
     "$PG_HOME_OLD/bin/pg_ctl" -w -D "$PGDATA_OLD" -m fast stop
-    prepare_new_data_directory
 
-    if ! start_with_home "$PG_HOME_NEW" "$PGDATA_NEW"; then
+    case "$UPGRADE_MODE" in
+        binary)
+            ;;
+        backup)
+            prepare_pgdata_backup
+            ;;
+        copy)
+            prepare_new_data_directory
+            ;;
+    esac
+
+    if ! start_with_home "$PG_HOME_NEW" "$PGDATA_ACTIVE"; then
         echo "NEW PostgreSQL startup failed; restoring OLD binary startup" >&2
         start_with_home "$PG_HOME_OLD" "$PGDATA_OLD" || die "automatic rollback startup also failed"
         die "minor upgrade failed and OLD PostgreSQL was restarted"
     fi
 
     log "minor upgrade startup successful: $old_version -> $TARGET_VERSION"
+    log "upgrade mode: $UPGRADE_MODE"
+    log "active PGDATA: $PGDATA_ACTIVE"
+    [[ -z "$PGDATA_BACKUP" ]] || log "PGDATA backup: $PGDATA_BACKUP"
     echo
     echo "NEXT: sh $0 postcheck"
 }
@@ -556,12 +694,14 @@ postcheck() {
     local settings_after="$WORK_DIR/postgresql_settings.after"
 
     ensure_password
+    [[ -n "$PGDATA_ACTIVE" ]] || die "upgrade mode state not found; run upgrade first"
+
     server_version="$(psql_new -d postgres -Atc 'show server_version')"
     data_directory="$(psql_new -d postgres -Atc 'show data_directory')"
     port="$(psql_new -d postgres -Atc 'show port')"
 
     [[ "$server_version" == "$TARGET_VERSION" ]] || die "server version mismatch: $server_version"
-    [[ "$data_directory" == "$PGDATA_NEW" ]] || die "data directory mismatch: $data_directory"
+    [[ "$data_directory" == "$PGDATA_ACTIVE" ]] || die "data directory mismatch: expected=$PGDATA_ACTIVE actual=$data_directory"
     [[ "$port" == "$PGPORT" ]] || die "port mismatch: $port"
 
     [[ -f "$settings_before" ]] || die "OLD PostgreSQL settings snapshot not found: $settings_before"
@@ -592,6 +732,8 @@ postcheck() {
     fi
 
     log "postcheck complete: PostgreSQL $server_version"
+    log "upgrade mode: $UPGRADE_MODE"
+    log "active PGDATA: $PGDATA_ACTIVE"
     echo
     echo "NEXT: sh $0 env"
 }
@@ -602,7 +744,7 @@ rewrite_profile_file() {
     local tmp="${file}.minor_upgrade.$$"
     local legacy_home="$BASE/pgsql"
 
-    awk -v activate="$activate_new" -v old_home="$PG_HOME_OLD" -v new_home="$PG_HOME_NEW" -v new_data="$PGDATA_NEW" -v new_port="$PGPORT" -v legacy_home="$legacy_home" '
+    awk -v activate="$activate_new" -v old_home="$PG_HOME_OLD" -v new_home="$PG_HOME_NEW" -v new_data="$PGDATA_ACTIVE" -v new_port="$PGPORT" -v legacy_home="$legacy_home" '
         function variable_name(line, value) {
             value = line
             sub(/^[[:space:]]*export[[:space:]]+/, "", value)
@@ -698,6 +840,7 @@ update_env() {
     local file backup_suffix
 
     ensure_password
+    [[ -n "$PGDATA_ACTIVE" ]] || die "upgrade mode state not found; run upgrade first"
     [[ "$(psql_new -d postgres -Atc 'show server_version')" == "$TARGET_VERSION" ]] || die "run upgrade and postcheck first"
 
     backup_suffix="before_pg${TARGET_VERSION}_minor_$(date +%Y%m%d_%H%M%S)"
@@ -715,6 +858,7 @@ update_env() {
     done
 
     log "environment updated; OLD binaries preserved at $PG_HOME_OLD"
+    log "active PGDATA preserved in profile: $PGDATA_ACTIVE"
     echo "Run: source $BASH_PROFILE && hash -r"
     echo "COMPLETE: all four minor-upgrade steps finished."
 }
@@ -726,7 +870,7 @@ Usage:
 
 Steps:
   prepare    Validate, install dependencies, build and precheck while online
-  upgrade    Preserve OLD PGDATA, copy to versioned NEW PGDATA, and start NEW
+  upgrade    Select binary-only, PGDATA backup, or PGDATA copy-and-switch mode
   postcheck  Validate server and update installed extensions where required
   env        Preserve old profile lines as comments and activate NEW PG_HOME
 
