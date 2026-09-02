@@ -5,7 +5,7 @@
 
 set -u
 
-SCRIPT_VERSION="1.0.21"
+SCRIPT_VERSION="1.0.22"
 SERVICE_NAME="${SERVICE_NAME:-}"
 CONFIG_FILE=""
 WORK_ROOT=""
@@ -609,6 +609,8 @@ compare_keyed_validation() {
     fi
     printf '%-28s : REVIEW (ASIS=%s, TOBE=%s, Added=%s, Removed=%s, Changed=%s)\n' "$_label" "$_asis_count" "$_tobe_count" "$_added" "$_removed" "$_changed" >> "$VALIDATION_DIR/validation_summary.txt"
     printf '  Detail: %s\n' "$_detail" >> "$VALIDATION_DIR/validation_summary.txt"
+    printf '  Differences:\n' >> "$VALIDATION_DIR/validation_summary.txt"
+    awk -F '\t' '{ line=""; for (i=1; i<=NF; i++) line=line (i==1 ? "" : " | ") $i; printf "    %s\n", line }' "$_detail" >> "$VALIDATION_DIR/validation_summary.txt"
     EXTENDED_REVIEW=1; return 1
 }
 validate_config_files_unchanged() {
@@ -873,7 +875,7 @@ postcheck() {
     printf '%s\n' 'Runtime Value Comparison:'
     awk -F '\t' '{printf "  %-12s | ASIS: %-35s | TOBE: %-35s | %s\n", $1, $2, $3, $4}' "$_validation_file"
     printf '\nExtended Validation:\n'
-    sed -n '1,300p' "$VALIDATION_DIR/validation_summary.txt"
+    cat "$VALIDATION_DIR/validation_summary.txt"
     if [ "$_validation_failed" -eq 0 ]; then
         printf 'Package Upgrade         : COMPLETED\nAutomatic Upgrade       : COMPLETED\nPost-upgrade Validation : PASSED\n'
         if [ "$_runtime_changed" -eq 0 ]; then
