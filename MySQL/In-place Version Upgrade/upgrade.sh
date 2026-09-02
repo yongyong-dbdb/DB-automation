@@ -5,7 +5,7 @@
 
 set -u
 
-SCRIPT_VERSION="1.0.15"
+SCRIPT_VERSION="1.0.16"
 SERVICE_NAME="${SERVICE_NAME:-}"
 CONFIG_FILE=""
 WORK_ROOT=""
@@ -82,7 +82,7 @@ require_root() {
 }
 
 require_commands() {
-    for _cmd in mysql mysqld mysqldump mysqlcheck my_print_defaults rpm yum tar sha256sum systemctl awk sed grep find stat df du cmp pgrep mktemp tee tr sort sleep cp chmod chown readlink ps wc tail; do
+    for _cmd in mysql mysqld mysqldump mysqlcheck my_print_defaults rpm yum tar sha256sum systemctl awk sed grep find stat df du cmp pgrep mktemp tee tr sort sleep cp chmod chown readlink ps wc tail basename mv; do
         command -v "$_cmd" >/dev/null 2>&1 || die "필수 명령 없음: $_cmd"
     done
 }
@@ -130,27 +130,36 @@ select_service_name() {
     fi
 
     _service_candidates=$(mktemp /tmp/mysql-service-candidates.XXXXXX) || die "서비스 후보 임시 파일 생성 실패"
-    {
-        systemctl list-units --type=service --all --no-legend 2>/dev/null |
-            awk '
-                $1 ~ /^(mysqld|mysql)(@[^.[:space:]]+)?\.service$/ {
-                    sub(/\.service$/, "", $1)
-                    print $1
-                }
-            '
-        systemctl list-unit-files --type=service --no-legend 2>/dev/null |
-            awk '
-                $1 ~ /^(mysqld|mysql)\.service$/ {
-                    sub(/\.service$/, "", $1)
-                    print $1
-                }
-            '
-    } | awk '!seen[$0]++' > "$_service_candidates"
-
-    _service_count=$(wc -l < "$_service_candidates" | tr -d ' ')
-    if [ "$_service_count" -eq 0 ]; then
+    _service_details=$(mktemp /tmp/mysql-service-details.XXXXXX) || {
         rm -f "$_service_candidates"
-        SERVICE_NAME=$(prompt_default "systemd service 이름" "")
+        die "서비스 상세 임시 파일 생성 실패"
+    }
+
+    systemctl list-units --type=service --state=running --no-legend 2>/dev/null |
+        awk '{print $1}' |
+        while IFS= read -r _unit_name; do
+            [ -n "$_unit_name" ] || continue
+            _unit_pid=$(systemctl show "$_unit_name" --property=MainPID --value 2>/dev/null || true)
+            case $_unit_pid in ''|0|*[!0-9]*) continue ;; esac
+            _unit_exe=$(readlink -f "/proc/$_unit_pid/exe" 2>/dev/null || true)
+            [ -n "$_unit_exe" ] || continue
+            case $(basename "$_unit_exe") in
+                mysqld|mysqld-debug)
+                    _unit_service=${_unit_name%.service}
+                    _unit_version=$("$_unit_exe" --version 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="Ver"){print $(i+1); exit}}')
+                    printf '%s\n' "$_unit_service" >> "$_service_candidates"
+                    printf '%s\t%s\t%s\t%s\n' "$_unit_service" "$_unit_pid" "$_unit_exe" "${_unit_version:-unknown}" >> "$_service_details"
+                    ;;
+            esac
+        done
+
+    awk '!seen[$0]++' "$_service_candidates" > "${_service_candidates}.unique"
+    mv "${_service_candidates}.unique" "$_service_candidates"
+    _service_count=$(wc -l < "$_service_candidates" | tr -d ' ')
+
+    if [ "$_service_count" -eq 0 ]; then
+        rm -f "$_service_candidates" "$_service_details"
+        SERVICE_NAME=$(prompt_default "실행 중인 MySQL Service 자동 감지 실패. systemd service 이름" "")
         [ -n "$SERVICE_NAME" ] || die "systemd service 이름 입력 필요"
         systemctl cat "$SERVICE_NAME" >/dev/null 2>&1 || die "systemd service unit 없음: $SERVICE_NAME"
         return 0
@@ -158,28 +167,30 @@ select_service_name() {
 
     if [ "$_service_count" -eq 1 ]; then
         SERVICE_NAME=$(sed -n '1p' "$_service_candidates")
-        rm -f "$_service_candidates"
-        info "systemd service 자동 감지: $SERVICE_NAME"
+        info "실행 중인 MySQL 인스턴스 자동 감지: $SERVICE_NAME"
+        rm -f "$_service_candidates" "$_service_details"
         return 0
     fi
 
-    printf '%s\n' '' '발견된 MySQL systemd service:' >&2
-    awk '{printf "  %d) %s\n", NR, $0}' "$_service_candidates" >&2
-    printf '선택 번호 또는 service 이름 [1]: ' >&2
+    printf '%s\n' '' '실행 중인 MySQL 인스턴스:' >&2
+    awk -F '\t' '{printf "  %d) Service=%s, PID=%s, Binary=%s, Version=%s\n", NR, $1, $2, $3, $4}' "$_service_details" >&2
+    printf '업그레이드 대상 인스턴스 선택 번호: ' >&2
     IFS= read -r _service_choice || {
-        rm -f "$_service_candidates"
+        rm -f "$_service_candidates" "$_service_details"
         exit 1
     }
-    _service_choice=${_service_choice:-1}
     case $_service_choice in
-        *[!0-9]*) SERVICE_NAME=$_service_choice ;;
-        *) SERVICE_NAME=$(sed -n "${_service_choice}p" "$_service_candidates") ;;
+        ''|*[!0-9]*)
+            rm -f "$_service_candidates" "$_service_details"
+            die "올바른 인스턴스 선택 번호 필요"
+            ;;
     esac
-    rm -f "$_service_candidates"
+    SERVICE_NAME=$(sed -n "${_service_choice}p" "$_service_candidates")
+    rm -f "$_service_candidates" "$_service_details"
 
     [ -n "$SERVICE_NAME" ] || die "선택 범위를 벗어난 번호: $_service_choice"
     systemctl cat "$SERVICE_NAME" >/dev/null 2>&1 || die "systemd service unit 없음: $SERVICE_NAME"
-    info "systemd service 선택: $SERVICE_NAME"
+    info "업그레이드 대상 MySQL 인스턴스 선택: $SERVICE_NAME"
 }
 
 select_config_file() {
