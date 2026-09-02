@@ -5,7 +5,7 @@
 
 set -u
 
-SCRIPT_VERSION="1.0.6"
+SCRIPT_VERSION="1.0.7"
 SERVICE_NAME="mysqld"
 CONFIG_FILE="/etc/my.cnf"
 WORK_ROOT=""
@@ -297,24 +297,8 @@ run_upgrade_checker() {
         die "Upgrade Checker 실행 실패 또는 호환성 Error 존재 (Errors: $_errors)"
     fi
 
-    printf '%s\n' '' '===== Upgrade Checker Warning/Notice 요약 ====='
-    awk '
-        /^[0-9]+\)/ { section=$0; next }
-        /^[[:space:]]+(Warning|Notice):/ {
-            if (section != printed_section) {
-                if (printed_section != "") print ""
-                print section
-                printed_section=section
-            }
-            sub(/^[[:space:]]+/, "")
-            print "  " $0
-            detail=1
-            next
-        }
-        detail && /^[[:space:]]*-[[:space:]]/ { print; next }
-        detail && /^[[:space:]]+(Solution:|[A-Za-z0-9_].*:)/ { print; next }
-        /^[[:space:]]*$/ { detail=0 }
-    ' "$_checker"
+    printf '%s\n' '' '===== Upgrade Checker 전체 결과 ====='
+    sed -n '1,2000p' "$_checker"
     printf '\nErrors: %s, Warnings: %s, Notices: %s\n' "$_errors" "$_warnings" "$_notices"
     printf 'Upgrade Checker 원문: %s\n' "$_checker"
     confirm "Upgrade Checker Warning/Notice 검토 완료 후 계속 진행할까요?" || die "사용자 중단"
