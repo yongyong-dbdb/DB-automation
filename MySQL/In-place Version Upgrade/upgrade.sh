@@ -5,7 +5,7 @@
 
 set -u
 
-SCRIPT_VERSION="1.0.19"
+SCRIPT_VERSION="1.0.20"
 SERVICE_NAME="${SERVICE_NAME:-}"
 CONFIG_FILE=""
 WORK_ROOT=""
@@ -327,7 +327,8 @@ collect_inputs() {
     _work_real=$(readlink -m "$WORK_ROOT") || die "작업 경로 확인 실패"
     case "$_work_real/" in "$_data_real"/*) die "작업 경로를 datadir 내부에 지정할 수 없음" ;; esac
     mkdir -p "$WORK_ROOT" || die "작업 경로 생성 실패: $WORK_ROOT"
-    SMOKE_SQL_FILE=$(prompt_default "업그레이드 후 업무 검증 SQL 파일 절대 경로 [선택, 미사용 시 Enter]" "")
+    printf '업그레이드 후 업무 검증 SQL 파일 절대 경로 [선택, 미사용 시 Enter]: ' >&2
+    IFS= read -r SMOKE_SQL_FILE || exit 1
     [ -z "$SMOKE_SQL_FILE" ] || [ -f "$SMOKE_SQL_FILE" ] || die "Application Smoke Test SQL 파일 없음: $SMOKE_SQL_FILE"
 }
 
@@ -557,7 +558,7 @@ snapshot_validation_state() {
     _phase=$1; _version=$2; _suffix="${_version}.${_phase}"
     mysql_cmd -NBe "SHOW GLOBAL VARIABLES" | sort > "$VALIDATION_DIR/global_variables_${_suffix}.txt" || die "Global Variables 저장 실패"
     mysql_cmd -NBe "SELECT VERSION(),@@version_comment,@@basedir,@@datadir,@@port,@@socket,@@server_id,@@hostname,@@lower_case_table_names,@@character_set_server,@@collation_server,@@sql_mode,@@time_zone,@@max_connections" > "$VALIDATION_DIR/server_identity_${_suffix}.txt" || die "Server Identity 저장 실패"
-    mysql_cmd -NBe "SELECT TABLE_SCHEMA,TABLE_TYPE,COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA NOT IN ('mysql','sys','performance_schema','information_schema') GROUP BY TABLE_SCHEMA,TABLE_TYPE UNION ALL SELECT TRIGGER_SCHEMA,'TRIGGER',COUNT(*) FROM INFORMATION_SCHEMA.TRIGGERS GROUP BY TRIGGER_SCHEMA UNION ALL SELECT ROUTINE_SCHEMA,ROUTINE_TYPE,COUNT(*) FROM INFORMATION_SCHEMA.ROUTINES GROUP BY ROUTINE_SCHEMA UNION ALL SELECT EVENT_SCHEMA,'EVENT',COUNT(*) FROM INFORMATION_SCHEMA.EVENTS GROUP BY EVENT_SCHEMA ORDER BY 1,2" > "$VALIDATION_DIR/user_objects_${_suffix}.txt" || die "사용자 객체 저장 실패"
+    mysql_cmd -NBe "SELECT TABLE_SCHEMA,TABLE_TYPE,COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA NOT IN ('mysql','sys','performance_schema','information_schema') GROUP BY TABLE_SCHEMA,TABLE_TYPE UNION ALL SELECT TRIGGER_SCHEMA,'TRIGGER',COUNT(*) FROM INFORMATION_SCHEMA.TRIGGERS GROUP BY TRIGGER_SCHEMA UNION ALL SELECT ROUTINE_SCHEMA,ROUTINE_TYPE,COUNT(*) FROM INFORMATION_SCHEMA.ROUTINES GROUP BY ROUTINE_SCHEMA,ROUTINE_TYPE UNION ALL SELECT EVENT_SCHEMA,'EVENT',COUNT(*) FROM INFORMATION_SCHEMA.EVENTS GROUP BY EVENT_SCHEMA ORDER BY 1,2" > "$VALIDATION_DIR/user_objects_${_suffix}.txt" || die "사용자 객체 저장 실패"
     mysql_cmd -NBe "SELECT TABLE_SCHEMA,COUNT(*),COALESCE(SUM(TABLE_ROWS),0),COALESCE(SUM(DATA_LENGTH),0),COALESCE(SUM(INDEX_LENGTH),0) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA NOT IN ('mysql','sys','performance_schema','information_schema') GROUP BY TABLE_SCHEMA ORDER BY TABLE_SCHEMA" > "$VALIDATION_DIR/schema_metrics_${_suffix}.txt" || die "Schema 지표 저장 실패"
     mysql_cmd -NBe "SELECT user,host,plugin,account_locked FROM mysql.user ORDER BY user,host" > "$VALIDATION_DIR/accounts_${_suffix}.txt" || die "계정 저장 실패"
     mysql_cmd -NBe "SELECT PLUGIN_NAME,PLUGIN_VERSION,PLUGIN_STATUS,PLUGIN_TYPE,COALESCE(PLUGIN_LIBRARY,'BUILT-IN') FROM INFORMATION_SCHEMA.PLUGINS WHERE PLUGIN_STATUS='ACTIVE' ORDER BY PLUGIN_TYPE,PLUGIN_NAME" > "$VALIDATION_DIR/plugins_${_suffix}.txt" || die "Plugin 저장 실패"
