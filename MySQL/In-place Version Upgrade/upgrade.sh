@@ -5,13 +5,13 @@
 
 set -u
 
-SCRIPT_VERSION="1.0.7"
+SCRIPT_VERSION="1.0.8"
 SERVICE_NAME="mysqld"
 CONFIG_FILE="/etc/my.cnf"
 WORK_ROOT=""
 DB_USER=""
-DB_HOST="localhost"
-DB_PORT="3306"
+DB_HOST=""
+DB_PORT=""
 DB_SOCKET=""
 CONNECTION_MODE="socket"
 BACKUP_MODE="1"
@@ -127,7 +127,14 @@ collect_inputs() {
             CONNECTION_MODE="socket"
             DB_SOCKET=$(prompt_default "Unix Socket 경로" "$_socket_default")
             ;;
-        2) CONNECTION_MODE="tcp"; DB_HOST=$(prompt_default "Host" "localhost"); DB_PORT=$(prompt_default "Port" "3306") ;;
+        2)
+            CONNECTION_MODE="tcp"
+            _host_default="localhost"
+            _port_default=$(my_print_defaults mysqld 2>/dev/null | sed -n 's/^--port=//p' | tail -n 1)
+            [ -n "$_port_default" ] || _port_default="3306"
+            DB_HOST=$(prompt_default "Host" "$_host_default")
+            DB_PORT=$(prompt_default "Port" "$_port_default")
+            ;;
         *) die "잘못된 접속 방식" ;;
     esac
     create_login_file
