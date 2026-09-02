@@ -5,7 +5,7 @@
 
 set -u
 
-SCRIPT_VERSION="1.0.18"
+SCRIPT_VERSION="1.0.19"
 SERVICE_NAME="${SERVICE_NAME:-}"
 CONFIG_FILE=""
 WORK_ROOT=""
@@ -327,7 +327,7 @@ collect_inputs() {
     _work_real=$(readlink -m "$WORK_ROOT") || die "작업 경로 확인 실패"
     case "$_work_real/" in "$_data_real"/*) die "작업 경로를 datadir 내부에 지정할 수 없음" ;; esac
     mkdir -p "$WORK_ROOT" || die "작업 경로 생성 실패: $WORK_ROOT"
-    SMOKE_SQL_FILE=$(prompt_default "Application Smoke Test SQL 파일 절대 경로 (미사용 시 Enter)" "")
+    SMOKE_SQL_FILE=$(prompt_default "업그레이드 후 업무 검증 SQL 파일 절대 경로 [선택, 미사용 시 Enter]" "")
     [ -z "$SMOKE_SQL_FILE" ] || [ -f "$SMOKE_SQL_FILE" ] || die "Application Smoke Test SQL 파일 없음: $SMOKE_SQL_FILE"
 }
 
