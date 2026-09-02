@@ -5,7 +5,7 @@
 
 set -u
 
-SCRIPT_VERSION="1.0.17"
+SCRIPT_VERSION="1.0.18"
 SERVICE_NAME="${SERVICE_NAME:-}"
 CONFIG_FILE=""
 WORK_ROOT=""
@@ -36,6 +36,11 @@ LOG_FILE=""
 BACKUP_DIR=""
 CONFIG_BACKUP_DIR=""
 CONFIG_PRIMARY_BACKUP=""
+VALIDATION_DIR=""
+SMOKE_SQL_FILE=""
+BEFORE_ERROR_LOG_LINES="0"
+EXTENDED_FAILED="0"
+EXTENDED_REVIEW="0"
 RPM_LIST_FILE=""
 
 line() { printf '%s\n' '=============================================================================='; }
@@ -84,7 +89,7 @@ require_root() {
 }
 
 require_commands() {
-    for _cmd in mysql mysqld mysqldump mysqlcheck my_print_defaults rpm yum tar sha256sum systemctl awk sed grep find stat df du cmp pgrep mktemp tee tr sort sleep cp chmod chown readlink ps wc tail basename mv; do
+    for _cmd in mysql mysqld mysqldump mysqlcheck my_print_defaults rpm yum tar sha256sum systemctl awk sed grep find stat df du cmp diff pgrep mktemp tee tr sort sleep cp chmod chown readlink ps wc tail basename mv; do
         command -v "$_cmd" >/dev/null 2>&1 || die "필수 명령 없음: $_cmd"
     done
 }
@@ -322,6 +327,8 @@ collect_inputs() {
     _work_real=$(readlink -m "$WORK_ROOT") || die "작업 경로 확인 실패"
     case "$_work_real/" in "$_data_real"/*) die "작업 경로를 datadir 내부에 지정할 수 없음" ;; esac
     mkdir -p "$WORK_ROOT" || die "작업 경로 생성 실패: $WORK_ROOT"
+    SMOKE_SQL_FILE=$(prompt_default "Application Smoke Test SQL 파일 절대 경로 (미사용 시 Enter)" "")
+    [ -z "$SMOKE_SQL_FILE" ] || [ -f "$SMOKE_SQL_FILE" ] || die "Application Smoke Test SQL 파일 없음: $SMOKE_SQL_FILE"
 }
 
 select_package_source() {
@@ -487,7 +494,10 @@ setup_run_paths() {
     BACKUP_DIR="$WORK_ROOT/${CURRENT_VERSION}_to_${TARGET_VERSION}_${RUN_ID}"
     mkdir -p "$BACKUP_DIR" || die "백업 디렉터리 생성 실패"
     LOG_FILE="$BACKUP_DIR/upgrade.log"
+    VALIDATION_DIR="$BACKUP_DIR/validation"
     chmod 700 "$BACKUP_DIR"
+    mkdir -p "$VALIDATION_DIR" || die "검증 디렉터리 생성 실패"
+    chmod 700 "$VALIDATION_DIR"
     backup_option_files
 }
 
@@ -502,6 +512,8 @@ show_summary() {
     printf 'DB Account        : %s\n' "$DB_USER"
     printf 'Backup Directory  : %s\n' "$BACKUP_DIR"
     printf 'Config Backup Dir : %s\n' "$CONFIG_BACKUP_DIR"
+    printf 'Validation Dir    : %s\n' "$VALIDATION_DIR"
+    [ -n "$SMOKE_SQL_FILE" ] && printf 'Smoke Test SQL   : %s\n' "$SMOKE_SQL_FILE"
     [ "$PACKAGE_SOURCE" = "1" ] || printf 'Package Source    : %s\n' "$PACKAGE_PATH"
     line
     confirm "이 구성으로 사전 검사를 시작할까요?" || die "사용자 취소"
@@ -541,8 +553,80 @@ run_upgrade_checker() {
     confirm "Upgrade Checker Warning/Notice 검토 완료 후 계속 진행할까요?" || die "사용자 중단"
 }
 
+snapshot_validation_state() {
+    _phase=$1; _version=$2; _suffix="${_version}.${_phase}"
+    mysql_cmd -NBe "SHOW GLOBAL VARIABLES" | sort > "$VALIDATION_DIR/global_variables_${_suffix}.txt" || die "Global Variables 저장 실패"
+    mysql_cmd -NBe "SELECT VERSION(),@@version_comment,@@basedir,@@datadir,@@port,@@socket,@@server_id,@@hostname,@@lower_case_table_names,@@character_set_server,@@collation_server,@@sql_mode,@@time_zone,@@max_connections" > "$VALIDATION_DIR/server_identity_${_suffix}.txt" || die "Server Identity 저장 실패"
+    mysql_cmd -NBe "SELECT TABLE_SCHEMA,TABLE_TYPE,COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA NOT IN ('mysql','sys','performance_schema','information_schema') GROUP BY TABLE_SCHEMA,TABLE_TYPE UNION ALL SELECT TRIGGER_SCHEMA,'TRIGGER',COUNT(*) FROM INFORMATION_SCHEMA.TRIGGERS GROUP BY TRIGGER_SCHEMA UNION ALL SELECT ROUTINE_SCHEMA,ROUTINE_TYPE,COUNT(*) FROM INFORMATION_SCHEMA.ROUTINES GROUP BY ROUTINE_SCHEMA UNION ALL SELECT EVENT_SCHEMA,'EVENT',COUNT(*) FROM INFORMATION_SCHEMA.EVENTS GROUP BY EVENT_SCHEMA ORDER BY 1,2" > "$VALIDATION_DIR/user_objects_${_suffix}.txt" || die "사용자 객체 저장 실패"
+    mysql_cmd -NBe "SELECT TABLE_SCHEMA,COUNT(*),COALESCE(SUM(TABLE_ROWS),0),COALESCE(SUM(DATA_LENGTH),0),COALESCE(SUM(INDEX_LENGTH),0) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA NOT IN ('mysql','sys','performance_schema','information_schema') GROUP BY TABLE_SCHEMA ORDER BY TABLE_SCHEMA" > "$VALIDATION_DIR/schema_metrics_${_suffix}.txt" || die "Schema 지표 저장 실패"
+    mysql_cmd -NBe "SELECT user,host,plugin,account_locked FROM mysql.user ORDER BY user,host" > "$VALIDATION_DIR/accounts_${_suffix}.txt" || die "계정 저장 실패"
+    mysql_cmd -NBe "SELECT PLUGIN_NAME,PLUGIN_VERSION,PLUGIN_STATUS,PLUGIN_TYPE,COALESCE(PLUGIN_LIBRARY,'BUILT-IN') FROM INFORMATION_SCHEMA.PLUGINS WHERE PLUGIN_STATUS='ACTIVE' ORDER BY PLUGIN_TYPE,PLUGIN_NAME" > "$VALIDATION_DIR/plugins_${_suffix}.txt" || die "Plugin 저장 실패"
+    rpm -qa --qf '%{NAME}\t%{VERSION}-%{RELEASE}.%{ARCH}\n' | grep '^mysql' | sort > "$VALIDATION_DIR/rpm_${_suffix}.txt" || true
+    { systemctl is-active "$SERVICE_NAME" 2>/dev/null || true; systemctl show "$SERVICE_NAME" --property=MainPID,ExecMainStatus,SubState --no-pager 2>/dev/null || true; } > "$VALIDATION_DIR/service_${_suffix}.txt"
+    { mysql_cmd -NBe "SELECT @@gtid_mode,@@enforce_gtid_consistency,@@global.gtid_executed,@@global.gtid_purged" 2>/dev/null || true; mysql_cmd -e "SHOW REPLICA STATUS\G" 2>/dev/null || true; } > "$VALIDATION_DIR/replication_${_suffix}.txt"
+}
+
+compare_validation_file() {
+    _label=$1; _before=$2; _after=$3; _diff=$4
+    if cmp -s "$_before" "$_after"; then printf '%-28s : PASSED\n' "$_label" >> "$VALIDATION_DIR/validation_summary.txt"; return 0; fi
+    diff -u "$_before" "$_after" > "$_diff" 2>/dev/null || true
+    printf '%-28s : REVIEW (%s)\n' "$_label" "$_diff" >> "$VALIDATION_DIR/validation_summary.txt"
+    EXTENDED_REVIEW=1; return 1
+}
+
+validate_config_files_unchanged() {
+    while IFS="$(printf '\t')" read -r _original _saved; do
+        [ -f "$_original" ] || die "업그레이드 전 Config 원본 파일 없음: $_original"
+        cmp -s "$_original" "$CONFIG_BACKUP_DIR/$_saved" || die "기존 Config 변경 감지: $_original"
+    done < "$CONFIG_BACKUP_DIR/option_files.manifest"
+}
+
+validate_replication_state() {
+    _before="$VALIDATION_DIR/replication_${CURRENT_VERSION}.before.txt"; _after="$VALIDATION_DIR/replication_${TARGET_VERSION}.after.txt"
+    _bc=$(grep -c '^[[:space:]]*Source_Host:' "$_before" 2>/dev/null || true); _ac=$(grep -c '^[[:space:]]*Source_Host:' "$_after" 2>/dev/null || true)
+    if [ "$_bc" -eq 0 ] && [ "$_ac" -eq 0 ]; then printf '%-28s : NOT APPLICABLE\n' "Replication" >> "$VALIDATION_DIR/validation_summary.txt"; return 0; fi
+    _io=$(grep -c '^[[:space:]]*Replica_IO_Running: Yes' "$_after" 2>/dev/null || true); _sql=$(grep -c '^[[:space:]]*Replica_SQL_Running: Yes' "$_after" 2>/dev/null || true)
+    if [ "$_bc" -eq "$_ac" ] && [ "$_io" -eq "$_ac" ] && [ "$_sql" -eq "$_ac" ]; then printf '%-28s : PASSED (%s channel)\n' "Replication" "$_ac" >> "$VALIDATION_DIR/validation_summary.txt"; return 0; fi
+    printf '%-28s : FAILED (channel 또는 IO/SQL 상태)\n' "Replication" >> "$VALIDATION_DIR/validation_summary.txt"; EXTENDED_FAILED=1; return 1
+}
+
+validate_new_error_log() {
+    _result="$VALIDATION_DIR/error_log_${TARGET_VERSION}.after.txt"; : > "$_result"
+    if [ -n "$LOG_ERROR" ] && [ -f "$LOG_ERROR" ]; then _start=$((BEFORE_ERROR_LOG_LINES + 1)); tail -n "+$_start" "$LOG_ERROR" > "$_result" 2>/dev/null || true; fi
+    if grep -Ei '\[ERROR\]|fatal|abort|upgrade[^[:alnum:]]+fail|fail[^[:alnum:]]+upgrade' "$_result" > "$VALIDATION_DIR/error_log_critical_${TARGET_VERSION}.txt" 2>/dev/null; then printf '%-28s : FAILED\n' "Error Log" >> "$VALIDATION_DIR/validation_summary.txt"; EXTENDED_FAILED=1; return 1; fi
+    if grep -Ei 'warning|deprecated' "$_result" > "$VALIDATION_DIR/error_log_review_${TARGET_VERSION}.txt" 2>/dev/null; then printf '%-28s : REVIEW\n' "Error Log" >> "$VALIDATION_DIR/validation_summary.txt"; EXTENDED_REVIEW=1; return 0; fi
+    printf '%-28s : PASSED\n' "Error Log" >> "$VALIDATION_DIR/validation_summary.txt"
+}
+
+run_smoke_test() {
+    if [ -z "$SMOKE_SQL_FILE" ]; then printf '%-28s : NOT PROVIDED\n' "Application Smoke Test" >> "$VALIDATION_DIR/validation_summary.txt"; return 0; fi
+    if mysql_cmd < "$SMOKE_SQL_FILE" > "$VALIDATION_DIR/application_smoke_${TARGET_VERSION}.out" 2> "$VALIDATION_DIR/application_smoke_${TARGET_VERSION}.err"; then printf '%-28s : PASSED\n' "Application Smoke Test" >> "$VALIDATION_DIR/validation_summary.txt"; return 0; fi
+    printf '%-28s : FAILED\n' "Application Smoke Test" >> "$VALIDATION_DIR/validation_summary.txt"; EXTENDED_FAILED=1; return 1
+}
+
+run_extended_validation() {
+    EXTENDED_FAILED=0; EXTENDED_REVIEW=0; : > "$VALIDATION_DIR/validation_summary.txt"
+    printf 'MySQL Upgrade Validation Summary\nASIS=%s TOBE=%s Service=%s\n\n' "$CURRENT_VERSION" "$TARGET_VERSION" "$SERVICE_NAME" >> "$VALIDATION_DIR/validation_summary.txt"
+    compare_validation_file "User Objects" "$VALIDATION_DIR/user_objects_${CURRENT_VERSION}.before.txt" "$VALIDATION_DIR/user_objects_${TARGET_VERSION}.after.txt" "$VALIDATION_DIR/user_objects_${CURRENT_VERSION}_to_${TARGET_VERSION}.diff" || true
+    compare_validation_file "Schema Metrics (estimated)" "$VALIDATION_DIR/schema_metrics_${CURRENT_VERSION}.before.txt" "$VALIDATION_DIR/schema_metrics_${TARGET_VERSION}.after.txt" "$VALIDATION_DIR/schema_metrics_${CURRENT_VERSION}_to_${TARGET_VERSION}.diff" || true
+    compare_validation_file "Accounts" "$VALIDATION_DIR/accounts_${CURRENT_VERSION}.before.txt" "$VALIDATION_DIR/accounts_${TARGET_VERSION}.after.txt" "$VALIDATION_DIR/accounts_${CURRENT_VERSION}_to_${TARGET_VERSION}.diff" || true
+    compare_validation_file "Active Plugins" "$VALIDATION_DIR/plugins_${CURRENT_VERSION}.before.txt" "$VALIDATION_DIR/plugins_${TARGET_VERSION}.after.txt" "$VALIDATION_DIR/plugins_${CURRENT_VERSION}_to_${TARGET_VERSION}.diff" || true
+    compare_validation_file "Global Variables" "$VALIDATION_DIR/global_variables_${CURRENT_VERSION}.before.txt" "$VALIDATION_DIR/global_variables_${TARGET_VERSION}.after.txt" "$VALIDATION_DIR/global_variables_${CURRENT_VERSION}_to_${TARGET_VERSION}.diff" || true
+    if rpm -qa --qf '%{NAME}\t%{VERSION}\n' | awk -F '\t' -v target="$TARGET_VERSION" '$1 ~ /^mysql-community-/ && $2 != target {bad=1} END{exit bad}'; then printf '%-28s : PASSED\n' "RPM Packages" >> "$VALIDATION_DIR/validation_summary.txt"; else printf '%-28s : FAILED\n' "RPM Packages" >> "$VALIDATION_DIR/validation_summary.txt"; EXTENDED_FAILED=1; fi
+    if [ "$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || true)" = "active" ] && [ "$(systemctl show "$SERVICE_NAME" --property=MainPID --value 2>/dev/null || true)" != "0" ]; then printf '%-28s : PASSED\n' "systemd Service" >> "$VALIDATION_DIR/validation_summary.txt"; else printf '%-28s : FAILED\n' "systemd Service" >> "$VALIDATION_DIR/validation_summary.txt"; EXTENDED_FAILED=1; fi
+    printf '%-28s : PASSED\n' "Config Files" >> "$VALIDATION_DIR/validation_summary.txt"
+    validate_replication_state || true; validate_new_error_log || true; run_smoke_test || true
+    if [ "$EXTENDED_FAILED" -ne 0 ]; then _overall=FAILED; elif [ "$EXTENDED_REVIEW" -ne 0 ]; then _overall=REVIEW; else _overall=PASSED; fi
+    printf '\nOverall Result               : %s\n' "$_overall" >> "$VALIDATION_DIR/validation_summary.txt"
+}
 collect_precheck() {
     info "업그레이드 전 상태 저장"
+    if [ -n "$LOG_ERROR" ] && [ -f "$LOG_ERROR" ]; then
+        BEFORE_ERROR_LOG_LINES=$(wc -l < "$LOG_ERROR" | tr -d ' ')
+    else
+        BEFORE_ERROR_LOG_LINES=0
+    fi
+    snapshot_validation_state before "$CURRENT_VERSION"
     mysql_cmd --table -e "SELECT 'SERVER_INFO' AS section; SELECT VERSION() version,@@version_comment edition,@@basedir basedir,@@datadir datadir,@@port port,@@socket socket,@@server_id server_id; SELECT 'SCHEMA_TABLE_COUNT' AS section; SELECT TABLE_SCHEMA,COUNT(*) table_count FROM INFORMATION_SCHEMA.TABLES GROUP BY TABLE_SCHEMA ORDER BY TABLE_SCHEMA; SELECT 'SCHEMA_SIZE' AS section; SELECT TABLE_SCHEMA,COUNT(*) table_count,COALESCE(SUM(TABLE_ROWS),0) estimated_rows,COALESCE(SUM(DATA_LENGTH),0) data_bytes,COALESCE(SUM(INDEX_LENGTH),0) index_bytes FROM INFORMATION_SCHEMA.TABLES GROUP BY TABLE_SCHEMA ORDER BY TABLE_SCHEMA; SELECT 'USERS' AS section; SELECT user,host,plugin,account_locked FROM mysql.user ORDER BY user,host; SELECT 'ACTIVE_PLUGINS' AS section; SELECT PLUGIN_NAME,PLUGIN_VERSION,PLUGIN_STATUS,PLUGIN_TYPE,COALESCE(PLUGIN_LIBRARY,'BUILT-IN') plugin_library FROM INFORMATION_SCHEMA.PLUGINS WHERE PLUGIN_STATUS='ACTIVE' ORDER BY PLUGIN_TYPE,PLUGIN_NAME;" > "$BACKUP_DIR/mysql_state_${CURRENT_VERSION}.before.txt" || die "DB 상태 저장 실패"
     {
         printf '===== RPM PACKAGES =====\n'; rpm -qa --qf '%{NAME} %{VERSION}-%{RELEASE}.%{ARCH}\n' | grep '^mysql' | sort
@@ -692,6 +776,7 @@ upgrade_packages() {
 validate_config_after_rpm() {
     if [ -f "${CONFIG_FILE}.rpmnew" ]; then cp -a "${CONFIG_FILE}.rpmnew" "$BACKUP_DIR/my.cnf.${TARGET_VERSION}.rpmnew" || die "rpmnew 보관 실패"; fi
     cmp -s "$CONFIG_PRIMARY_BACKUP" "$CONFIG_FILE" || die "기존 option file 변경 감지: $CONFIG_FILE"
+    validate_config_files_unchanged
     mysqld --defaults-file="$CONFIG_FILE" --validate-config --user="$OS_SERVICE_USER" >> "$LOG_FILE" 2>&1 || die "새 mysqld의 기존 option file 검증 실패"
     _new_datadir=$(my_print_defaults_cmd | sed -n 's/^--datadir=//p' | tail -n 1)
     [ "${_new_datadir%/}" = "${DATADIR%/}" ] || die "datadir 변경 감지: $DATADIR -> $_new_datadir"
@@ -718,6 +803,7 @@ start_and_wait() {
 
 postcheck() {
     info "업그레이드 후 검증"
+    snapshot_validation_state after "$TARGET_VERSION"
     mysql_cmd --table -e "SELECT 'SERVER_INFO' AS section; SELECT VERSION() version,@@version_comment edition,@@basedir basedir,@@datadir datadir,@@port port,@@socket socket,@@server_id server_id; SELECT 'SCHEMA_TABLE_COUNT' AS section; SELECT TABLE_SCHEMA,COUNT(*) table_count FROM INFORMATION_SCHEMA.TABLES GROUP BY TABLE_SCHEMA ORDER BY TABLE_SCHEMA; SELECT 'SCHEMA_SIZE' AS section; SELECT TABLE_SCHEMA,COUNT(*) table_count,COALESCE(SUM(TABLE_ROWS),0) estimated_rows,COALESCE(SUM(DATA_LENGTH),0) data_bytes,COALESCE(SUM(INDEX_LENGTH),0) index_bytes FROM INFORMATION_SCHEMA.TABLES GROUP BY TABLE_SCHEMA ORDER BY TABLE_SCHEMA; SELECT 'USERS' AS section; SELECT user,host,plugin,account_locked FROM mysql.user ORDER BY user,host; SELECT 'ACTIVE_PLUGINS' AS section; SELECT PLUGIN_NAME,PLUGIN_VERSION,PLUGIN_STATUS,PLUGIN_TYPE,COALESCE(PLUGIN_LIBRARY,'BUILT-IN') plugin_library FROM INFORMATION_SCHEMA.PLUGINS WHERE PLUGIN_STATUS='ACTIVE' ORDER BY PLUGIN_TYPE,PLUGIN_NAME;" > "$BACKUP_DIR/mysql_state_${TARGET_VERSION}.after.txt" || die "업그레이드 후 상태 저장 실패"
     _after_version=$(mysql_cmd -NBe "SELECT VERSION()") || die "업그레이드 후 version 조회 실패"
     _after_basedir=$(mysql_cmd -NBe "SELECT @@basedir") || die "업그레이드 후 basedir 조회 실패"
@@ -743,6 +829,8 @@ postcheck() {
     fi
     rpm -qa --qf '%{NAME} %{VERSION}-%{RELEASE}.%{ARCH}\n' | grep '^mysql' | sort > "$BACKUP_DIR/rpm_${TARGET_VERSION}.after.txt"
     cp -a "$CONFIG_FILE" "$BACKUP_DIR/my.cnf.${TARGET_VERSION}.after"
+    run_extended_validation
+    [ "$EXTENDED_FAILED" -eq 0 ] || _validation_failed=1
     chown -R "$OS_SERVICE_USER:$OS_SERVICE_GROUP" "$BACKUP_DIR" 2>/dev/null || warn "결과 파일 소유권 변경 실패"
     line
     printf '%s\n' 'Runtime Value Comparison:'
@@ -755,12 +843,13 @@ postcheck() {
             printf 'Runtime Value Review    : USER ACTION REQUIRED\n'
             warn "업그레이드 전후 런타임 값 변경 감지. 비교 결과 확인 후 사용자가 조치"
         fi
-        printf 'Current Version         : %s\nTarget Version          : %s\nResult Directory        : %s\n' "$CURRENT_VERSION" "$TARGET_VERSION" "$BACKUP_DIR"
+        printf 'Current Version         : %s\nTarget Version          : %s\nResult Directory        : %s\nValidation Summary      : %s\n' "$CURRENT_VERSION" "$TARGET_VERSION" "$BACKUP_DIR" "$VALIDATION_DIR/validation_summary.txt"
     else
         printf 'Package Upgrade         : COMPLETED\nAutomatic Upgrade       : COMPLETED\nPost-upgrade Validation : FAILED\nDatabase Service        : RUNNING (자동 종료 안 함)\nComparison Result       : %s\nResult Directory        : %s\n' "$_validation_file" "$BACKUP_DIR"
         printf '%s\n' '확인 필요 항목:'
         awk -F '\t' 'NR==1 || $4=="FAILED"' "$_validation_file"
         line
+        printf 'Validation Summary      : %s\n' "$VALIDATION_DIR/validation_summary.txt"
         warn "패키지 업그레이드는 적용됐지만 사후 검증 실패. 자동 Rollback 또는 서비스 종료는 수행하지 않음"
         return 1
     fi
