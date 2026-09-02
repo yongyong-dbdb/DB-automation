@@ -5,7 +5,7 @@
 
 set -u
 
-SCRIPT_VERSION="1.0.10"
+SCRIPT_VERSION="1.0.11"
 SERVICE_NAME="mysqld"
 CONFIG_FILE=""
 WORK_ROOT=""
@@ -42,6 +42,9 @@ warn() { printf '[WARNING] %s\n' "$*" >&2; [ -n "$LOG_FILE" ] && printf '[WARNIN
 die() { printf '[ERROR] %s\n' "$*" >&2; [ -n "$LOG_FILE" ] && printf '[ERROR] %s\n' "$*" >> "$LOG_FILE"; exit 1; }
 
 cleanup() {
+    if [ -t 0 ]; then
+        stty echo 2>/dev/null || true
+    fi
     [ -n "$MYSQL_CNF" ] && [ -f "$MYSQL_CNF" ] && rm -f "$MYSQL_CNF"
     [ -n "$TMP_DIR" ] && [ -d "$TMP_DIR" ] && rm -rf "$TMP_DIR"
     return 0
