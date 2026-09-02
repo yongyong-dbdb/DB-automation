@@ -5,7 +5,7 @@
 
 set -u
 
-SCRIPT_VERSION="1.0.13"
+SCRIPT_VERSION="1.0.14"
 SERVICE_NAME="${SERVICE_NAME:-}"
 CONFIG_FILE=""
 WORK_ROOT=""
@@ -217,6 +217,13 @@ select_config_file() {
         return 0
     fi
 
+    if [ "$_config_count" -eq 1 ]; then
+        CONFIG_FILE=$(sed -n '1p' "$_config_candidates")
+        rm -f "$_config_candidates"
+        info "MySQL option file 자동 감지: $CONFIG_FILE"
+        return 0
+    fi
+
     printf '%s\n' '' '발견된 MySQL option file:' >&2
     awk '{printf "  %d) %s\n", NR, $0}' "$_config_candidates" >&2
     printf '선택 번호 또는 option file 절대 경로 [1]: ' >&2
@@ -241,37 +248,37 @@ select_config_file() {
     info "MySQL option file 선택: $CONFIG_FILE"
 }
 
+configure_connection() {
+    _socket_detected=$(my_print_defaults_cmd 2>/dev/null | sed -n 's/^--socket=//p' | tail -n 1)
+    [ -n "$_socket_detected" ] || _socket_detected=$(mysqld_effective_value socket)
+
+    if [ -n "$_socket_detected" ] && [ -S "$_socket_detected" ]; then
+        CONNECTION_MODE="socket"
+        DB_SOCKET=$_socket_detected
+        info "실행 중인 MySQL Unix Socket 자동 감지: $DB_SOCKET"
+        return 0
+    fi
+
+    warn "실행 중인 MySQL Unix Socket을 자동 확인하지 못함"
+    CONNECTION_MODE="tcp"
+    _port_detected=$(my_print_defaults_cmd 2>/dev/null | sed -n 's/^--port=//p' | tail -n 1)
+    [ -n "$_port_detected" ] || _port_detected=$(mysqld_effective_value port)
+    DB_HOST=$(prompt_default "TCP Host" "")
+    [ -n "$DB_HOST" ] || die "TCP Host 입력 필요"
+    DB_PORT=$(prompt_default "TCP Port" "$_port_detected")
+    [ -n "$DB_PORT" ] || die "TCP Port 입력 필요"
+    case $DB_PORT in *[!0-9]*) die "TCP Port는 숫자만 입력 가능: $DB_PORT" ;; esac
+}
+
 collect_inputs() {
     line
     printf 'MySQL RPM Package-based In-place Upgrade Automation v%s\n' "$SCRIPT_VERSION"
     line
     select_service_name
     select_config_file
+    configure_connection
     DB_USER=$(prompt_default "MySQL 접속용 DB 관리자 계정 (OS 계정 아님)" "")
     [ -n "$DB_USER" ] || die "MySQL DB 관리자 계정 입력 필요"
-
-    printf '\n접속 방식\n1) Unix Socket\n2) TCP/IP\n선택 [1]: '
-    IFS= read -r _mode
-    case ${_mode:-1} in
-        1)
-            _socket_default=$(my_print_defaults_cmd 2>/dev/null | sed -n 's/^--socket=//p' | tail -n 1)
-            [ -n "$_socket_default" ] || _socket_default=$(mysqld_effective_value socket)
-            CONNECTION_MODE="socket"
-            DB_SOCKET=$(prompt_default "Unix Socket 경로" "$_socket_default")
-            [ -n "$DB_SOCKET" ] || die "Unix Socket 경로 입력 필요"
-            ;;
-        2)
-            CONNECTION_MODE="tcp"
-            _port_default=$(my_print_defaults_cmd 2>/dev/null | sed -n 's/^--port=//p' | tail -n 1)
-            [ -n "$_port_default" ] || _port_default=$(mysqld_effective_value port)
-            DB_HOST=$(prompt_default "Host" "")
-            [ -n "$DB_HOST" ] || die "TCP Host 입력 필요"
-            DB_PORT=$(prompt_default "Port" "$_port_default")
-            [ -n "$DB_PORT" ] || die "TCP Port 입력 필요"
-            case $DB_PORT in *[!0-9]*) die "TCP Port는 숫자만 입력 가능: $DB_PORT" ;; esac
-            ;;
-        *) die "잘못된 접속 방식" ;;
-    esac
     create_login_file
     mysql_cmd -NBe "SELECT 1" >/dev/null 2>&1 || die "MySQL 접속 실패"
     CURRENT_VERSION=$(mysql_cmd -NBe "SELECT VERSION()") || die "현재 버전 조회 실패"
@@ -281,8 +288,10 @@ collect_inputs() {
     BEFORE_SOCKET=$(mysql_cmd -NBe "SELECT @@socket") || die "socket 조회 실패"
     BEFORE_SERVER_ID=$(mysql_cmd -NBe "SELECT @@server_id") || die "server_id 조회 실패"
     DATADIR=$BEFORE_DATADIR
-    LOG_ERROR=$(my_print_defaults_cmd 2>/dev/null | sed -n 's/^--log-error=//p' | tail -n 1)
-    [ -n "$LOG_ERROR" ] || LOG_ERROR=$(mysql_cmd -NBe "SELECT @@log_error" 2>/dev/null || true)
+    DB_PORT=$BEFORE_PORT
+    DB_SOCKET=$BEFORE_SOCKET
+    LOG_ERROR=$(mysql_cmd -NBe "SELECT @@log_error") || die "log_error 조회 실패"
+    info "실행 중인 MySQL Runtime 값 확인: socket=$DB_SOCKET, port=$DB_PORT, datadir=$DATADIR"
     OS_SERVICE_USER=$(stat -c '%U' "$DATADIR") || die "datadir 소유자 조회 실패"
     OS_SERVICE_GROUP=$(stat -c '%G' "$DATADIR") || die "datadir 그룹 조회 실패"
     printf '%s\n' '' '업그레이드 결과 및 백업 저장 경로' '  - Upgrade Checker, 로그, 사전/사후 상태, Logical/Physical Backup 저장' '  - RPM Bundle 또는 RPM 파일 경로는 다음 Package Source 단계에서 별도 입력' >&2
