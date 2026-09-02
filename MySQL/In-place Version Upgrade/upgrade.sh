@@ -5,7 +5,7 @@
 
 set -u
 
-SCRIPT_VERSION="1.0.11"
+SCRIPT_VERSION="1.0.12"
 SERVICE_NAME="mysqld"
 CONFIG_FILE=""
 WORK_ROOT=""
@@ -541,7 +541,7 @@ validate_config_after_rpm() {
 
 start_and_wait() {
     systemctl daemon-reload
-    info "MySQL ${TARGET_VERSION} 첫 기동 및 Automatic Upgrade 대기"
+    info "MySQL ${TARGET_VERSION} 최초 기동 및 내부 Data Dictionary/System Table 자동 업그레이드 완료 대기"
     systemctl start "$SERVICE_NAME" || { [ -n "$LOG_ERROR" ] && tail -n 200 "$LOG_ERROR" >> "$LOG_FILE" 2>&1; die "서비스 시작 실패"; }
     _i=0
     while [ $_i -lt 60 ]; do
