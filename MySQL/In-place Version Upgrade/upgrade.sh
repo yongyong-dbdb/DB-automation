@@ -5,8 +5,8 @@
 
 set -u
 
-SCRIPT_VERSION="1.0.12"
-SERVICE_NAME="mysqld"
+SCRIPT_VERSION="1.0.13"
+SERVICE_NAME="${SERVICE_NAME:-}"
 CONFIG_FILE=""
 WORK_ROOT=""
 DB_USER=""
@@ -109,6 +109,70 @@ mysqldump_cmd() { mysqldump --defaults-extra-file="$MYSQL_CNF" "$@"; }
 mysqlcheck_cmd() { mysqlcheck --defaults-extra-file="$MYSQL_CNF" "$@"; }
 my_print_defaults_cmd() { my_print_defaults --defaults-file="$CONFIG_FILE" mysqld; }
 
+mysqld_effective_value() {
+    _effective_name=$1
+    mysqld --defaults-file="$CONFIG_FILE" --verbose --help 2>/dev/null |
+        awk -v option="$_effective_name" '
+            $1 == option {
+                $1=""
+                sub(/^[[:space:]]+/, "")
+                value=$0
+            }
+            END { print value }
+        '
+}
+
+select_service_name() {
+    if [ -n "$SERVICE_NAME" ]; then
+        systemctl cat "$SERVICE_NAME" >/dev/null 2>&1 || die "systemd service unit 없음: $SERVICE_NAME"
+        info "systemd service 지정값 사용: $SERVICE_NAME"
+        return 0
+    fi
+
+    _service_candidates=$(mktemp /tmp/mysql-service-candidates.XXXXXX) || die "서비스 후보 임시 파일 생성 실패"
+    systemctl list-unit-files --type=service --no-legend 2>/dev/null |
+        awk '
+            $1 ~ /^(mysqld|mysql)(@[^[:space:]]*)?\.service$/ {
+                sub(/\.service$/, "", $1)
+                print $1
+            }
+        ' | awk '!seen[$0]++' > "$_service_candidates"
+
+    _service_count=$(wc -l < "$_service_candidates" | tr -d ' ')
+    if [ "$_service_count" -eq 0 ]; then
+        rm -f "$_service_candidates"
+        SERVICE_NAME=$(prompt_default "systemd service 이름" "")
+        [ -n "$SERVICE_NAME" ] || die "systemd service 이름 입력 필요"
+        systemctl cat "$SERVICE_NAME" >/dev/null 2>&1 || die "systemd service unit 없음: $SERVICE_NAME"
+        return 0
+    fi
+
+    if [ "$_service_count" -eq 1 ]; then
+        SERVICE_NAME=$(sed -n '1p' "$_service_candidates")
+        rm -f "$_service_candidates"
+        info "systemd service 자동 감지: $SERVICE_NAME"
+        return 0
+    fi
+
+    printf '%s\n' '' '발견된 MySQL systemd service:' >&2
+    awk '{printf "  %d) %s\n", NR, $0}' "$_service_candidates" >&2
+    printf '선택 번호 또는 service 이름 [1]: ' >&2
+    IFS= read -r _service_choice || {
+        rm -f "$_service_candidates"
+        exit 1
+    }
+    _service_choice=${_service_choice:-1}
+    case $_service_choice in
+        *[!0-9]*) SERVICE_NAME=$_service_choice ;;
+        *) SERVICE_NAME=$(sed -n "${_service_choice}p" "$_service_candidates") ;;
+    esac
+    rm -f "$_service_candidates"
+
+    [ -n "$SERVICE_NAME" ] || die "선택 범위를 벗어난 번호: $_service_choice"
+    systemctl cat "$SERVICE_NAME" >/dev/null 2>&1 || die "systemd service unit 없음: $SERVICE_NAME"
+    info "systemd service 선택: $SERVICE_NAME"
+}
+
 select_config_file() {
     _config_all=$(mktemp /tmp/mysql-config-all.XXXXXX) || die "설정 파일 후보 임시 파일 생성 실패"
     _config_candidates=$(mktemp /tmp/mysql-config-candidates.XXXXXX) || {
@@ -181,31 +245,30 @@ collect_inputs() {
     line
     printf 'MySQL RPM Package-based In-place Upgrade Automation v%s\n' "$SCRIPT_VERSION"
     line
-    if systemctl cat "$SERVICE_NAME" >/dev/null 2>&1; then
-        info "systemd service 자동 감지: $SERVICE_NAME"
-    else
-        SERVICE_NAME=$(prompt_default "systemd service 이름" "$SERVICE_NAME")
-        systemctl cat "$SERVICE_NAME" >/dev/null 2>&1 || die "systemd service unit 없음: $SERVICE_NAME"
-    fi
+    select_service_name
     select_config_file
-    DB_USER=$(prompt_default "MySQL 접속용 DB 관리자 계정 (OS 계정 아님)" "root")
+    DB_USER=$(prompt_default "MySQL 접속용 DB 관리자 계정 (OS 계정 아님)" "")
+    [ -n "$DB_USER" ] || die "MySQL DB 관리자 계정 입력 필요"
 
     printf '\n접속 방식\n1) Unix Socket\n2) TCP/IP\n선택 [1]: '
     IFS= read -r _mode
     case ${_mode:-1} in
         1)
             _socket_default=$(my_print_defaults_cmd 2>/dev/null | sed -n 's/^--socket=//p' | tail -n 1)
-            [ -n "$_socket_default" ] || _socket_default="/var/lib/mysql/mysql.sock"
+            [ -n "$_socket_default" ] || _socket_default=$(mysqld_effective_value socket)
             CONNECTION_MODE="socket"
             DB_SOCKET=$(prompt_default "Unix Socket 경로" "$_socket_default")
+            [ -n "$DB_SOCKET" ] || die "Unix Socket 경로 입력 필요"
             ;;
         2)
             CONNECTION_MODE="tcp"
-            _host_default="localhost"
             _port_default=$(my_print_defaults_cmd 2>/dev/null | sed -n 's/^--port=//p' | tail -n 1)
-            [ -n "$_port_default" ] || _port_default="3306"
-            DB_HOST=$(prompt_default "Host" "$_host_default")
+            [ -n "$_port_default" ] || _port_default=$(mysqld_effective_value port)
+            DB_HOST=$(prompt_default "Host" "")
+            [ -n "$DB_HOST" ] || die "TCP Host 입력 필요"
             DB_PORT=$(prompt_default "Port" "$_port_default")
+            [ -n "$DB_PORT" ] || die "TCP Port 입력 필요"
+            case $DB_PORT in *[!0-9]*) die "TCP Port는 숫자만 입력 가능: $DB_PORT" ;; esac
             ;;
         *) die "잘못된 접속 방식" ;;
     esac
@@ -241,7 +304,7 @@ select_package_source() {
     PACKAGE_SOURCE=${PACKAGE_SOURCE:-2}
     case $PACKAGE_SOURCE in
         1)
-            TARGET_VERSION=$(prompt_default "목표 MySQL 버전 (예: 8.4.11)" "")
+            TARGET_VERSION=$(prompt_default "목표 MySQL 버전" "")
             [ -n "$TARGET_VERSION" ] || die "목표 MySQL 버전 입력 필요"
             ;;
         2)
