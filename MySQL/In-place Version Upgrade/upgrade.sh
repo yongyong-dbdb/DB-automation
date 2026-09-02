@@ -5,9 +5,9 @@
 
 set -u
 
-SCRIPT_VERSION="1.0.8"
+SCRIPT_VERSION="1.0.9"
 SERVICE_NAME="mysqld"
-CONFIG_FILE="/etc/my.cnf"
+CONFIG_FILE=""
 WORK_ROOT=""
 DB_USER=""
 DB_HOST=""
@@ -79,7 +79,7 @@ require_root() {
 }
 
 require_commands() {
-    for _cmd in mysql mysqld mysqldump mysqlcheck my_print_defaults rpm yum tar sha256sum systemctl awk sed grep find stat df du cmp pgrep mktemp tee tr sort sleep cp chmod chown readlink; do
+    for _cmd in mysql mysqld mysqldump mysqlcheck my_print_defaults rpm yum tar sha256sum systemctl awk sed grep find stat df du cmp pgrep mktemp tee tr sort sleep cp chmod chown readlink ps wc tail; do
         command -v "$_cmd" >/dev/null 2>&1 || die "필수 명령 없음: $_cmd"
     done
 }
@@ -105,17 +105,85 @@ mysql_cmd() { mysql --defaults-extra-file="$MYSQL_CNF" "$@"; }
 mysqldump_cmd() { mysqldump --defaults-extra-file="$MYSQL_CNF" "$@"; }
 mysqlcheck_cmd() { mysqlcheck --defaults-extra-file="$MYSQL_CNF" "$@"; }
 
+select_config_file() {
+    _config_all=$(mktemp /tmp/mysql-config-all.XXXXXX) || die "설정 파일 후보 임시 파일 생성 실패"
+    _config_candidates=$(mktemp /tmp/mysql-config-candidates.XXXXXX) || {
+        rm -f "$_config_all"
+        die "설정 파일 후보 임시 파일 생성 실패"
+    }
+
+    {
+        _mysqld_pid=$(pgrep -xo mysqld 2>/dev/null || true)
+        if [ -n "$_mysqld_pid" ]; then
+            ps -ww -p "$_mysqld_pid" -o args= 2>/dev/null |
+                tr ' ' '\n' |
+                sed -n -e 's/^--defaults-file=//p' -e 's/^--defaults-extra-file=//p'
+        fi
+
+        systemctl cat "$SERVICE_NAME" 2>/dev/null |
+            tr ' ' '\n' |
+            sed -n -e 's/^--defaults-file=//p' -e 's/^--defaults-extra-file=//p'
+
+        mysqld --verbose --help 2>/dev/null |
+            awk '
+                /Default options are read from the following files in the given order:/ {
+                    getline
+                    for (i=1; i<=NF; i++) print $i
+                    exit
+                }
+            '
+
+        find /etc -maxdepth 3 -type f \( -name 'my.cnf' -o -name 'my.cnf.*' \) -print 2>/dev/null
+    } | sed '/^[[:space:]]*$/d' | awk '!seen[$0]++' > "$_config_all"
+
+    while IFS= read -r _config_path; do
+        [ -f "$_config_path" ] && printf '%s\n' "$_config_path"
+    done < "$_config_all" > "$_config_candidates"
+    rm -f "$_config_all"
+
+    _config_count=$(wc -l < "$_config_candidates" | tr -d ' ')
+    if [ "$_config_count" -eq 0 ]; then
+        rm -f "$_config_candidates"
+        CONFIG_FILE=$(prompt_default "MySQL option file 절대 경로" "")
+        [ -f "$CONFIG_FILE" ] || die "MySQL option file 없음: $CONFIG_FILE"
+        return 0
+    fi
+
+    printf '%s\n' '' '발견된 MySQL option file:' >&2
+    awk '{printf "  %d) %s\n", NR, $0}' "$_config_candidates" >&2
+    printf '선택 번호 또는 option file 절대 경로 [1]: ' >&2
+    IFS= read -r _config_choice || {
+        rm -f "$_config_candidates"
+        exit 1
+    }
+    _config_choice=${_config_choice:-1}
+
+    case $_config_choice in
+        *[!0-9]*)
+            CONFIG_FILE=$_config_choice
+            ;;
+        *)
+            CONFIG_FILE=$(sed -n "${_config_choice}p" "$_config_candidates")
+            ;;
+    esac
+    rm -f "$_config_candidates"
+
+    [ -n "$CONFIG_FILE" ] || die "선택 범위를 벗어난 번호: $_config_choice"
+    [ -f "$CONFIG_FILE" ] || die "MySQL option file 없음: $CONFIG_FILE"
+    info "MySQL option file 선택: $CONFIG_FILE"
+}
+
 collect_inputs() {
     line
     printf 'MySQL RPM Package-based In-place Upgrade Automation v%s\n' "$SCRIPT_VERSION"
     line
-    CONFIG_FILE=$(prompt_default "MySQL option file 경로" "$CONFIG_FILE")
     if systemctl cat "$SERVICE_NAME" >/dev/null 2>&1; then
         info "systemd service 자동 감지: $SERVICE_NAME"
     else
         SERVICE_NAME=$(prompt_default "systemd service 이름" "$SERVICE_NAME")
         systemctl cat "$SERVICE_NAME" >/dev/null 2>&1 || die "systemd service unit 없음: $SERVICE_NAME"
     fi
+    select_config_file
     DB_USER=$(prompt_default "MySQL 접속용 DB 관리자 계정 (OS 계정 아님)" "root")
 
     printf '\n접속 방식\n1) Unix Socket\n2) TCP/IP\n선택 [1]: '
