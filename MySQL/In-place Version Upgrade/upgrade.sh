@@ -5,7 +5,7 @@
 
 set -u
 
-SCRIPT_VERSION="1.0.16"
+SCRIPT_VERSION="1.0.17"
 SERVICE_NAME="${SERVICE_NAME:-}"
 CONFIG_FILE=""
 WORK_ROOT=""
@@ -34,6 +34,8 @@ MYSQL_CNF=""
 RUN_ID="$(date '+%Y%m%d_%H%M%S')"
 LOG_FILE=""
 BACKUP_DIR=""
+CONFIG_BACKUP_DIR=""
+CONFIG_PRIMARY_BACKUP=""
 RPM_LIST_FILE=""
 
 line() { printf '%s\n' '=============================================================================='; }
@@ -418,12 +420,75 @@ version_guard() {
     [ "$_lowest" = "$CURRENT_VERSION" ] || die "다운그레이드 또는 잘못된 버전 순서: $CURRENT_VERSION -> $TARGET_VERSION"
 }
 
+backup_option_files() {
+    CONFIG_BACKUP_DIR="$WORK_ROOT/config_backup_${CURRENT_VERSION}_${RUN_ID}"
+    _config_list=$(mktemp /tmp/mysql-config-backup-list.XXXXXX) || die "Config 백업 목록 생성 실패"
+    _config_next=$(mktemp /tmp/mysql-config-backup-next.XXXXXX) || { rm -f "$_config_list"; die "Config 백업 목록 생성 실패"; }
+    printf '%s\n' "$CONFIG_FILE" > "$_config_list"
+
+    _config_pass=0
+    while [ "$_config_pass" -lt 20 ]; do
+        _config_pass=$((_config_pass + 1))
+        cp "$_config_list" "$_config_next" || die "Config 백업 목록 처리 실패"
+        while IFS= read -r _config_source; do
+            [ -f "$_config_source" ] || continue
+            _config_base=$(dirname "$_config_source")
+
+            sed -n 's/^[[:space:]]*!include[[:space:]][[:space:]]*//p' "$_config_source" |
+                while IFS= read -r _include_file; do
+                    [ -n "$_include_file" ] || continue
+                    case $_include_file in /*) ;; *) _include_file="$_config_base/$_include_file" ;; esac
+                    [ -f "$_include_file" ] && readlink -f "$_include_file" >> "$_config_next"
+                done
+
+            sed -n 's/^[[:space:]]*!includedir[[:space:]][[:space:]]*//p' "$_config_source" |
+                while IFS= read -r _include_dir; do
+                    [ -n "$_include_dir" ] || continue
+                    case $_include_dir in /*) ;; *) _include_dir="$_config_base/$_include_dir" ;; esac
+                    [ -d "$_include_dir" ] || continue
+                    find "$_include_dir" -maxdepth 1 -type f -name '*.cnf' -print
+                done >> "$_config_next"
+        done < "$_config_list"
+
+        sort -u "$_config_next" -o "$_config_next"
+        if cmp -s "$_config_list" "$_config_next"; then
+            break
+        fi
+        cp "$_config_next" "$_config_list" || die "Config 백업 목록 갱신 실패"
+    done
+    [ "$_config_pass" -lt 20 ] || { rm -f "$_config_list" "$_config_next"; die "Config include 탐색이 20회를 초과함"; }
+
+    mkdir -p "$CONFIG_BACKUP_DIR/files" || { rm -f "$_config_list" "$_config_next"; die "Config 백업 디렉터리 생성 실패: $CONFIG_BACKUP_DIR"; }
+    chmod 700 "$CONFIG_BACKUP_DIR"
+    : > "$CONFIG_BACKUP_DIR/option_files.manifest"
+    : > "$CONFIG_BACKUP_DIR/option_files.sha256"
+
+    while IFS= read -r _config_source; do
+        [ -f "$_config_source" ] || { rm -f "$_config_list" "$_config_next"; die "Config 파일 없음: $_config_source"; }
+        _config_real=$(readlink -f "$_config_source") || { rm -f "$_config_list" "$_config_next"; die "Config 실제 경로 확인 실패: $_config_source"; }
+        _config_relative=${_config_real#/}
+        _config_dest="$CONFIG_BACKUP_DIR/files/$_config_relative"
+        mkdir -p "$(dirname "$_config_dest")" || { rm -f "$_config_list" "$_config_next"; die "Config 백업 하위 디렉터리 생성 실패"; }
+        cp -a "$_config_real" "$_config_dest" || { rm -f "$_config_list" "$_config_next"; die "Config 백업 실패: $_config_real"; }
+        printf '%s\t%s\n' "$_config_real" "files/$_config_relative" >> "$CONFIG_BACKUP_DIR/option_files.manifest"
+        (cd "$CONFIG_BACKUP_DIR" && sha256sum "files/$_config_relative") >> "$CONFIG_BACKUP_DIR/option_files.sha256" || { rm -f "$_config_list" "$_config_next"; die "Config SHA-256 생성 실패"; }
+        if [ "$_config_real" = "$(readlink -f "$CONFIG_FILE")" ]; then
+            CONFIG_PRIMARY_BACKUP=$_config_dest
+        fi
+    done < "$_config_list"
+
+    rm -f "$_config_list" "$_config_next"
+    [ -n "$CONFIG_PRIMARY_BACKUP" ] && [ -f "$CONFIG_PRIMARY_BACKUP" ] || die "선택한 option file 백업 확인 실패"
+    (cd "$CONFIG_BACKUP_DIR" && sha256sum -c option_files.sha256) >/dev/null 2>&1 || die "Config 백업 SHA-256 검증 실패"
+    info "MySQL Config 백업 완료: $CONFIG_BACKUP_DIR"
+}
+
 setup_run_paths() {
     BACKUP_DIR="$WORK_ROOT/${CURRENT_VERSION}_to_${TARGET_VERSION}_${RUN_ID}"
     mkdir -p "$BACKUP_DIR" || die "백업 디렉터리 생성 실패"
     LOG_FILE="$BACKUP_DIR/upgrade.log"
     chmod 700 "$BACKUP_DIR"
-    cp -a "$CONFIG_FILE" "$BACKUP_DIR/my.cnf.${CURRENT_VERSION}.before" || die "option file 백업 실패"
+    backup_option_files
 }
 
 show_summary() {
@@ -436,6 +501,7 @@ show_summary() {
     printf 'OS Service Account: %s:%s\n' "$OS_SERVICE_USER" "$OS_SERVICE_GROUP"
     printf 'DB Account        : %s\n' "$DB_USER"
     printf 'Backup Directory  : %s\n' "$BACKUP_DIR"
+    printf 'Config Backup Dir : %s\n' "$CONFIG_BACKUP_DIR"
     [ "$PACKAGE_SOURCE" = "1" ] || printf 'Package Source    : %s\n' "$PACKAGE_PATH"
     line
     confirm "이 구성으로 사전 검사를 시작할까요?" || die "사용자 취소"
@@ -625,7 +691,7 @@ upgrade_packages() {
 
 validate_config_after_rpm() {
     if [ -f "${CONFIG_FILE}.rpmnew" ]; then cp -a "${CONFIG_FILE}.rpmnew" "$BACKUP_DIR/my.cnf.${TARGET_VERSION}.rpmnew" || die "rpmnew 보관 실패"; fi
-    cmp -s "$BACKUP_DIR/my.cnf.${CURRENT_VERSION}.before" "$CONFIG_FILE" || die "기존 option file 변경 감지: $CONFIG_FILE"
+    cmp -s "$CONFIG_PRIMARY_BACKUP" "$CONFIG_FILE" || die "기존 option file 변경 감지: $CONFIG_FILE"
     mysqld --defaults-file="$CONFIG_FILE" --validate-config --user="$OS_SERVICE_USER" >> "$LOG_FILE" 2>&1 || die "새 mysqld의 기존 option file 검증 실패"
     _new_datadir=$(my_print_defaults_cmd | sed -n 's/^--datadir=//p' | tail -n 1)
     [ "${_new_datadir%/}" = "${DATADIR%/}" ] || die "datadir 변경 감지: $DATADIR -> $_new_datadir"
