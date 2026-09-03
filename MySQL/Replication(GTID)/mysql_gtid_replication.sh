@@ -720,17 +720,125 @@ configure_one() {
     cp "$cfg_candidate" "$cfg_cnf" || die "cannot update $cfg_cnf"
     log "Updated: $cfg_cnf"
     log "Backup : $cfg_backup"
+    if [ "$cfg_role" = Source ]; then
+        SOURCE_CONFIG_CHANGED=yes
+    else
+        REPLICA_CONFIG_CHANGED=yes
+    fi
 }
 
 restart_one() {
     role=$1
     service=$2
-    [ -n "$service" ] || { warn "$role service is not recorded; restart it manually if configuration changed"; return; }
-    command -v systemctl >/dev/null 2>&1 || { warn "systemctl unavailable; restart $role manually"; return; }
-    answer=$(ask "Restart $role service $service now? (yes/no)" no)
+    cnf=$3
+    datadir=$4
+    changed=$5
+
+    [ "$changed" = yes ] || return
+
+    role_key=$(printf '%s' "$role" | tr '[:upper:]' '[:lower:]')
+    pid_file=$(mysql_query "$role_key" "SELECT @@GLOBAL.pid_file;" 2>/dev/null || true)
+    mysqld_pid=
+    if [ -n "$pid_file" ] && [ -r "$pid_file" ]; then
+        mysqld_pid=$(sed -n '1{s/[^0-9].*//;p;}' "$pid_file")
+    fi
+
+    detected_service=
+    detected_parent=
+    if is_uint "${mysqld_pid:-}" && [ -r "/proc/$mysqld_pid/cgroup" ]; then
+        detected_service=$(sed -n 's#.*[/]\([^/]*\.service\)\([./].*\)\{0,1\}$#\1#p' "/proc/$mysqld_pid/cgroup" | head -n 1)
+        mysqld_ppid=$(awk '{ print $4 }' "/proc/$mysqld_pid/stat" 2>/dev/null || true)
+        if is_uint "${mysqld_ppid:-}" && [ -r "/proc/$mysqld_ppid/comm" ]; then
+            detected_parent=$(sed -n '1p' "/proc/$mysqld_ppid/comm")
+        fi
+    fi
+    if [ -z "$service" ] && [ -n "$detected_service" ]; then
+        service=$detected_service
+        log "Detected $role systemd service from PID $mysqld_pid: $service"
+    fi
+
+    restart_method=manual
+    restart_display=
+    if [ -n "$service" ] && command -v systemctl >/dev/null 2>&1; then
+        restart_method=systemd
+        restart_display="systemctl restart $service"
+    elif [ -n "$cnf" ] && command -v mysqladmin >/dev/null 2>&1 && command -v mysqld >/dev/null 2>&1; then
+        if [ "$detected_parent" = mysqld_safe ] && command -v mysqld_safe >/dev/null 2>&1; then
+            restart_method=mysqld_safe
+        elif mysqld --no-defaults --verbose --help 2>/dev/null | grep -- '--daemonize' >/dev/null 2>&1; then
+            restart_method=direct
+        fi
+        if [ "$role" = Source ]; then
+            restart_client_file=$SOURCE_CLIENT_FILE
+        else
+            restart_client_file=$REPLICA_CLIENT_FILE
+        fi
+        start_user_option=
+        datadir_owner=
+        if [ -n "$datadir" ] && [ -d "$datadir" ]; then
+            datadir_owner=$(ls -ld "$datadir" 2>/dev/null | awk '{ print $3 }')
+        fi
+        current_uid=$(id -u 2>/dev/null || printf 'unknown')
+        current_user=$(id -un 2>/dev/null || printf 'unknown')
+        if [ "$current_uid" = 0 ] && [ -n "$datadir_owner" ]; then
+            start_user_option=" --user=$datadir_owner"
+        elif [ -n "$datadir_owner" ] && [ "$current_user" != "$datadir_owner" ]; then
+            restart_method=manual
+            warn "$role data directory owner is $datadir_owner, but the script runs as $current_user"
+            warn "Run the start command as $datadir_owner or configure a systemd service."
+        fi
+        if [ "$restart_method" = mysqld_safe ]; then
+            restart_display="mysqladmin --defaults-extra-file=$restart_client_file shutdown && mysqld_safe --defaults-file=$cnf$start_user_option &"
+        elif [ "$restart_method" = direct ]; then
+            restart_display="mysqladmin --defaults-extra-file=$restart_client_file shutdown && mysqld --defaults-file=$cnf --daemonize$start_user_option"
+        fi
+    fi
+
+    log ""
+    log "[$role restart required]"
+    if [ "$restart_method" = manual ]; then
+        warn "A safe automatic restart command could not be determined."
+        [ -n "$service" ] && log "Recorded service: $service"
+        [ -n "$cnf" ] && log "Configuration : $cnf"
+        warn "Restart only this $role instance manually, then run: sh $SCRIPT_NAME precheck"
+        return
+    fi
+
+    log "Restart method : $restart_method"
+    log "Restart command: $restart_display"
+    answer=$(ask "Run this $role restart now? (yes/no)" no)
     [ "$answer" = yes ] || { warn "$role restart skipped"; return; }
-    systemctl restart "$service" || die "failed to restart $role service: $service"
-    systemctl is-active --quiet "$service" || die "$role service is not active: $service"
+
+    current_fast_shutdown=$(mysql_query "$role_key" "SELECT @@GLOBAL.innodb_fast_shutdown;")
+    log "Current innodb_fast_shutdown: $current_fast_shutdown"
+    log "Value 1 is safe for a normal configuration restart."
+    log "Value 0 performs a slow shutdown and is mainly recommended before a major upgrade or downgrade; it can take a long time on a large instance."
+    slow_shutdown=$(ask "Use innodb_fast_shutdown=0 for this restart? (yes/no)" no)
+    case $slow_shutdown in yes|no) ;; *) die "answer must be yes or no" ;; esac
+    if [ "$slow_shutdown" = yes ]; then
+        mysql_query "$role_key" "SET GLOBAL innodb_fast_shutdown=0;"
+        log "Applied before shutdown: SET GLOBAL innodb_fast_shutdown=0;"
+    fi
+
+    if [ "$restart_method" = systemd ]; then
+        systemctl restart "$service" || die "failed to restart $role service: $service"
+        systemctl is-active --quiet "$service" || die "$role service is not active: $service"
+    elif [ "$restart_method" = direct ]; then
+        mysqladmin --defaults-extra-file="$restart_client_file" shutdown || die "failed to stop $role with mysqladmin"
+        if [ "$current_uid" = 0 ] && [ -n "$datadir_owner" ]; then
+            mysqld --defaults-file="$cnf" --daemonize --user="$datadir_owner" || die "failed to start $role with $cnf"
+        else
+            mysqld --defaults-file="$cnf" --daemonize || die "failed to start $role with $cnf"
+        fi
+    else
+        mysqladmin --defaults-extra-file="$restart_client_file" shutdown || die "failed to stop $role with mysqladmin"
+        if [ "$current_uid" = 0 ] && [ -n "$datadir_owner" ]; then
+            nohup mysqld_safe --defaults-file="$cnf" --user="$datadir_owner" >/dev/null 2>&1 &
+        else
+            nohup mysqld_safe --defaults-file="$cnf" >/dev/null 2>&1 &
+        fi
+    fi
+    log "$role restart completed. Runtime settings will be verified by the precheck step."
 }
 
 configure() {
@@ -740,6 +848,8 @@ configure() {
     ensure_credentials source
     ensure_credentials replica
     load_runtime_facts
+    SOURCE_CONFIG_CHANGED=no
+    REPLICA_CONFIG_CHANGED=no
     profile=$(ask "Configuration profile (minimum/production)" minimum)
     case $profile in minimum|production) ;; *) die "configuration profile must be minimum or production" ;; esac
     source_expire=$(mysql_query source "SELECT @@GLOBAL.binlog_expire_logs_seconds;")
@@ -779,8 +889,8 @@ configure() {
     fi
     configure_one Source "$SOURCE_CNF" "$SOURCE_SERVER_ID" "$source_default_id" "$source_offer" "$profile" "$source_expire" no "$source_updates_option" "$replica_source_info_option"
     configure_one Replica "$REPLICA_CNF" "$REPLICA_SERVER_ID" "$replica_default_id" "$replica_offer" "$profile" "$replica_expire" "$durable_relay" "$replica_updates_option" "$replica_source_info_option"
-    restart_one Source "$SOURCE_SERVICE"
-    restart_one Replica "$REPLICA_SERVICE"
+    restart_one Source "$SOURCE_SERVICE" "$SOURCE_CNF" "$SOURCE_DATADIR" "$SOURCE_CONFIG_CHANGED"
+    restart_one Replica "$REPLICA_SERVICE" "$REPLICA_CNF" "$REPLICA_DATADIR" "$REPLICA_CONFIG_CHANGED"
     next_step precheck "Complete any required MySQL restart first, then verify the effective runtime settings."
 }
 
