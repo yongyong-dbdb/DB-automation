@@ -288,6 +288,17 @@ mysql_table() {
     fi
 }
 
+mysql_vertical() {
+    role=$1
+    sql=$2
+    ensure_credentials "$role"
+    if [ "$role" = source ]; then
+        printf '%s\n' "$sql" | mysql --defaults-extra-file="$SOURCE_CLIENT_FILE" --vertical
+    else
+        printf '%s\n' "$sql" | mysql --defaults-extra-file="$REPLICA_CLIENT_FILE" --vertical
+    fi
+}
+
 variable_exists() {
     role=$1
     variable_name=$2
@@ -1460,9 +1471,9 @@ show_replica_status() {
     syntax=$(replication_syntax "$replica_ver")
     clause=$(channel_clause)
     if [ "$syntax" = modern ]; then
-        mysql_table replica "SHOW REPLICA STATUS$clause\G"
+        mysql_vertical replica "SHOW REPLICA STATUS$clause;"
     else
-        mysql_table replica "SHOW SLAVE STATUS$clause\G"
+        mysql_vertical replica "SHOW SLAVE STATUS$clause;"
     fi
 }
 
@@ -1479,18 +1490,111 @@ status() {
     log "STATUS COMPLETE: review receiver/applier thread state and replication errors above."
 }
 
+collect_validate_diagnostics() {
+    failure_reason=$1
+    diagnostic_source_gtid=$2
+    mkdir -p "$RUN_DIR" || die "cannot create diagnostic directory: $RUN_DIR"
+    diagnostic_file="$RUN_DIR/validate_failure.log"
+    diagnostic_replica_gtid=$(mysql_query replica "SELECT @@GLOBAL.gtid_executed;" 2>/dev/null || printf unavailable)
+    if [ "$diagnostic_replica_gtid" != unavailable ]; then
+        diagnostic_missing_gtid=$(mysql_query replica "SELECT GTID_SUBTRACT('$(sql_quote "$diagnostic_source_gtid")','$(sql_quote "$diagnostic_replica_gtid")');" 2>/dev/null || printf unavailable)
+    else
+        diagnostic_missing_gtid=unavailable
+    fi
+    replica_ver=$(mysql_query replica "SELECT @@version;" 2>/dev/null || printf unknown)
+    syntax=$(replication_syntax "$replica_ver")
+    clause=$(channel_clause)
+    if [ "$syntax" = modern ]; then
+        diagnostic_status_sql="SHOW REPLICA STATUS$clause;"
+    else
+        diagnostic_status_sql="SHOW SLAVE STATUS$clause;"
+    fi
+    {
+        log "Validation failure time : $(date '+%Y-%m-%d %H:%M:%S %z')"
+        log "Reason                  : $failure_reason"
+        log "Channel                 : ${CHANNEL_NAME:-default}"
+        log "Source GTID             : $diagnostic_source_gtid"
+        log "Replica GTID            : $diagnostic_replica_gtid"
+        log "Missing on Replica      : $diagnostic_missing_gtid"
+        log ""
+        log "Full replication status:"
+        mysql_vertical replica "$diagnostic_status_sql" 2>&1 || true
+        log ""
+        log "Performance Schema connection status:"
+        mysql_table replica "SELECT CHANNEL_NAME, SERVICE_STATE, LAST_ERROR_NUMBER, LAST_ERROR_MESSAGE, LAST_ERROR_TIMESTAMP FROM performance_schema.replication_connection_status WHERE CHANNEL_NAME='$(sql_quote "$CHANNEL_NAME")';" 2>&1 || true
+        log ""
+        log "Performance Schema coordinator status:"
+        mysql_table replica "SELECT CHANNEL_NAME, SERVICE_STATE, LAST_ERROR_NUMBER, LAST_ERROR_MESSAGE, LAST_ERROR_TIMESTAMP FROM performance_schema.replication_applier_status_by_coordinator WHERE CHANNEL_NAME='$(sql_quote "$CHANNEL_NAME")';" 2>&1 || true
+        log ""
+        log "Performance Schema worker errors:"
+        mysql_table replica "SELECT CHANNEL_NAME, WORKER_ID, SERVICE_STATE, LAST_ERROR_NUMBER, LAST_ERROR_MESSAGE, LAST_ERROR_TIMESTAMP FROM performance_schema.replication_applier_status_by_worker WHERE CHANNEL_NAME='$(sql_quote "$CHANNEL_NAME")' AND LAST_ERROR_NUMBER <> 0 ORDER BY WORKER_ID;" 2>&1 || true
+    } > "$diagnostic_file"
+
+    log ""
+    log "============================================================"
+    log "[VALIDATE FAILED] Replication diagnostics"
+    log "============================================================"
+    log "Reason             : $failure_reason"
+    log "Channel            : ${CHANNEL_NAME:-default}"
+    log "Source GTID        : $diagnostic_source_gtid"
+    log "Replica GTID       : $diagnostic_replica_gtid"
+    log "Missing on Replica : $diagnostic_missing_gtid"
+    log ""
+    diagnostic_summary=$(sed -n \
+        -e '/^[[:space:]]*Replica_IO_Running:/p' \
+        -e '/^[[:space:]]*Replica_SQL_Running:/p' \
+        -e '/^[[:space:]]*Slave_IO_Running:/p' \
+        -e '/^[[:space:]]*Slave_SQL_Running:/p' \
+        -e '/^[[:space:]]*Last_IO_Errno:/p' \
+        -e '/^[[:space:]]*Last_IO_Error:/p' \
+        -e '/^[[:space:]]*Last_SQL_Errno:/p' \
+        -e '/^[[:space:]]*Last_SQL_Error:/p' \
+        -e '/^[[:space:]]*Source_Host:/p' \
+        -e '/^[[:space:]]*Source_Port:/p' \
+        -e '/^[[:space:]]*Master_Host:/p' \
+        -e '/^[[:space:]]*Master_Port:/p' \
+        -e '/^[[:space:]]*Seconds_Behind_Source:/p' \
+        -e '/^[[:space:]]*Seconds_Behind_Master:/p' \
+        "$diagnostic_file")
+    if [ -n "$diagnostic_summary" ]; then
+        printf '%s\n' "$diagnostic_summary"
+    else
+        warn "No replication status row was returned; the channel may not exist or may not have been configured."
+    fi
+    log ""
+    log "Full diagnostic log: $diagnostic_file"
+    log "NEXT ACTION: correct the reported I/O or SQL error, start the channel if stopped, then rerun: sh $SCRIPT_NAME validate"
+}
+
 validate() {
     load_state
     ensure_credentials source
     ensure_credentials replica
+    mkdir -p "$RUN_DIR" || die "cannot create work directory"
     source_gtid=$(mysql_query source "SELECT @@GLOBAL.gtid_executed;") || die "cannot read Source GTIDs"
     timeout=$(ask "Seconds to wait for Replica to apply Source GTIDs" 60)
     is_uint "$timeout" || die "timeout must be numeric"
-    wait_result=$(mysql_query replica "SELECT WAIT_FOR_EXECUTED_GTID_SET('$(sql_quote "$source_gtid")',$timeout);") || die "GTID wait failed"
-    case $wait_result in 0) ;; 1) die "Replica did not apply all Source GTIDs within $timeout seconds" ;; *) die "unexpected GTID wait result: $wait_result" ;; esac
+    if ! wait_result=$(mysql_query replica "SELECT WAIT_FOR_EXECUTED_GTID_SET('$(sql_quote "$source_gtid")',$timeout);"); then
+        collect_validate_diagnostics "WAIT_FOR_EXECUTED_GTID_SET failed" "$source_gtid"
+        die "GTID wait failed"
+    fi
+    case $wait_result in
+        0) ;;
+        1)
+            collect_validate_diagnostics "Replica did not apply all Source GTIDs within $timeout seconds" "$source_gtid"
+            die "Replica did not apply all Source GTIDs within $timeout seconds"
+            ;;
+        *)
+            collect_validate_diagnostics "Unexpected GTID wait result: $wait_result" "$source_gtid"
+            die "unexpected GTID wait result: $wait_result"
+            ;;
+    esac
     replica_gtid=$(mysql_query replica "SELECT @@GLOBAL.gtid_executed;")
     subset=$(mysql_query replica "SELECT GTID_SUBSET('$(sql_quote "$source_gtid")','$(sql_quote "$replica_gtid")');")
-    [ "$subset" = 1 ] || die "Source GTID set is not a subset of Replica gtid_executed"
+    if [ "$subset" != 1 ]; then
+        collect_validate_diagnostics "Source GTID set is not a subset of Replica gtid_executed" "$source_gtid"
+        die "Source GTID set is not a subset of Replica gtid_executed"
+    fi
     replica_ver=$(mysql_query replica "SELECT @@version;")
     syntax=$(replication_syntax "$replica_ver")
     clause=$(channel_clause)
