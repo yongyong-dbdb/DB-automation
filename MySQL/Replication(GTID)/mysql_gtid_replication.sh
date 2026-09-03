@@ -3,6 +3,7 @@
 set -u
 
 SCRIPT_NAME=${0##*/}
+SCRIPT_VERSION=1.0.11
 STEP=${1:-help}
 STATE_FILE=${MYSQL_GTID_STATE_FILE:-"$(pwd)/.mysql_gtid_replication.state"}
 WORK_ROOT=${MYSQL_GTID_WORK_ROOT:-"$(pwd)/mysql_gtid_replication_work"}
@@ -27,6 +28,8 @@ trap cleanup EXIT HUP INT TERM
 usage() {
     cat <<EOF
 Usage: sh $SCRIPT_NAME <step>
+
+Version: $SCRIPT_VERSION
 
 Steps:
   discover    Detect and record Source/Replica connection information
@@ -731,9 +734,11 @@ EOF
         if [ "$mb_role" = Replica ]; then
             cat <<EOF
 
-# Enable after initial data restore if direct writes to Replica must be blocked.
-# read_only=ON
-# super_read_only=ON
+# Replica operational protection. The initialize step temporarily disables
+# write protection only while restoring an online logical dump, then restores it.
+read_only=ON
+super_read_only=ON
+event_scheduler=OFF
 EOF
             if [ "$mb_durable_relay" = yes ]; then
                 cat <<EOF
@@ -971,7 +976,8 @@ configure() {
     replica_source_info_option=$(source_info_sync_variable replica)
     if [ "$profile" = production ]; then
         log "Production profile adds sync_binlog=1, innodb_flush_log_at_trx_commit=1, binlog_row_image=FULL and explicit binlog retention."
-        log "Replica read_only/super_read_only are shown as post-initialization settings and are not enabled before restore."
+        log "Replica read_only=ON, super_read_only=ON and event_scheduler=OFF are written as persistent production settings."
+        log "The initialize step temporarily disables write protection only during its logical restore and restores it immediately afterward."
         log "Binary log retention must be longer than the initial copy, restore, and Replica catch-up time."
         log "A larger value provides more recovery margin but consumes more disk space."
         source_expire=$(ask_required "Source binary log retention in seconds" "$source_expire")
@@ -1185,11 +1191,30 @@ initialize() {
     checksum_file="$dump_file.sha256"
     if command -v sha256sum >/dev/null 2>&1; then sha256sum "$dump_file" > "$checksum_file"; fi
     confirm_phrase "The selected databases will be restored to Replica. Existing objects can be replaced by statements contained in the dump." "RESTORE REPLICA"
-    if [ "$compress_dump" = yes ]; then
-        gzip -dc "$dump_file" | mysql --defaults-extra-file="$REPLICA_CLIENT_FILE" || die "Replica restore failed"
-    else
-        mysql --defaults-extra-file="$REPLICA_CLIENT_FILE" < "$dump_file" || die "Replica restore failed"
+    replica_read_only_before=$(mysql_query replica "SELECT @@GLOBAL.read_only;")
+    replica_super_read_only_before=$(mysql_query replica "SELECT @@GLOBAL.super_read_only;")
+    restore_protection_changed=no
+    if is_on "$replica_read_only_before" || is_on "$replica_super_read_only_before"; then
+        log "Replica write protection is enabled. It will be disabled only for this controlled restore and restored immediately afterward."
+        mysql_query replica "SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF;" || die "cannot temporarily disable Replica write protection"
+        restore_protection_changed=yes
     fi
+    restore_result=0
+    if [ "$compress_dump" = yes ]; then
+        gzip -dc "$dump_file" | mysql --defaults-extra-file="$REPLICA_CLIENT_FILE" || restore_result=$?
+    else
+        mysql --defaults-extra-file="$REPLICA_CLIENT_FILE" < "$dump_file" || restore_result=$?
+    fi
+    if [ "$restore_protection_changed" = yes ]; then
+        if is_on "$replica_read_only_before"; then
+            mysql_query replica "SET GLOBAL read_only=ON;" || die "restore finished but Replica read_only could not be restored"
+        fi
+        if is_on "$replica_super_read_only_before"; then
+            mysql_query replica "SET GLOBAL super_read_only=ON;" || die "restore finished but Replica super_read_only could not be restored"
+        fi
+        log "Replica write protection was restored to its pre-restore state."
+    fi
+    [ "$restore_result" -eq 0 ] || die "Replica restore failed"
     if [ "$keep_dump" = no ]; then
         rm -f "$dump_file" "$checksum_file"
         log "Dump removed after successful restore."
@@ -1628,6 +1653,36 @@ validate() {
     log "VALIDATION: PASSED"
     log "Source GTID set is present on Replica."
     show_replica_status
+    log ""
+    log "[Replica operational protection]"
+    current_read_only=$(mysql_query replica "SELECT @@GLOBAL.read_only;")
+    current_super_read_only=$(mysql_query replica "SELECT @@GLOBAL.super_read_only;")
+    current_event_scheduler=$(mysql_query replica "SELECT @@GLOBAL.event_scheduler;")
+    enabled_events=$(mysql_query replica "SELECT COUNT(*) FROM information_schema.EVENTS WHERE STATUS='ENABLED';")
+    log "  read_only       : $current_read_only"
+    log "  super_read_only : $current_super_read_only"
+    log "  event_scheduler : $current_event_scheduler"
+    log "  enabled events  : $enabled_events"
+    if ! is_on "$current_read_only" || ! is_on "$current_super_read_only" || [ "$current_event_scheduler" != OFF ]; then
+        log "Recommended for a dedicated Replica: block direct writes and prevent restored scheduled events from running twice."
+        log "This changes dynamic Runtime variables only and does not restart MySQL."
+        protect_replica=$(ask "Apply read_only=ON, super_read_only=ON and event_scheduler=OFF now? (yes/no)" yes)
+        case $protect_replica in
+            yes)
+                mysql_query replica "SET GLOBAL event_scheduler=OFF; SET GLOBAL read_only=ON; SET GLOBAL super_read_only=ON;" || die "replication is valid, but Replica runtime protection could not be applied"
+                log "Replica Runtime protection applied without restart."
+                if [ -n "$REPLICA_CNF" ]; then
+                    log "Persistence: rerun 'sh $SCRIPT_NAME configure' with the production profile if these values are not yet present in $REPLICA_CNF."
+                else
+                    warn "Replica option-file path is unknown; persist read_only, super_read_only and event_scheduler manually before the next restart."
+                fi
+                ;;
+            no) warn "Replica remains writable or Event Scheduler remains enabled; review before production use." ;;
+            *) die "answer must be yes or no" ;;
+        esac
+    else
+        log "Replica Runtime protection is already active."
+    fi
     next_step status "Validation passed; use status for subsequent operational checks."
 }
 
