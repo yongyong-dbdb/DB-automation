@@ -3,7 +3,7 @@
 set -u
 
 SCRIPT_NAME=${0##*/}
-SCRIPT_VERSION=1.0.12
+SCRIPT_VERSION=1.0.13
 STEP=${1:-help}
 STATE_FILE=${MYSQL_GTID_STATE_FILE:-"$(pwd)/.mysql_gtid_replication.state"}
 WORK_ROOT=${MYSQL_GTID_WORK_ROOT:-"$(pwd)/mysql_gtid_replication_work"}
@@ -1658,22 +1658,45 @@ validate() {
     log "  super_read_only : $current_super_read_only"
     log "  event_scheduler : $current_event_scheduler"
     log "  enabled events  : $enabled_events"
-    if ! is_on "$current_read_only" || ! is_on "$current_super_read_only" || [ "$current_event_scheduler" != OFF ]; then
-        log "Recommended for a dedicated Replica: block direct writes and prevent restored scheduled events from running twice."
-        log "This changes dynamic Runtime variables only and does not restart MySQL."
-        protect_replica=$(ask "Apply read_only=ON, super_read_only=ON and event_scheduler=OFF now? (yes/no)" yes)
-        case $protect_replica in
+    log "The following values are operational policy options, not GTID replication prerequisites."
+    log "Selections change dynamic Runtime values only, do not restart MySQL, and are not written to my.cnf."
+    if ! is_on "$current_read_only" || ! is_on "$current_super_read_only"; then
+        log ""
+        log "Direct-write protection:"
+        log "  read_only=ON       : blocks normal client writes while allowing replication applier updates"
+        log "  super_read_only=ON : also blocks privileged client writes that could bypass read_only"
+        log "  recommended        : yes for a dedicated read-only Replica"
+        protect_writes=$(ask "Enable Replica direct-write protection now? (yes/no)" yes)
+        case $protect_writes in
             yes)
-                mysql_query replica "SET GLOBAL event_scheduler=OFF; SET GLOBAL read_only=ON; SET GLOBAL super_read_only=ON;" || die "replication is valid, but Replica runtime protection could not be applied"
-                log "Replica Runtime protection applied without restart."
-                log "These operational policy values were not written to my.cnf. Review them again after a MySQL restart."
+                mysql_query replica "SET GLOBAL read_only=ON; SET GLOBAL super_read_only=ON;" || die "replication is valid, but Replica direct-write protection could not be applied"
+                log "Replica direct-write protection applied without restart."
                 ;;
-            no) warn "Replica remains writable or Event Scheduler remains enabled; review before production use." ;;
+            no) warn "Replica remains directly writable; review before production use." ;;
             *) die "answer must be yes or no" ;;
         esac
     else
-        log "Replica Runtime protection is already active."
+        log "Replica direct-write protection is already active."
     fi
+    if [ "$current_event_scheduler" != OFF ]; then
+        log ""
+        log "Scheduled-event protection:"
+        log "  event_scheduler=OFF: prevents restored Event Scheduler definitions from executing on Replica"
+        log "  enabled events      : $enabled_events"
+        log "  recommended         : yes when events must execute only on Source"
+        disable_events=$(ask "Disable Replica Event Scheduler now? (yes/no)" yes)
+        case $disable_events in
+            yes)
+                mysql_query replica "SET GLOBAL event_scheduler=OFF;" || die "replication is valid, but Replica Event Scheduler could not be disabled"
+                log "Replica Event Scheduler disabled without restart."
+                ;;
+            no) warn "Replica Event Scheduler remains enabled; restored events can execute on both Source and Replica." ;;
+            *) die "answer must be yes or no" ;;
+        esac
+    else
+        log "Replica Event Scheduler is already OFF."
+    fi
+    log "Review these operational policy values again after a MySQL restart."
     next_step status "Validation passed; use status for subsequent operational checks."
 }
 
