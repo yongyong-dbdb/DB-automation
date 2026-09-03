@@ -982,29 +982,25 @@ initialize() {
     source_size_display=$(format_bytes "$source_app_bytes")
     if [ -n "$replica_gtid_preview" ]; then replica_gtid_state=not-empty; else replica_gtid_state=empty; fi
     log ""
-    log "[initialization decision facts]"
-    log "  Source application tables       : $source_app_tables"
-    log "  Source estimated data+index size: $source_size_display ($source_app_bytes bytes)"
-    log "  Replica application tables      : $replica_app_tables"
-    log "  Replica gtid_executed            : $replica_gtid_state"
-    log "  Note: INFORMATION_SCHEMA size is an estimate; actual dump size and duration depend on data types, compression, I/O, CPU, and network."
+    log "============================================================"
+    log "[INITIALIZE 1/4] Initial data method"
+    log "============================================================"
+    log "Source tables : $source_app_tables"
+    log "Source size   : $source_size_display (estimated)"
+    log "Replica tables: $replica_app_tables"
+    log "Replica GTID  : $replica_gtid_state"
     log ""
-    log "Initial data method options:"
-    log "  online-dump : keep Source online, create a consistent InnoDB logical dump, and restore it to Replica"
-    log "                suitable for small or moderate data; dump/restore time and Source load must be considered"
-    log "  already     : no copy; use only when Replica data and GTID history already match Source"
-    log "  external    : use an external hot physical backup or Clone workflow; recommended for large data and minimal downtime"
-    log "  skip        : make no change and exit this step; initialization remains incomplete"
+    log "  online-dump : online logical copy for test/small-to-moderate data"
+    log "  already     : no copy; data and GTID history must already match"
+    log "  external    : physical backup/Clone for large production data"
+    log "  skip        : exit without initialization"
     log ""
-    log "Selection guide for the detected state:"
     if [ "${replica_app_tables:-0}" -eq 0 ] && [ -z "$replica_gtid_preview" ]; then
-        log "  This Replica appears clean (no application tables and empty GTID history)."
-        log "  - Current test/small-to-moderate data: choose online-dump."
-        log "  - Large production data or strict downtime/load limits: choose external."
-        log "  - Do not choose already unless data and GTID history were initialized by another verified method."
+        log "Detected state : clean Replica"
+        log "Recommendation : online-dump for test/small-to-moderate data; external for large production data"
     else
-        log "  This Replica is not empty. Do not choose already based only on matching object names or row counts."
-        log "  Verify both data consistency and GTID history, or use a controlled reprovisioning method."
+        log "Detected state : Replica is not empty"
+        log "Recommendation : verify data and GTID history or perform controlled reprovisioning"
     fi
     method=$(ask "Initial data method (online-dump/already/external/skip)" skip)
     case $method in
@@ -1032,22 +1028,24 @@ initialize() {
     esac
     detected_dbs=$(mysql_query source "SELECT GROUP_CONCAT(SCHEMA_NAME ORDER BY SCHEMA_NAME SEPARATOR ' ') FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME NOT IN ('information_schema','performance_schema','mysql','sys');")
     [ -n "$detected_dbs" ] || die "no application databases detected on Source"
-    log "Detected application databases are shown as the default."
-    log "This unfiltered replication workflow requires all application databases to be initialized together."
-    log "A partial mysqldump can record the Source's global GTID set even for excluded databases, causing their earlier transactions to be treated as already executed."
+    log ""
+    log "============================================================"
+    log "[INITIALIZE 2/4] Database and dump options"
+    log "============================================================"
+    log "All detected application databases must be initialized because this channel has no replication filters."
     dbs=$(ask_required "Space-separated databases to initialize" "$detected_dbs")
     safe_database_list "$dbs"
     normalized_detected=$(printf '%s\n' $detected_dbs | sort | tr '\n' ' ')
     normalized_selected=$(printf '%s\n' $dbs | sort | tr '\n' ' ')
     [ "$normalized_selected" = "$normalized_detected" ] || die "partial database initialization is not supported without matching replication filters; select all detected application databases"
-    log "Dump content and file options:"
-    log "  stored routines : include stored procedures and functions; normally yes"
-    log "  events          : include Event Scheduler definitions; normally yes, but review whether events should run on Replica"
-    log "  gzip            : reduce dump disk usage and transfer size at the cost of CPU"
-    log "  keep dump       : retain the verified dump for rollback/reuse after a successful restore"
+    log ""
+    log "Stored routines include procedures and functions. Recommended: yes"
     include_routines=$(ask "Include stored routines? (yes/no)" yes)
+    log "Scheduled events may execute twice if Event Scheduler is enabled on Replica. Review before promotion."
     include_events=$(ask "Include Event Scheduler definitions? (yes/no)" yes)
+    log "gzip reduces disk/transfer size but uses CPU. Recommended: yes"
     compress_dump=$(ask "Compress dump with gzip? (yes/no)" yes)
+    log "Keeping the dump supports verification and retry but consumes disk. Recommended: yes"
     keep_dump=$(ask "Keep dump after successful restore? (yes/no)" yes)
     case $include_routines in yes|no) ;; *) die "answer must be yes or no" ;; esac
     case $include_events in yes|no) ;; *) die "answer must be yes or no" ;; esac
@@ -1060,8 +1058,16 @@ initialize() {
     fi
     replica_gtid=$(mysql_query replica "SELECT @@GLOBAL.gtid_executed;") || die "cannot read Replica GTID state"
     if [ -n "$replica_gtid" ]; then
-        warn "Replica gtid_executed is not empty: $replica_gtid"
-        confirm_phrase "Logical restore with SET GTID_PURGED normally requires a clean Replica GTID state. Existing channels and GTIDs will be reset." "RESET REPLICA GTID"
+        log ""
+        log "============================================================"
+        log "[ACTION REQUIRED] Existing Replica GTID"
+        log "============================================================"
+        warn "Replica gtid_executed: $replica_gtid"
+        log "This is transaction history, not the gtid_mode setting in my.cnf."
+        log "Action  : reset existing channels, binary logs, and Replica GTID history"
+        log "Use only: new/rebuildable Replica with no data or GTID history to preserve"
+        log "Recovery: not automatically reversible"
+        confirm_phrase "Logical restore with SET GTID_PURGED requires a compatible clean GTID state." "RESET REPLICA GTID"
         replica_ver=$(mysql_query replica "SELECT @@version;")
         replica_num=$(version_number "$replica_ver")
         reset_syntax=$(replication_syntax "$replica_ver")
@@ -1082,13 +1088,28 @@ initialize() {
     dump_object_options="--triggers"
     [ "$include_routines" = yes ] && dump_object_options="$dump_object_options --routines"
     [ "$include_events" = yes ] && dump_object_options="$dump_object_options --events"
-    log "Creating an online InnoDB-consistent dump: $dump_file"
-    log "Source remains online. Ensure binlog retention covers dump, transfer, restore and catch-up time."
+    log ""
+    log "============================================================"
+    log "[INITIALIZE 3/4] Create and restore initial dump"
+    log "============================================================"
+    log "Method : online InnoDB-consistent logical dump"
+    log "Output : $dump_file"
+    log "Source : remains online"
+    log "Safety : binlog retention must cover dump, restore, and catch-up time"
+    dump_warning_log="$RUN_DIR/mysqldump_warnings.log"
     # Word splitting is intentional after database names are validated.
     # shellcheck disable=SC2086
     # Word splitting is intentional for validated DB names and script-owned flags.
     # shellcheck disable=SC2086
-    mysqldump --defaults-extra-file="$SOURCE_CLIENT_FILE" --single-transaction --quick --skip-lock-tables $dump_object_options --hex-blob --set-gtid-purged=ON --databases $dbs > "$dump_file" || die "mysqldump failed"
+    if ! mysqldump --defaults-extra-file="$SOURCE_CLIENT_FILE" --single-transaction --quick --skip-lock-tables $dump_object_options --hex-blob --set-gtid-purged=ON --databases $dbs > "$dump_file" 2> "$dump_warning_log"; then
+        sed -n '1,200p' "$dump_warning_log" >&2
+        die "mysqldump failed; full diagnostic log: $dump_warning_log"
+    fi
+    if [ -s "$dump_warning_log" ]; then
+        warn "mysqldump completed with warning(s); details: $dump_warning_log"
+    else
+        rm -f "$dump_warning_log"
+    fi
     if [ "$compress_dump" = yes ]; then
         need_cmd gzip
         gzip "$dump_file" || die "dump compression failed"
@@ -1109,6 +1130,10 @@ initialize() {
     fi
     INITIALIZED=yes
     save_state
+    log ""
+    log "============================================================"
+    log "[INITIALIZE 4/4] Completed"
+    log "============================================================"
     log "Initial data restore completed."
     next_step replicate "Initial data and GTID history are ready on Replica."
 }
@@ -1134,15 +1159,77 @@ replicate() {
     replica_ver=$(mysql_query replica "SELECT @@version;")
     syntax=$(replication_syntax "$replica_ver")
     log ""
-    log "Replication account input:"
-    log "  user : dedicated MySQL account used only by the Replica I/O thread"
-    log "  host : Replica IP or the narrowest permitted host pattern as evaluated by Source"
-    repl_user=$(ask_required "Replication user" "")
-    repl_host=$(ask_required "Replication account host allowed on Source (Replica IP or restricted pattern)" "")
+    log "============================================================"
+    log "[REPLICATE 1/3] Replication account action"
+    log "============================================================"
+    log "  create   : define a new dedicated account and grant only REPLICATION SLAVE"
+    log "  existing : select an unlocked Source account that already has REPLICATION SLAVE"
+    log "  sql-only : print minimum-privilege SQL without changing Source"
+    account_action=$(ask "Replication account action (create/existing/sql-only)" sql-only)
+    case $account_action in create|existing|sql-only) ;; *) die "invalid replication account action: $account_action" ;; esac
+
+    existing_ssl_type=
+    if [ "$account_action" = existing ]; then
+        account_candidates="$RUN_DIR/existing_replication_accounts.tsv"
+        if mysql_query source "SELECT User, Host, account_locked, IF(COALESCE(ssl_type,'')='', 'NONE', ssl_type), plugin FROM mysql.user WHERE Repl_slave_priv='Y' AND account_locked='N' ORDER BY User, Host;" > "$account_candidates" 2>/dev/null; then
+            candidate_count_value=$(candidate_count "$account_candidates")
+        else
+            candidate_count_value=0
+            : > "$account_candidates"
+            warn "The Source administrative account cannot list mysql.user; manual account input is required."
+        fi
+        log ""
+        log "Eligible existing accounts on Source:"
+        if [ "$candidate_count_value" -gt 0 ]; then
+            awk -F '\t' '{ printf "  %d) %s@%s  [TLS=%s, plugin=%s]\n", NR, $1, $2, $4, $5 }' "$account_candidates"
+        else
+            log "  none detected"
+        fi
+        log "  m) enter an existing account manually"
+        existing_selection=$(ask "Select existing account number or m" m)
+        case $existing_selection in
+            m|M)
+                repl_user=$(ask_required "Existing replication user" "")
+                repl_host=$(ask_required "Existing account host exactly as defined on Source" "")
+                ;;
+            *)
+                is_uint "$existing_selection" || die "existing account selection must be a number or m"
+                [ "$existing_selection" -ge 1 ] && [ "$existing_selection" -le "$candidate_count_value" ] || die "existing account selection is out of range: $existing_selection"
+                selected_account=$(sed -n "${existing_selection}p" "$account_candidates")
+                repl_user=$(printf '%s\n' "$selected_account" | awk -F '\t' '{ print $1 }')
+                repl_host=$(printf '%s\n' "$selected_account" | awk -F '\t' '{ print $2 }')
+                existing_ssl_type=$(printf '%s\n' "$selected_account" | awk -F '\t' '{ print $4 }')
+                [ -n "$repl_user" ] && [ -n "$repl_host" ] || die "unexpected existing account result"
+                ;;
+        esac
+    else
+        log ""
+        log "New account definition:"
+        log "  user : dedicated account name for the Replica I/O thread; the script does not assume or pre-create a name"
+        log "  host : Replica IP or the narrowest permitted host pattern as evaluated by Source"
+        repl_user=$(ask_required "Replication user to create or print" "")
+        repl_host=$(ask_required "Replication account host allowed on Source" "")
+    fi
     validate_account_name "$repl_user"
     validate_account_host "$repl_host"
     q_user=$(sql_quote "$repl_user")
     q_host=$(sql_quote "$repl_host")
+    if [ "$account_action" = existing ]; then
+        eligible_count=$(mysql_query source "SELECT COUNT(*) FROM mysql.user WHERE User='$q_user' AND Host='$q_host' AND Repl_slave_priv='Y' AND account_locked='N';" 2>/dev/null || printf unknown)
+        [ "$eligible_count" = 1 ] || die "selected existing account is missing, locked, or lacks REPLICATION SLAVE: '$q_user'@'$q_host'"
+        log ""
+        log "Selected account: '$q_user'@'$q_host'"
+        log "Current grants:"
+        selected_grants="$RUN_DIR/selected_replication_account_grants.txt"
+        mysql_query source "SHOW GRANTS FOR '$q_user'@'$q_host';" > "$selected_grants" || die "cannot inspect grants for selected account"
+        sed 's/^/  /' "$selected_grants"
+        extra_grants=$(grep '^GRANT ' "$selected_grants" | grep -v '^GRANT USAGE ON ' | grep -v '^GRANT REPLICATION SLAVE ON \*\.\* TO ' || true)
+        if [ -n "$extra_grants" ]; then
+            warn "The selected account has privileges beyond the dedicated replication connection privilege."
+            printf '%s\n' "$extra_grants" | sed 's/^/  /'
+            confirm_phrase "A dedicated minimum-privilege account is safer for production." "USE BROAD ACCOUNT"
+        fi
+    fi
     source_connect_host=$(ask_required "Source host/IP reachable from Replica" "$SOURCE_HOST")
     validate_network_host "$source_connect_host"
     source_connect_port=$(ask_required "Source port reachable from Replica" "${SOURCE_PORT:-$SOURCE_RUNTIME_PORT}")
@@ -1173,6 +1260,9 @@ replicate() {
             fi
             ;;
         plain)
+            if [ -n "$existing_ssl_type" ] && [ "$existing_ssl_type" != NONE ]; then
+                die "selected existing account requires TLS ($existing_ssl_type); choose tls transport"
+            fi
             warn "Plain replication transport does not protect replication credentials or traffic from network interception."
             confirm_phrase "Use only on a separately protected network." "ALLOW PLAIN REPLICATION"
             if [ "$syntax" = modern ]; then transport_options=", GET_SOURCE_PUBLIC_KEY=1"; else transport_options=", GET_MASTER_PUBLIC_KEY=1"; fi
@@ -1191,11 +1281,6 @@ replicate() {
     log "GRANT REPLICATION SLAVE ON *.* TO '$q_user'@'$q_host';"
     log ""
     log "Only REPLICATION SLAVE is granted to the replication connection account."
-    log "Replication account action options:"
-    log "  create   : create the account now on Source and grant only REPLICATION SLAVE"
-    log "  existing : use an account already created with the required minimum privilege"
-    log "  sql-only : print the minimum-privilege SQL without changing Source; recommended when a separate DBA grants accounts"
-    account_action=$(ask "Replication account action (create/existing/sql-only)" sql-only)
     case $account_action in
         create)
             log "The Source administrative account must be allowed to CREATE USER and grant REPLICATION SLAVE."
