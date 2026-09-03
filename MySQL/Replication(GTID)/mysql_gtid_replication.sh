@@ -3,7 +3,7 @@
 set -u
 
 SCRIPT_NAME=${0##*/}
-SCRIPT_VERSION=1.0.11
+SCRIPT_VERSION=1.0.12
 STEP=${1:-help}
 STATE_FILE=${MYSQL_GTID_STATE_FILE:-"$(pwd)/.mysql_gtid_replication.state"}
 WORK_ROOT=${MYSQL_GTID_WORK_ROOT:-"$(pwd)/mysql_gtid_replication_work"}
@@ -734,11 +734,6 @@ EOF
         if [ "$mb_role" = Replica ]; then
             cat <<EOF
 
-# Replica operational protection. The initialize step temporarily disables
-# write protection only while restoring an online logical dump, then restores it.
-read_only=ON
-super_read_only=ON
-event_scheduler=OFF
 EOF
             if [ "$mb_durable_relay" = yes ]; then
                 cat <<EOF
@@ -976,8 +971,8 @@ configure() {
     replica_source_info_option=$(source_info_sync_variable replica)
     if [ "$profile" = production ]; then
         log "Production profile adds sync_binlog=1, innodb_flush_log_at_trx_commit=1, binlog_row_image=FULL and explicit binlog retention."
-        log "Replica read_only=ON, super_read_only=ON and event_scheduler=OFF are written as persistent production settings."
-        log "The initialize step temporarily disables write protection only during its logical restore and restores it immediately afterward."
+        log "Replica read_only, super_read_only and event_scheduler are operational policy values and are not written to my.cnf."
+        log "Their current Runtime values are reviewed after validation and can be changed without restarting MySQL."
         log "Binary log retention must be longer than the initial copy, restore, and Replica catch-up time."
         log "A larger value provides more recovery margin but consumes more disk space."
         source_expire=$(ask_required "Source binary log retention in seconds" "$source_expire")
@@ -1671,11 +1666,7 @@ validate() {
             yes)
                 mysql_query replica "SET GLOBAL event_scheduler=OFF; SET GLOBAL read_only=ON; SET GLOBAL super_read_only=ON;" || die "replication is valid, but Replica runtime protection could not be applied"
                 log "Replica Runtime protection applied without restart."
-                if [ -n "$REPLICA_CNF" ]; then
-                    log "Persistence: rerun 'sh $SCRIPT_NAME configure' with the production profile if these values are not yet present in $REPLICA_CNF."
-                else
-                    warn "Replica option-file path is unknown; persist read_only, super_read_only and event_scheduler manually before the next restart."
-                fi
+                log "These operational policy values were not written to my.cnf. Review them again after a MySQL restart."
                 ;;
             no) warn "Replica remains writable or Event Scheduler remains enabled; review before production use." ;;
             *) die "answer must be yes or no" ;;
