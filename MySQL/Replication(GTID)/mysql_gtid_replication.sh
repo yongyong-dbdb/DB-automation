@@ -235,6 +235,42 @@ mysql_query() {
     fi
 }
 
+reset_credentials() {
+    role=$1
+    if [ "$role" = source ]; then
+        [ -n "${SOURCE_CLIENT_FILE:-}" ] && rm -f "$SOURCE_CLIENT_FILE"
+        SOURCE_CLIENT_FILE=
+        SOURCE_ADMIN_PASSWORD=
+    else
+        [ -n "${REPLICA_CLIENT_FILE:-}" ] && rm -f "$REPLICA_CLIENT_FILE"
+        REPLICA_CLIENT_FILE=
+        REPLICA_ADMIN_PASSWORD=
+    fi
+}
+
+verify_connection() {
+    role=$1
+    case $role in
+        source) display_role=Source ;;
+        replica) display_role=Replica ;;
+        *) die "internal connection role error: $role" ;;
+    esac
+    attempt=1
+    while [ "$attempt" -le 3 ]; do
+        ensure_credentials "$role"
+        if mysql_query "$role" "SELECT 1;" >/dev/null; then
+            return
+        fi
+        reset_credentials "$role"
+        if [ "$attempt" -lt 3 ]; then
+            warn "$display_role authentication failed; verify that the password belongs to this exact instance."
+            warn "Retrying $display_role credentials ($((attempt + 1))/3)."
+        fi
+        attempt=$((attempt + 1))
+    done
+    die "$display_role connection failed after 3 authentication attempts"
+}
+
 mysql_table() {
     role=$1
     sql=$2
@@ -249,7 +285,7 @@ mysql_table() {
 variable_exists() {
     role=$1
     variable_name=$2
-    result=$(mysql_query "$role" "SHOW GLOBAL VARIABLES LIKE '$(sql_quote "$variable_name")';" 2>/dev/null || true)
+    result=$(mysql_query "$role" "SHOW GLOBAL VARIABLES LIKE '$(sql_quote "$variable_name")';") || die "unable to query $variable_name on $role"
     [ -n "$result" ]
 }
 
@@ -540,6 +576,8 @@ version_number() {
 }
 
 load_runtime_facts() {
+    verify_connection source
+    verify_connection replica
     source_row=$(runtime_row source) || die "Source connection failed"
     replica_row=$(runtime_row replica) || die "Replica connection failed"
     old_ifs=$IFS; IFS='|'; set -f; set -- $source_row; set +f; IFS=$old_ifs
