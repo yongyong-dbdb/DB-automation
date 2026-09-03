@@ -1208,7 +1208,7 @@ replicate() {
         log "  user : dedicated account name for the Replica I/O thread; the script does not assume or pre-create a name"
         log "  host : Replica IP or the narrowest permitted host pattern as evaluated by Source"
         repl_user=$(ask_required "Replication user to create or print" "")
-        repl_host=$(ask_required "Replication account host allowed on Source" "")
+        repl_host=$(ask_required "Replica client IP/host to permit on Source" "")
     fi
     validate_account_name "$repl_user"
     validate_account_host "$repl_host"
@@ -1230,9 +1230,15 @@ replicate() {
             confirm_phrase "A dedicated minimum-privilege account is safer for production." "USE BROAD ACCOUNT"
         fi
     fi
-    source_connect_host=$(ask_required "Source host/IP reachable from Replica" "$SOURCE_HOST")
+    log ""
+    log "Replication connection endpoint:"
+    log "  Source address : destination IP/hostname that the Replica I/O thread will connect to"
+    log "  Source port    : Source mysqld TCP port detected from @@port"
+    source_connect_host=$(ask_required "Source server IP/hostname that Replica will connect to" "$SOURCE_HOST")
     validate_network_host "$source_connect_host"
-    source_connect_port=$(ask_required "Source port reachable from Replica" "${SOURCE_PORT:-$SOURCE_RUNTIME_PORT}")
+    detected_source_port=$(mysql_query source "SELECT @@port;") || die "cannot detect Source TCP port"
+    is_uint "$detected_source_port" || die "Source returned a non-numeric @@port value: $detected_source_port"
+    source_connect_port=$(ask_required "Source TCP port that Replica will connect to" "$detected_source_port")
     is_uint "$source_connect_port" || die "Source replication port must be numeric"
     q_source_host=$(sql_quote "$source_connect_host")
     log "Replication transport options:"
