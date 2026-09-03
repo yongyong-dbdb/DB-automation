@@ -468,6 +468,9 @@ collect_endpoint() {
     log "[$role connection]"
     socket_count=$(candidate_count "$SOCKET_CANDIDATE_FILE")
     if [ "$socket_count" -ge 2 ]; then default_mode=socket; else default_mode=tcp; fi
+    log "Connection mode options:"
+    log "  tcp    : connect through a host/IP and port; use for remote instances or TCP validation"
+    log "  socket : connect through a local Unix socket; use when this controller runs on the MySQL host"
     mode=$(ask "$role connection mode (tcp/socket)" "$default_mode")
     case $mode in tcp|socket) ;; *) die "invalid connection mode: $mode" ;; esac
     if [ "$mode" = tcp ]; then
@@ -888,6 +891,10 @@ configure() {
     load_runtime_facts
     SOURCE_CONFIG_CHANGED=no
     REPLICA_CONFIG_CHANGED=no
+    log ""
+    log "Configuration profile options:"
+    log "  minimum    : apply only the settings required for GTID replication"
+    log "  production : also apply crash-durability and explicit binary-log retention settings; may increase storage I/O"
     profile=$(ask "Configuration profile (minimum/production)" minimum)
     case $profile in minimum|production) ;; *) die "configuration profile must be minimum or production" ;; esac
     source_expire=$(mysql_query source "SELECT @@GLOBAL.binlog_expire_logs_seconds;")
@@ -899,11 +906,16 @@ configure() {
     if [ "$profile" = production ]; then
         log "Production profile adds sync_binlog=1, innodb_flush_log_at_trx_commit=1, binlog_row_image=FULL and explicit binlog retention."
         log "Replica read_only/super_read_only are shown as post-initialization settings and are not enabled before restore."
+        log "Binary log retention must be longer than the initial copy, restore, and Replica catch-up time."
+        log "A larger value provides more recovery margin but consumes more disk space."
         source_expire=$(ask_required "Source binary log retention in seconds" "$source_expire")
         replica_expire=$(ask_required "Replica binary log retention in seconds" "$replica_expire")
         is_uint "$source_expire" || die "Source binary log retention must be numeric"
         is_uint "$replica_expire" || die "Replica binary log retention must be numeric"
-        durable_relay=$(ask "Use maximum Replica relay-log durability (more storage I/O)? (yes/no)" no)
+        log "Relay-log durability options:"
+        log "  yes : sync relay log and connection metadata for stronger crash durability; increases storage I/O"
+        log "  no  : retain normal MySQL synchronization behavior"
+        durable_relay=$(ask "Use maximum Replica relay-log durability? (yes/no)" no)
         case $durable_relay in yes|no) ;; *) die "answer must be yes or no" ;; esac
     fi
     source_default_id=$SOURCE_SERVER_ID
@@ -946,6 +958,13 @@ initialize() {
     mkdir -p "$RUN_DIR" || die "cannot create work directory"
     ensure_credentials source
     ensure_credentials replica
+    log ""
+    log "Initial data method options:"
+    log "  online-dump : keep Source online, create a consistent InnoDB logical dump, and restore it to Replica"
+    log "                suitable for small or moderate data; dump/restore time and Source load must be considered"
+    log "  already     : no copy; use only when Replica data and GTID history already match Source"
+    log "  external    : use an external hot physical backup or Clone workflow; recommended for large data and minimal downtime"
+    log "  skip        : make no change and exit this step; initialization remains incomplete"
     method=$(ask "Initial data method (online-dump/already/external/skip)" skip)
     case $method in
         already)
@@ -972,8 +991,15 @@ initialize() {
     esac
     dbs=$(mysql_query source "SELECT GROUP_CONCAT(SCHEMA_NAME SEPARATOR ' ') FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME NOT IN ('information_schema','performance_schema','mysql','sys');")
     [ -n "$dbs" ] || die "no application databases detected on Source"
+    log "Detected application databases are shown as the default."
+    log "Enter one or more database names separated by spaces; only the selected databases are copied."
     dbs=$(ask_required "Space-separated databases to initialize" "$dbs")
     safe_database_list "$dbs"
+    log "Dump content and file options:"
+    log "  stored routines : include stored procedures and functions; normally yes"
+    log "  events          : include Event Scheduler definitions; normally yes, but review whether events should run on Replica"
+    log "  gzip            : reduce dump disk usage and transfer size at the cost of CPU"
+    log "  keep dump       : retain the verified dump for rollback/reuse after a successful restore"
     include_routines=$(ask "Include stored routines? (yes/no)" yes)
     include_events=$(ask "Include Event Scheduler definitions? (yes/no)" yes)
     compress_dump=$(ask "Compress dump with gzip? (yes/no)" yes)
@@ -1062,6 +1088,10 @@ replicate() {
     source_ver=$(mysql_query source "SELECT @@version;")
     replica_ver=$(mysql_query replica "SELECT @@version;")
     syntax=$(replication_syntax "$replica_ver")
+    log ""
+    log "Replication account input:"
+    log "  user : dedicated MySQL account used only by the Replica I/O thread"
+    log "  host : Replica IP or the narrowest permitted host pattern as evaluated by Source"
     repl_user=$(ask_required "Replication user" "")
     repl_host=$(ask_required "Replication account host allowed on Source (Replica IP or restricted pattern)" "")
     validate_account_name "$repl_user"
@@ -1073,11 +1103,18 @@ replicate() {
     source_connect_port=$(ask_required "Source port reachable from Replica" "${SOURCE_PORT:-$SOURCE_RUNTIME_PORT}")
     is_uint "$source_connect_port" || die "Source replication port must be numeric"
     q_source_host=$(sql_quote "$source_connect_host")
+    log "Replication transport options:"
+    log "  tls   : encrypt replication credentials and traffic; recommended for production"
+    log "  plain : no TLS encryption; use only on a separately protected network"
     transport=$(ask "Replication transport (tls/plain)" tls)
     case $transport in
         tls)
+            log "TLS certificate verification options:"
+            log "  yes : verify that the Source certificate matches its identity; recommended when CA/hostname are configured correctly"
+            log "  no  : encrypt traffic without Source identity verification"
             verify_tls=$(ask "Verify Source certificate identity? (yes/no)" yes)
             case $verify_tls in yes|no) ;; *) die "answer must be yes or no" ;; esac
+            log "Provide the CA file installed on Replica, or leave blank to use the Replica's configured trust settings."
             ca_file=$(ask "CA certificate path on Replica (blank uses its configured trust settings)" "")
             case $ca_file in *[!A-Za-z0-9_./:-]*) die "CA path contains unsupported characters: $ca_file" ;; esac
             if [ "$syntax" = modern ]; then
@@ -1109,6 +1146,10 @@ replicate() {
     log "GRANT REPLICATION SLAVE ON *.* TO '$q_user'@'$q_host';"
     log ""
     log "Only REPLICATION SLAVE is granted to the replication connection account."
+    log "Replication account action options:"
+    log "  create   : create the account now on Source and grant only REPLICATION SLAVE"
+    log "  existing : use an account already created with the required minimum privilege"
+    log "  sql-only : print the minimum-privilege SQL without changing Source; recommended when a separate DBA grants accounts"
     account_action=$(ask "Replication account action (create/existing/sql-only)" sql-only)
     case $account_action in
         create)
