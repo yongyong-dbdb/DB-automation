@@ -951,6 +951,21 @@ safe_database_list() {
     done
 }
 
+format_bytes() {
+    bytes=${1:-0}
+    awk -v bytes="$bytes" 'BEGIN {
+        split("B KiB MiB GiB TiB", unit, " ")
+        value = bytes + 0
+        index = 1
+        while (value >= 1024 && index < 5) {
+            value /= 1024
+            index++
+        }
+        if (index == 1) printf "%.0f %s", value, unit[index]
+        else printf "%.2f %s", value, unit[index]
+    }'
+}
+
 initialize() {
     load_state
     need_cmd mysql
@@ -958,6 +973,21 @@ initialize() {
     mkdir -p "$RUN_DIR" || die "cannot create work directory"
     ensure_credentials source
     ensure_credentials replica
+    verify_connection source
+    verify_connection replica
+    source_app_tables=$(mysql_query source "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema NOT IN ('information_schema','performance_schema','mysql','sys');")
+    source_app_bytes=$(mysql_query source "SELECT COALESCE(SUM(COALESCE(data_length,0)+COALESCE(index_length,0)),0) FROM information_schema.tables WHERE table_schema NOT IN ('information_schema','performance_schema','mysql','sys');")
+    replica_app_tables=$(mysql_query replica "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema NOT IN ('information_schema','performance_schema','mysql','sys');")
+    replica_gtid_preview=$(mysql_query replica "SELECT @@GLOBAL.gtid_executed;")
+    source_size_display=$(format_bytes "$source_app_bytes")
+    if [ -n "$replica_gtid_preview" ]; then replica_gtid_state=not-empty; else replica_gtid_state=empty; fi
+    log ""
+    log "[initialization decision facts]"
+    log "  Source application tables       : $source_app_tables"
+    log "  Source estimated data+index size: $source_size_display ($source_app_bytes bytes)"
+    log "  Replica application tables      : $replica_app_tables"
+    log "  Replica gtid_executed            : $replica_gtid_state"
+    log "  Note: INFORMATION_SCHEMA size is an estimate; actual dump size and duration depend on data types, compression, I/O, CPU, and network."
     log ""
     log "Initial data method options:"
     log "  online-dump : keep Source online, create a consistent InnoDB logical dump, and restore it to Replica"
@@ -965,6 +995,17 @@ initialize() {
     log "  already     : no copy; use only when Replica data and GTID history already match Source"
     log "  external    : use an external hot physical backup or Clone workflow; recommended for large data and minimal downtime"
     log "  skip        : make no change and exit this step; initialization remains incomplete"
+    log ""
+    log "Selection guide for the detected state:"
+    if [ "${replica_app_tables:-0}" -eq 0 ] && [ -z "$replica_gtid_preview" ]; then
+        log "  This Replica appears clean (no application tables and empty GTID history)."
+        log "  - Current test/small-to-moderate data: choose online-dump."
+        log "  - Large production data or strict downtime/load limits: choose external."
+        log "  - Do not choose already unless data and GTID history were initialized by another verified method."
+    else
+        log "  This Replica is not empty. Do not choose already based only on matching object names or row counts."
+        log "  Verify both data consistency and GTID history, or use a controlled reprovisioning method."
+    fi
     method=$(ask "Initial data method (online-dump/already/external/skip)" skip)
     case $method in
         already)
@@ -989,12 +1030,16 @@ initialize() {
         online-dump) ;;
         *) die "invalid initialization method: $method" ;;
     esac
-    dbs=$(mysql_query source "SELECT GROUP_CONCAT(SCHEMA_NAME SEPARATOR ' ') FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME NOT IN ('information_schema','performance_schema','mysql','sys');")
-    [ -n "$dbs" ] || die "no application databases detected on Source"
+    detected_dbs=$(mysql_query source "SELECT GROUP_CONCAT(SCHEMA_NAME ORDER BY SCHEMA_NAME SEPARATOR ' ') FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME NOT IN ('information_schema','performance_schema','mysql','sys');")
+    [ -n "$detected_dbs" ] || die "no application databases detected on Source"
     log "Detected application databases are shown as the default."
-    log "Enter one or more database names separated by spaces; only the selected databases are copied."
-    dbs=$(ask_required "Space-separated databases to initialize" "$dbs")
+    log "This unfiltered replication workflow requires all application databases to be initialized together."
+    log "A partial mysqldump can record the Source's global GTID set even for excluded databases, causing their earlier transactions to be treated as already executed."
+    dbs=$(ask_required "Space-separated databases to initialize" "$detected_dbs")
     safe_database_list "$dbs"
+    normalized_detected=$(printf '%s\n' $detected_dbs | sort | tr '\n' ' ')
+    normalized_selected=$(printf '%s\n' $dbs | sort | tr '\n' ' ')
+    [ "$normalized_selected" = "$normalized_detected" ] || die "partial database initialization is not supported without matching replication filters; select all detected application databases"
     log "Dump content and file options:"
     log "  stored routines : include stored procedures and functions; normally yes"
     log "  events          : include Event Scheduler definitions; normally yes, but review whether events should run on Replica"
