@@ -235,9 +235,9 @@ mysql_query() {
     sql=$2
     ensure_credentials "$role"
     if [ "$role" = source ]; then
-        mysql --defaults-extra-file="$SOURCE_CLIENT_FILE" --batch --skip-column-names -e "$sql"
+        printf '%s\n' "$sql" | mysql --defaults-extra-file="$SOURCE_CLIENT_FILE" --batch --skip-column-names
     else
-        mysql --defaults-extra-file="$REPLICA_CLIENT_FILE" --batch --skip-column-names -e "$sql"
+        printf '%s\n' "$sql" | mysql --defaults-extra-file="$REPLICA_CLIENT_FILE" --batch --skip-column-names
     fi
 }
 
@@ -282,9 +282,9 @@ mysql_table() {
     sql=$2
     ensure_credentials "$role"
     if [ "$role" = source ]; then
-        mysql --defaults-extra-file="$SOURCE_CLIENT_FILE" --table -e "$sql"
+        printf '%s\n' "$sql" | mysql --defaults-extra-file="$SOURCE_CLIENT_FILE" --table
     else
-        mysql --defaults-extra-file="$REPLICA_CLIENT_FILE" --table -e "$sql"
+        printf '%s\n' "$sql" | mysql --defaults-extra-file="$REPLICA_CLIENT_FILE" --table
     fi
 }
 
@@ -1205,6 +1205,39 @@ replication_syntax() {
     if [ "$num" -ge 8000023 ]; then printf modern; else printf legacy; fi
 }
 
+show_source_password_policy() {
+    policy_file="$RUN_DIR/source_password_policy.tsv"
+    mysql_query source "SHOW GLOBAL VARIABLES LIKE 'validate_password%';" > "$policy_file" 2>/dev/null || : > "$policy_file"
+    log ""
+    log "============================================================"
+    log "[Source password policy]"
+    log "============================================================"
+    if [ ! -s "$policy_file" ]; then
+        log "validate_password: not detected"
+        log "The server or an external authentication component can still reject a password."
+        return
+    fi
+    policy_value=$(awk -F '\t' '$1 ~ /[._]policy$/ { print $2; exit }' "$policy_file")
+    length_value=$(awk -F '\t' '$1 ~ /[._]length$/ { print $2; exit }' "$policy_file")
+    mixed_value=$(awk -F '\t' '$1 ~ /[._]mixed_case_count$/ { print $2; exit }' "$policy_file")
+    number_value=$(awk -F '\t' '$1 ~ /[._]number_count$/ { print $2; exit }' "$policy_file")
+    special_value=$(awk -F '\t' '$1 ~ /[._]special_char_count$/ { print $2; exit }' "$policy_file")
+    check_user_value=$(awk -F '\t' '$1 ~ /[._]check_user_name$/ { print $2; exit }' "$policy_file")
+    dictionary_value=$(awk -F '\t' '$1 ~ /[._]dictionary_file$/ { print $2; exit }' "$policy_file")
+    log "Policy             : ${policy_value:-unknown}"
+    log "Minimum length     : ${length_value:-unknown}"
+    case ${policy_value:-unknown} in
+        MEDIUM|1|STRONG|2)
+            log "Uppercase/lowercase: at least ${mixed_value:-unknown} of each"
+            log "Numbers            : at least ${number_value:-unknown}"
+            log "Special characters : at least ${special_value:-unknown}"
+            ;;
+    esac
+    [ -n "$check_user_value" ] && log "Reject user-name match: $check_user_value"
+    case ${policy_value:-unknown} in STRONG|2) log "Dictionary file    : ${dictionary_value:-not configured}" ;; esac
+    log "The password is entered securely and is not written to the state file or logs."
+}
+
 replicate() {
     load_state
     [ "$INITIALIZED" = yes ] || die "initial data is not marked ready; run initialize"
@@ -1351,10 +1384,37 @@ replicate() {
         create)
             log "The Source administrative account must be allowed to CREATE USER and grant REPLICATION SLAVE."
             confirm_phrase "The displayed minimum-privilege account will be created on Source." "CREATE REPLICATION USER"
-            repl_password=$(ask_secret "New replication user password")
-            validate_sql_password "$repl_password"
-            q_pass=$(sql_quote "$repl_password")
-            mysql_query source "CREATE USER '$q_user'@'$q_host' IDENTIFIED BY '$q_pass'$account_tls_clause; GRANT REPLICATION SLAVE ON *.* TO '$q_user'@'$q_host';" || die "cannot create/grant replication account; choose sql-only for DBA execution or existing for a prepared account"
+            target_exists=$(mysql_query source "SELECT COUNT(*) FROM mysql.user WHERE User='$q_user' AND Host='$q_host';") || die "cannot check whether the target account already exists"
+            [ "$target_exists" -eq 0 ] || die "account '$q_user'@'$q_host' already exists; rerun and select existing"
+            show_source_password_policy
+            password_attempt=1
+            account_created=no
+            create_error_log="$RUN_DIR/create_replication_user_error.log"
+            while [ "$password_attempt" -le 3 ]; do
+                repl_password=$(ask_secret "New replication user password (attempt $password_attempt/3)")
+                validate_sql_password "$repl_password"
+                q_pass=$(sql_quote "$repl_password")
+                password_strength=$(mysql_query source "SELECT VALIDATE_PASSWORD_STRENGTH('$q_pass');" 2>/dev/null || true)
+                if is_uint "${password_strength:-}" && [ "$password_strength" -gt 0 ]; then
+                    log "Source password strength score: $password_strength/100"
+                fi
+                if mysql_query source "CREATE USER '$q_user'@'$q_host' IDENTIFIED BY '$q_pass'$account_tls_clause;" 2> "$create_error_log"; then
+                    account_created=yes
+                    break
+                fi
+                if grep -q 'ERROR 1819' "$create_error_log"; then
+                    warn "Password rejected by the Source password policy."
+                    sed -n '1,20p' "$create_error_log" >&2
+                else
+                    sed -n '1,50p' "$create_error_log" >&2
+                    die "cannot create replication account"
+                fi
+                unset repl_password q_pass
+                password_attempt=$((password_attempt + 1))
+            done
+            [ "$account_created" = yes ] || die "password policy validation failed after 3 attempts; no account was created"
+            rm -f "$create_error_log"
+            mysql_query source "GRANT REPLICATION SLAVE ON *.* TO '$q_user'@'$q_host';" || die "account was created but the REPLICATION SLAVE grant failed; review and grant the privilege manually"
             ;;
         existing)
             log "No CREATE USER or GRANT statement will be executed."
