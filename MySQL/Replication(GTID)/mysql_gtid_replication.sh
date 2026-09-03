@@ -1344,6 +1344,13 @@ replicate() {
     validate_network_host "$source_connect_host"
     source_connect_port=$(ask_required "Source TCP port that Replica will connect to" "$detected_source_port")
     is_uint "$source_connect_port" || die "Source replication port must be numeric"
+    if [ "$SOURCE_LOCATION" = local ] && [ "$REPLICA_LOCATION" = local ] && [ "$source_connect_port" = "$detected_replica_port" ] && [ "$detected_source_port" != "$detected_replica_port" ]; then
+        die "selected Source port $source_connect_port is the local Replica port; use detected Source port $detected_source_port"
+    fi
+    if [ "$source_connect_port" != "$detected_source_port" ]; then
+        warn "Selected Source port $source_connect_port differs from Source @@port $detected_source_port."
+        confirm_phrase "Continue only when NAT, proxy, or port mapping intentionally exposes a different Source port." "USE MAPPED SOURCE PORT"
+    fi
     q_source_host=$(sql_quote "$source_connect_host")
     log "Replication transport options:"
     log "  tls   : encrypt replication credentials and traffic; recommended for production"
@@ -1351,22 +1358,34 @@ replicate() {
     transport=$(ask "Replication transport (tls/plain)" tls)
     case $transport in
         tls)
-            log "TLS certificate verification options:"
-            log "  yes : verify that the Source certificate matches its identity; recommended when CA/hostname are configured correctly"
-            log "  no  : encrypt traffic without Source identity verification"
-            verify_tls=$(ask "Verify Source certificate identity? (yes/no)" yes)
-            case $verify_tls in yes|no) ;; *) die "answer must be yes or no" ;; esac
-            log "Provide the CA file installed on Replica, or leave blank to use the Replica's configured trust settings."
-            ca_file=$(ask "CA certificate path on Replica (blank uses its configured trust settings)" "")
-            case $ca_file in *[!A-Za-z0-9_./:-]*) die "CA path contains unsupported characters: $ca_file" ;; esac
-            if [ "$syntax" = modern ]; then
-                transport_options=", SOURCE_SSL=1"
-                [ -n "$ca_file" ] && transport_options="$transport_options, SOURCE_SSL_CA='$(sql_quote "$ca_file")'"
-                [ "$verify_tls" = yes ] && transport_options="$transport_options, SOURCE_SSL_VERIFY_SERVER_CERT=1"
+            log "TLS verification modes:"
+            log "  verify-identity : encrypt traffic and verify Source certificate CA plus hostname/IP; recommended for production"
+            log "  encrypt-only    : encrypt without authenticating Source identity; intended only for controlled test environments"
+            tls_mode=$(ask "TLS verification mode (verify-identity/encrypt-only)" verify-identity)
+            case $tls_mode in verify-identity|encrypt-only) ;; *) die "invalid TLS verification mode: $tls_mode" ;; esac
+            ca_file=
+            if [ "$tls_mode" = verify-identity ]; then
+                log "The CA certificate must exist on the Replica host and be readable by the Replica mysqld OS account."
+                log "The Source certificate SAN/CN must match the Source hostname or IP entered above."
+                ca_file=$(ask_required "CA certificate path on Replica" "")
+                case $ca_file in *[!A-Za-z0-9_./:-]*) die "CA path contains unsupported characters: $ca_file" ;; esac
+                if [ "$REPLICA_LOCATION" = local ] && [ ! -r "$ca_file" ]; then
+                    die "CA certificate is not readable on the local Replica host: $ca_file"
+                fi
             else
-                transport_options=", MASTER_SSL=1"
-                [ -n "$ca_file" ] && transport_options="$transport_options, MASTER_SSL_CA='$(sql_quote "$ca_file")'"
-                [ "$verify_tls" = yes ] && transport_options="$transport_options, MASTER_SSL_VERIFY_SERVER_CERT=1"
+                warn "encrypt-only TLS does not verify Source identity and is vulnerable to an active man-in-the-middle attack."
+                confirm_phrase "Use only for a controlled test environment or until a trusted CA and matching certificate are deployed." "ALLOW UNVERIFIED TLS"
+            fi
+            if [ "$syntax" = modern ]; then
+                transport_options=", SOURCE_SSL=1, SOURCE_SSL_VERIFY_SERVER_CERT=0"
+                if [ "$tls_mode" = verify-identity ]; then
+                    transport_options=", SOURCE_SSL=1, SOURCE_SSL_CA='$(sql_quote "$ca_file")', SOURCE_SSL_VERIFY_SERVER_CERT=1"
+                fi
+            else
+                transport_options=", MASTER_SSL=1, MASTER_SSL_VERIFY_SERVER_CERT=0"
+                if [ "$tls_mode" = verify-identity ]; then
+                    transport_options=", MASTER_SSL=1, MASTER_SSL_CA='$(sql_quote "$ca_file")', MASTER_SSL_VERIFY_SERVER_CERT=1"
+                fi
             fi
             ;;
         plain)
@@ -1460,6 +1479,11 @@ replicate() {
         mysql_query replica "CHANGE MASTER TO MASTER_HOST='$q_source_host', MASTER_PORT=$source_connect_port, MASTER_USER='$q_user', MASTER_PASSWORD='$q_pass', MASTER_AUTO_POSITION=1$transport_options$clause; START SLAVE$clause;" || die "cannot configure/start GTID replication"
     fi
     unset repl_password q_pass
+    sleep 2
+    connection_error=$(mysql_query replica "SELECT LAST_ERROR_NUMBER FROM performance_schema.replication_connection_status WHERE CHANNEL_NAME='$(sql_quote "$CHANNEL_NAME")';" 2>/dev/null || printf unknown)
+    worker_error=$(mysql_query replica "SELECT COALESCE(MAX(LAST_ERROR_NUMBER),0) FROM performance_schema.replication_applier_status_by_worker WHERE CHANNEL_NAME='$(sql_quote "$CHANNEL_NAME")';" 2>/dev/null || printf unknown)
+    case $connection_error in ''|0) ;; *) collect_validate_diagnostics "Replication receiver failed immediately after START REPLICA" "$(mysql_query source 'SELECT @@GLOBAL.gtid_executed;')"; die "replication receiver error: $connection_error" ;; esac
+    case $worker_error in ''|0) ;; *) collect_validate_diagnostics "Replication applier failed immediately after START REPLICA" "$(mysql_query source 'SELECT @@GLOBAL.gtid_executed;')"; die "replication applier error: $worker_error" ;; esac
     log "GTID replication channel started: ${CHANNEL_NAME:-default}"
     next_step validate "The replication channel has started; verify GTID catch-up and thread status."
 }
