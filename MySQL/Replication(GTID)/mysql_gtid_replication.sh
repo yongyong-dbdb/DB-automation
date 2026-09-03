@@ -143,6 +143,7 @@ save_state() {
         printf "SOURCE_ADMIN_USER='%s'\n" "$(state_quote "$SOURCE_ADMIN_USER")"
         printf "SOURCE_CNF='%s'\n" "$(state_quote "$SOURCE_CNF")"
         printf "SOURCE_SERVICE='%s'\n" "$(state_quote "$SOURCE_SERVICE")"
+        printf "SOURCE_LOCATION='%s'\n" "$(state_quote "$SOURCE_LOCATION")"
         printf "REPLICA_MODE='%s'\n" "$(state_quote "$REPLICA_MODE")"
         printf "REPLICA_HOST='%s'\n" "$(state_quote "$REPLICA_HOST")"
         printf "REPLICA_PORT='%s'\n" "$(state_quote "$REPLICA_PORT")"
@@ -150,6 +151,7 @@ save_state() {
         printf "REPLICA_ADMIN_USER='%s'\n" "$(state_quote "$REPLICA_ADMIN_USER")"
         printf "REPLICA_CNF='%s'\n" "$(state_quote "$REPLICA_CNF")"
         printf "REPLICA_SERVICE='%s'\n" "$(state_quote "$REPLICA_SERVICE")"
+        printf "REPLICA_LOCATION='%s'\n" "$(state_quote "$REPLICA_LOCATION")"
         printf "CHANNEL_NAME='%s'\n" "$(state_quote "$CHANNEL_NAME")"
         printf "INITIALIZED='%s'\n" "$(state_quote "$INITIALIZED")"
     } > "$state_tmp" || die "cannot write state file: $state_tmp"
@@ -164,6 +166,8 @@ init_state_defaults() {
     SOURCE_ADMIN_USER=${SOURCE_ADMIN_USER:-}
     SOURCE_CNF=${SOURCE_CNF:-}
     SOURCE_SERVICE=${SOURCE_SERVICE:-}
+    SOURCE_LOCATION=${SOURCE_LOCATION:-}
+    [ -n "$SOURCE_LOCATION" ] || { if [ "$SOURCE_MODE" = socket ]; then SOURCE_LOCATION=local; else SOURCE_LOCATION=remote; fi; }
     REPLICA_MODE=${REPLICA_MODE:-tcp}
     REPLICA_HOST=${REPLICA_HOST:-}
     REPLICA_PORT=${REPLICA_PORT:-}
@@ -171,6 +175,8 @@ init_state_defaults() {
     REPLICA_ADMIN_USER=${REPLICA_ADMIN_USER:-}
     REPLICA_CNF=${REPLICA_CNF:-}
     REPLICA_SERVICE=${REPLICA_SERVICE:-}
+    REPLICA_LOCATION=${REPLICA_LOCATION:-}
+    [ -n "$REPLICA_LOCATION" ] || { if [ "$REPLICA_MODE" = socket ]; then REPLICA_LOCATION=local; else REPLICA_LOCATION=remote; fi; }
     CHANNEL_NAME=${CHANNEL_NAME:-}
     INITIALIZED=${INITIALIZED:-no}
 }
@@ -461,6 +467,21 @@ choose_cnf() {
     CHOSEN_CNF=$cnf
 }
 
+host_is_local() {
+    check_host=$1
+    case $check_host in
+        localhost|localhost.localdomain|127.*|::1) return 0 ;;
+    esac
+    local_short=$(hostname 2>/dev/null || true)
+    local_fqdn=$(hostname -f 2>/dev/null || true)
+    [ -n "$local_short" ] && [ "$check_host" = "$local_short" ] && return 0
+    [ -n "$local_fqdn" ] && [ "$check_host" = "$local_fqdn" ] && return 0
+    if command -v ip >/dev/null 2>&1; then
+        ip -o addr show 2>/dev/null | awk '{ sub(/\/.*/, "", $4); print $4 }' | grep -F -x "$check_host" >/dev/null 2>&1 && return 0
+    fi
+    return 1
+}
+
 collect_endpoint() {
     role=$1
     upper=$2
@@ -478,26 +499,41 @@ collect_endpoint() {
         port=$(ask_required "$role MySQL port" "")
         is_uint "$port" || die "$role port must be numeric"
         socket=
+        if host_is_local "$host"; then default_location=local; else default_location=remote; fi
+        log "Instance location controls whether this script may inspect and modify local configuration files."
+        log "  local  : this MySQL instance runs on the controller host"
+        log "  remote : this MySQL instance runs on another server; local my.cnf/service discovery is disabled"
+        location=$(ask "$role instance location relative to this controller (local/remote)" "$default_location")
+        case $location in local|remote) ;; *) die "$role location must be local or remote" ;; esac
     else
         host=
         port=
         choose_socket "$role"
         socket=$CHOSEN_SOCKET
+        location=local
     fi
     admin_user=$(ask_required "$role administrative MySQL user" "")
-    choose_cnf "$role" "$socket"
-    cnf=$CHOSEN_CNF
-    service=$(ask "$role systemd service (blank if unavailable or manually managed)" "")
+    if [ "$location" = local ]; then
+        choose_cnf "$role" "$socket"
+        cnf=$CHOSEN_CNF
+        service=$(ask "$role systemd service (blank if unavailable or manually managed)" "")
+    else
+        cnf=
+        service=
+        log "$role is remote: local my.cnf and service discovery skipped."
+    fi
     case $upper in
         SOURCE)
             SOURCE_MODE=$mode; SOURCE_HOST=$host; SOURCE_PORT=$port
             SOURCE_SOCKET=$socket; SOURCE_ADMIN_USER=$admin_user
             SOURCE_CNF=$cnf; SOURCE_SERVICE=$service
+            SOURCE_LOCATION=$location
             ;;
         REPLICA)
             REPLICA_MODE=$mode; REPLICA_HOST=$host; REPLICA_PORT=$port
             REPLICA_SOCKET=$socket; REPLICA_ADMIN_USER=$admin_user
             REPLICA_CNF=$cnf; REPLICA_SERVICE=$service
+            REPLICA_LOCATION=$location
             ;;
         *) die "internal endpoint role error: $upper" ;;
     esac
@@ -535,6 +571,24 @@ print_runtime() {
     log "  super_read_only : $6"
 }
 
+print_management_topology() {
+    log ""
+    log "============================================================"
+    log "[Management topology]"
+    log "============================================================"
+    if [ "$SOURCE_MODE" = socket ]; then
+        log "Source  : local socket $SOURCE_SOCKET"
+    else
+        log "Source  : $SOURCE_LOCATION TCP $SOURCE_HOST:$SOURCE_PORT"
+    fi
+    if [ "$REPLICA_MODE" = socket ]; then
+        log "Replica : local socket $REPLICA_SOCKET"
+    else
+        log "Replica : $REPLICA_LOCATION TCP $REPLICA_HOST:$REPLICA_PORT"
+    fi
+    log "Note    : management endpoints can differ from the address used by the Replica I/O thread."
+}
+
 discover() {
     need_cmd mysql
     mkdir -p "$(dirname "$STATE_FILE")" "$RUN_DIR" || die "cannot create state/work directory"
@@ -551,6 +605,7 @@ discover() {
     ensure_credentials replica
     print_runtime source
     print_runtime replica
+    print_management_topology
     log ""
     log "State saved: $STATE_FILE"
     load_runtime_facts
@@ -1157,7 +1212,14 @@ replicate() {
     ensure_credentials replica
     source_ver=$(mysql_query source "SELECT @@version;")
     replica_ver=$(mysql_query replica "SELECT @@version;")
+    detected_source_port=$(mysql_query source "SELECT @@port;") || die "cannot detect Source TCP port"
+    detected_replica_port=$(mysql_query replica "SELECT @@port;") || die "cannot detect Replica TCP port"
+    is_uint "$detected_source_port" || die "Source returned a non-numeric @@port value: $detected_source_port"
+    is_uint "$detected_replica_port" || die "Replica returned a non-numeric @@port value: $detected_replica_port"
     syntax=$(replication_syntax "$replica_ver")
+    print_management_topology
+    log "Runtime ports: Source=$detected_source_port, Replica=$detected_replica_port"
+    log "The replication channel connects from Replica to the Source address and Source port confirmed below."
     log ""
     log "============================================================"
     log "[REPLICATE 1/3] Replication account action"
@@ -1236,8 +1298,6 @@ replicate() {
     log "  Source port    : Source mysqld TCP port detected from @@port"
     source_connect_host=$(ask_required "Source server IP/hostname that Replica will connect to" "$SOURCE_HOST")
     validate_network_host "$source_connect_host"
-    detected_source_port=$(mysql_query source "SELECT @@port;") || die "cannot detect Source TCP port"
-    is_uint "$detected_source_port" || die "Source returned a non-numeric @@port value: $detected_source_port"
     source_connect_port=$(ask_required "Source TCP port that Replica will connect to" "$detected_source_port")
     is_uint "$source_connect_port" || die "Source replication port must be numeric"
     q_source_host=$(sql_quote "$source_connect_host")
