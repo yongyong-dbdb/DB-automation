@@ -2,7 +2,7 @@
 
 PostgreSQL SQL 실행계획과 Planner 관련 정보를 한 번에 확인하기 위한 진단 스크립트입니다.
 
-단순 `EXPLAIN` 출력뿐 아니라 실행계획에 실제로 사용된 Relation을 자동으로 추출하고, 해당 Table의 통계와 Column 통계, Extended Statistics, Index 구성과 Index 사용량까지 함께 확인합니다.
+단순 `EXPLAIN` 출력뿐 아니라 실행계획에 실제로 사용된 Relation을 자동 추출하고, 해당 Table의 통계와 Column 통계, Extended Statistics, Index 구성과 Index 사용량까지 함께 확인합니다.
 
 `EXPLAIN ANALYZE` 사용 시에는 실행 직전/직후의 Table 및 Index 누적 통계를 Snapshot으로 저장한 뒤 Delta를 계산해 이번 실행 구간에서 증가한 통계도 함께 출력합니다.
 
@@ -25,6 +25,7 @@ explain.sh
 - Index 구성 및 Index Column 확인
 - Index 사용량 및 I/O 확인
 - `EXPLAIN ANALYZE` 실행 구간의 Table/Index 통계 Delta 확인
+- DML `EXPLAIN ANALYZE` 수행 시 데이터 변경 자동 Rollback
 - Cardinality 추정 오류 및 Index 사용 여부 분석 보조
 
 ## 실행
@@ -74,7 +75,51 @@ PG_HOME
 | SUMMARY | Planning/Execution 요약 | Planning Time 등 확인 |
 | FORMAT | TEXT / JSON / YAML / XML | 기본 TEXT |
 
-`ANALYZE` 선택 시 SQL이 실제로 실행되므로 추가 확인 후 수행합니다.
+`ANALYZE=yes` 선택 시 SQL이 실제로 실행되므로 `EXECUTE` 문자열을 추가로 입력해야 진행됩니다.
+
+## DML 자동 Rollback
+
+`ANALYZE=yes`일 때 비실행 JSON Plan의 `Operation`을 확인해 DML 여부를 판별합니다.
+
+대상:
+
+```text
+INSERT
+UPDATE
+DELETE
+MERGE
+```
+
+DML로 판별되면 다음 방식으로 실행합니다.
+
+```text
+BEGIN
+  ↓
+EXPLAIN ANALYZE DML
+  ↓
+ROLLBACK
+```
+
+즉 `UPDATE`, `DELETE`, `INSERT`, `MERGE`의 실제 실행계획과 Actual Rows/Time을 확인하되, Table Row 변경은 자동으로 Rollback합니다.
+
+예:
+
+```text
+DML detected : Update
+Execution    : BEGIN -> EXPLAIN ANALYZE -> ROLLBACK
+DML safety   : BEGIN -> EXPLAIN ANALYZE -> ROLLBACK
+```
+
+단, Transaction Rollback으로 복구되지 않는 부수효과는 남을 수 있습니다.
+
+```text
+Sequence 증가
+외부 시스템 호출 함수
+Transaction 외부 Side Effect
+일부 Extension/외부 함수 동작
+```
+
+따라서 DML에 대한 `EXPLAIN ANALYZE`는 자동 Rollback을 사용하더라도 운영 환경에서 주의가 필요합니다.
 
 ## 1. Execution Plan
 
@@ -108,13 +153,17 @@ Memory
 실행 순서:
 
 ```text
+비실행 JSON Plan 생성
+        ↓
 Plan Base Relation 자동 추출
         ↓
-Table / Index 통계 Before Snapshot
+Table / Index Before Snapshot
         ↓
-EXPLAIN ANALYZE 실제 실행
+EXPLAIN ANALYZE 실행
         ↓
-Table / Index 통계 After Snapshot
+DML이면 ROLLBACK
+        ↓
+Table / Index After Snapshot
         ↓
 After - Before Delta 계산
 ```
@@ -134,16 +183,6 @@ n_tup_del
 n_tup_hot_upd
 ```
 
-예:
-
-```text
-metric                         before           after           delta
-seq_scan                           10              11              +1
-seq_tup_read                   966247         5962745        +4996498
-idx_scan                           10              10               0
-n_tup_upd                      198196         4198196        +4000000
-```
-
 ### Index Statistics / I/O Delta
 
 `pg_stat_all_indexes`, `pg_statio_all_indexes` 기준으로 다음 항목을 출력합니다.
@@ -156,25 +195,17 @@ idx_blks_read
 idx_blks_hit
 ```
 
-예:
-
-```text
-metric                         before           after           delta
-idx_scan                           10              10               0
-idx_tup_read                        5               5               0
-idx_blks_read                   30165           30165               0
-idx_blks_hit                   410900          410900               0
-```
-
 ### Delta 해석
 
-Delta는 PostgreSQL의 누적 통계를 실행 직전/직후에 조회해 계산한 값입니다.
+Delta는 PostgreSQL 누적 통계를 실행 직전/직후에 조회해 계산한 값입니다.
 
-따라서 동일 Relation을 다른 Session에서도 동시에 사용하면 다른 Session의 증가분이 일부 포함될 수 있습니다.
+동일 Relation을 다른 Session에서도 동시에 사용하면 다른 Session의 증가분이 일부 포함될 수 있습니다.
 
 이번 SQL 자체의 Buffer 사용량은 `EXPLAIN (ANALYZE, BUFFERS)` 결과가 더 직접적인 기준이며, `pg_stat_*` Delta는 보조 진단값으로 사용합니다.
 
-`ANALYZE=no`에서는 대상 SQL이 실제 실행되지 않으므로 의미 있는 실행 구간 Delta를 만들 수 없습니다. 이 경우 기존 누적 통계를 그대로 출력합니다.
+`ANALYZE=no`에서는 대상 SQL이 실제 실행되지 않으므로 의미 있는 실행 구간 Delta를 만들 수 없습니다. 이 경우 현재 누적 통계를 그대로 출력합니다.
+
+DML을 Rollback하더라도 Scan/Index/I/O와 같은 실행 통계 카운터는 실제 실행으로 인해 증가할 수 있으므로 Delta 분석에 사용할 수 있습니다. 반면 DML 변경 Row 자체는 Rollback되므로 최종 데이터 변경량과 `n_tup_*` Delta를 동일한 의미로 해석하면 안 됩니다.
 
 ## 3. Planner Settings
 
@@ -245,7 +276,7 @@ plan_cache_mode
 
 대상 SQL 문자열에서 Table명을 단순 파싱하지 않습니다.
 
-추가 `EXPLAIN (FORMAT JSON)` 결과의 `Schema`와 `Relation Name`을 기준으로 실제 Plan Base Relation을 자동 추출합니다.
+`EXPLAIN (VERBOSE, COSTS FALSE, FORMAT JSON)` 결과의 `Schema`와 `Relation Name`을 기준으로 실제 Plan Base Relation을 자동 추출합니다.
 
 예:
 
@@ -282,7 +313,7 @@ Total Relation Size
 
 ## 6. Table Statistics
 
-`pg_stat_all_tables` 기준 누적 통계를 출력합니다.
+`pg_stat_all_tables` 기준 현재 누적 통계를 출력합니다.
 
 ```text
 seq_scan
@@ -306,7 +337,7 @@ analyze_count
 autoanalyze_count
 ```
 
-`ANALYZE=yes`에서는 위 누적값과 별도로 실행 전/후 Delta도 앞에서 출력합니다.
+`ANALYZE=yes`에서는 현재 누적값과 별도로 실행 전/후 Delta도 출력합니다.
 
 ## 7. Column Information
 
@@ -433,6 +464,8 @@ PostgreSQL Version 확인
         ↓
 EXPLAIN 옵션 선택
         ↓
+비실행 JSON Plan 생성
+        ↓
 Plan Base Relation 자동 추출
         ↓
 Execution Plan
@@ -442,17 +475,9 @@ Planner Settings
 Table / Column / Statistics / Index 누적 정보
 ```
 
-### ANALYZE = yes
+### ANALYZE = yes / SELECT 등 비 DML
 
 ```text
-PostgreSQL 연결
-        ↓
-대상 SQL 파일 선택
-        ↓
-PostgreSQL Version 확인
-        ↓
-EXPLAIN 옵션 선택
-        ↓
 Plan Base Relation 자동 추출
         ↓
 Before Snapshot
@@ -461,13 +486,29 @@ EXPLAIN ANALYZE 실제 실행
         ↓
 After Snapshot
         ↓
-Table Statistics Delta
+Table / Index Statistics Delta
         ↓
-Index Statistics / I/O Delta
+상세 진단
+```
+
+### ANALYZE = yes / DML
+
+```text
+Plan Base Relation 및 DML Operation 자동 확인
         ↓
-Planner Settings
+Before Snapshot
         ↓
-Table / Column / Statistics / Index 현재 누적 정보
+BEGIN
+        ↓
+EXPLAIN ANALYZE INSERT / UPDATE / DELETE / MERGE
+        ↓
+ROLLBACK
+        ↓
+After Snapshot
+        ↓
+Table / Index Statistics Delta
+        ↓
+상세 진단
 ```
 
 여러 Table이 Plan에 포함된 경우 각 Relation별로 진단 항목을 반복 출력합니다.
@@ -478,15 +519,15 @@ Table / Column / Statistics / Index 현재 누적 정보
 EXPLAIN
 → SQL을 실제 수행하지 않고 Planner의 예상 실행계획 확인
 
-EXPLAIN ANALYZE
-→ SQL 실제 수행 후 Actual Rows / Actual Time 확인
+EXPLAIN ANALYZE SELECT
+→ SELECT 실제 수행 후 Actual Rows / Actual Time 확인
+
+EXPLAIN ANALYZE DML
+→ DML 실제 수행 후 Actual Rows / Actual Time 확인
+→ 스크립트에서 자동 BEGIN / ROLLBACK 적용
 ```
 
-특히 `INSERT`, `UPDATE`, `DELETE`, `MERGE`에 `ANALYZE`를 사용할 경우 실제 변경이 발생할 수 있습니다.
-
-스크립트는 `ANALYZE=yes` 선택 시 `EXECUTE` 문자열을 추가 입력해야 진행됩니다.
-
-Transaction으로 감싸더라도 Sequence 증가, 외부 함수 호출 등 Transaction 외부 부수효과는 완전히 복구되지 않을 수 있습니다.
+DML의 Table Row 변경은 자동 Rollback하지만, Sequence 증가나 외부 함수 호출 등 Transaction 외부 부수효과는 완전히 복구되지 않을 수 있습니다.
 
 ## 통계 해석 시 주의
 
