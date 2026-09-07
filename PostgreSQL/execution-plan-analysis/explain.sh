@@ -1,7 +1,7 @@
 #!/bin/sh
 set -u
 
-SCRIPT_VERSION="1.1.2"
+SCRIPT_VERSION="1.1.3"
 SCRIPT_DIR=$(CDPATH='' cd "$(dirname "$0")" && pwd)
 DEFAULT_OUTPUT_DIR="$SCRIPT_DIR/results"
 
@@ -673,12 +673,21 @@ addopt "FORMAT $FORMAT"
 tmp="$work_dir/explain.sql"
 plan_json="$work_dir/plan.json"
 rel_file="$work_dir/relations.txt"
+diag_map_file="$work_dir/diagnostic-relation-map.txt"
+diag_rel_file="$work_dir/diagnostic-relations.txt"
 table_before="$work_dir/table_before.txt"
 table_after="$work_dir/table_after.txt"
 index_before="$work_dir/index_before.txt"
 index_after="$work_dir/index_after.txt"
 plan_output="$work_dir/plan-output.txt"
 report_output="$work_dir/report-output.txt"
+PARTITION_DIAG_LIMIT=${PARTITION_DIAG_LIMIT:-3}
+case $PARTITION_DIAG_LIMIT in
+    ''|*[!0-9]*|0)
+        echo "ERROR: PARTITION_DIAG_LIMIT must be a positive integer." >&2
+        exit 1
+        ;;
+esac
 
 result_timestamp=$(date '+%Y%m%d_%H%M%S')
 result_database=$(printf '%s' "$PGDATABASE" | tr -c '[:alnum:]_.-' '_')
@@ -698,6 +707,7 @@ mkdir -p "$RESULT_DIR" || {
     echo "user=$PGUSER"
     echo "sql_file=$SQL_FILE"
     echo "explain_options=$opts"
+    echo "partition_diagnostic_limit=$PARTITION_DIAG_LIMIT"
     echo
 } > "$RESULT_FILE" || {
     echo "ERROR: Could not create result file: $RESULT_FILE" >&2
@@ -882,6 +892,87 @@ print_index_delta() {
     ' "$index_before" "$index_after"
 }
 
+build_diagnostic_relation_list() {
+    : > "$diag_map_file"
+    : > "$diag_rel_file"
+
+    while IFS= read -r rel
+    do
+        [ -n "$rel" ] || continue
+        printf '%s\n' "
+WITH RECURSIVE ancestors AS (
+    SELECT i.inhparent AS parent_oid, 1 AS depth
+    FROM pg_inherits i
+    WHERE i.inhrelid = :'rel'::regclass
+  UNION ALL
+    SELECT i.inhparent, a.depth + 1
+    FROM ancestors a
+    JOIN pg_inherits i ON i.inhrelid = a.parent_oid
+), top_parent AS (
+    SELECT parent_oid
+    FROM ancestors
+    ORDER BY depth DESC
+    LIMIT 1
+)
+SELECT :'rel' AS relation_name,
+       COALESCE(
+           (SELECT format('%I.%I', n.nspname, c.relname)
+              FROM top_parent t
+              JOIN pg_class c ON c.oid = t.parent_oid
+              JOIN pg_namespace n ON n.oid = c.relnamespace),
+           :'rel'
+       ) AS family_name,
+       EXISTS (SELECT 1 FROM ancestors) AS is_partition;
+" | run_psql -X -qAt -F '|' -v ON_ERROR_STOP=1 -v rel="$rel" >> "$diag_map_file" || {
+            echo "ERROR: Could not inspect partition hierarchy for relation: $rel" >&2
+            return 1
+        }
+    done < "$rel_file"
+
+    awk -F'|' -v limit="$PARTITION_DIAG_LIMIT" '
+        $3 == "t" {
+            if (selected[$2] < limit) {
+                print $1
+                selected[$2]++
+            }
+            next
+        }
+        { print $1 }
+    ' "$diag_map_file" > "$diag_rel_file"
+}
+
+print_diagnostic_selection() {
+    awk -F'|' -v limit="$PARTITION_DIAG_LIMIT" '
+        {
+            relation[NR]=$1
+            family[NR]=$2
+            partitioned[NR]=$3
+            if ($3 == "t") total[$2]++
+        }
+        END {
+            for (i=1; i<=NR; i++) {
+                if (partitioned[i] != "t") {
+                    printf "Standalone relation : %s -> detailed diagnostic\n", relation[i]
+                    continue
+                }
+                f=family[i]
+                if (!shown[f]) {
+                    selected=(total[f] < limit ? total[f] : limit)
+                    printf "Partition family    : %s (plan partitions=%d, detailed=%d)\n", f, total[f], selected
+                    count=0
+                    for (j=1; j<=NR && count<limit; j++) {
+                        if (partitioned[j] == "t" && family[j] == f) {
+                            printf "  selected          : %s\n", relation[j]
+                            count++
+                        }
+                    }
+                    shown[f]=1
+                }
+            }
+        }
+    ' "$diag_map_file"
+}
+
 if [ "$ANALYZE" = yes ] && [ -s "$rel_file" ]; then
     snapshot_stats "$table_before" "$index_before"
 fi
@@ -974,6 +1065,10 @@ fi
 
 section "Referenced Relations (Plan Base Relations)" | tee -a "$RESULT_FILE"
 cat "$rel_file" | tee -a "$RESULT_FILE"
+
+build_diagnostic_relation_list || exit 1
+section "Detailed Diagnostic Selection" | tee -a "$RESULT_FILE"
+print_diagnostic_selection | tee -a "$RESULT_FILE"
 
 run_relation_report() {
     rel=$1
@@ -1162,6 +1257,6 @@ do
     run_relation_report "$rel" "Index Information" "$SQL_INDEX_INFO"
     run_relation_report "$rel" "Index Columns" "$SQL_INDEX_COLUMNS"
     run_relation_report "$rel" "Index Usage / I/O" "$SQL_INDEX_IO"
-done < "$rel_file"
+done < "$diag_rel_file"
 
 echo "Final result file: $RESULT_FILE" | tee -a "$RESULT_FILE"
