@@ -83,7 +83,83 @@ echo "  user     : $PGUSER"
 echo "  database : $PGDATABASE"
 echo
 
-if ! "$PSQL_BIN" -X -Atqc "SELECT 1;" >/dev/null 2>&1; then
+
+# Private temporary files for this invocation.
+work_dir=$(umask 077; mktemp -d "${TMPDIR:-/tmp}/pg_explain.XXXXXXXX") || exit 1
+tty_state=
+cleanup() {
+    if [ -n "$tty_state" ]; then
+        stty "$tty_state" </dev/tty 2>/dev/null || :
+    fi
+    rm -rf -- "$work_dir"
+}
+trap cleanup 0
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+run_psql() {
+    "$PSQL_BIN" -w "$@"
+}
+
+password_prompted=no
+prompt_password_once() {
+    [ "$password_prompted" = no ] || return 1
+    password_prompted=yes
+    tty_state=$(stty -g </dev/tty) || {
+        echo "ERROR: No terminal; configure PGPASSFILE for unattended execution." >&2
+        return 1
+    }
+    printf 'Password for user %s: ' "$PGUSER" >/dev/tty
+    stty -echo </dev/tty || return 1
+    IFS= read -r _password </dev/tty
+    _read_status=$?
+    stty "$tty_state" </dev/tty || return 1
+    tty_state=
+    printf '\n' >/dev/tty
+    [ "$_read_status" -eq 0 ] || { unset _password; return 1; }
+    # Host wildcard covers PGHOST retry and local sockets.
+    (
+        umask 077
+        for _field in "$PGPORT" "$PGDATABASE" "$PGUSER" "$_password"; do
+            case $_field in
+                *'
+'*) exit 1 ;;
+            esac
+        done
+        printf '*:'
+        for _field in "$PGPORT" "$PGDATABASE" "$PGUSER"; do
+            printf '%s' "$_field" | sed 's/\\/\\\\/g; s/:/\\:/g'
+            printf ':'
+        done
+        printf '%s' "$_password" | sed 's/\\/\\\\/g; s/:/\\:/g'
+        printf '\n'
+    ) > "$work_dir/pgpass"
+    _write_status=$?
+    unset _password
+    [ "$_write_status" -eq 0 ] || return 1
+    chmod 600 "$work_dir/pgpass" || return 1
+    unset PGPASSWORD
+    PGPASSFILE=$work_dir/pgpass
+    export PGPASSFILE
+}
+
+check_connection() {
+    if LC_ALL=C run_psql -X -Atqc "SELECT 1;" >/dev/null 2>"$work_dir/connection.err"; then
+        return 0
+    fi
+    # Socket/network/database errors must not trigger a password prompt.
+    if grep -Eq 'no password supplied|password authentication failed' "$work_dir/connection.err" &&
+       [ "$password_prompted" = no ]; then
+        prompt_password_once || return 1
+        run_psql -X -Atqc "SELECT 1;" >/dev/null
+        return $?
+    fi
+    cat "$work_dir/connection.err" >&2
+    return 1
+}
+
+if ! check_connection; then
     echo "Initial connection failed."
     printf 'Retry with PGHOST (example: localhost or socket directory): ' >&2
     IFS= read -r _retry_host
@@ -93,23 +169,34 @@ if ! "$PSQL_BIN" -X -Atqc "SELECT 1;" >/dev/null 2>&1; then
     }
     PGHOST=$_retry_host
     export PGHOST
-    "$PSQL_BIN" -X -Atqc "SELECT 1;" >/dev/null 2>&1 || {
+    check_connection || {
         echo "ERROR: PostgreSQL connection failed." >&2
         exit 1
     }
 fi
 
 SQL_FILE=${1:-}
-if [ -z "$SQL_FILE" ]; then
-    printf 'Target SQL file path: ' >&2
-    IFS= read -r SQL_FILE
-fi
-[ -r "$SQL_FILE" ] || {
-    echo "ERROR: cannot read SQL file: $SQL_FILE" >&2
-    exit 1
-}
+while :
+do
+    if [ -z "$SQL_FILE" ]; then
+        printf 'Target SQL file path (empty to cancel): ' >&2
+        IFS= read -r SQL_FILE || {
+            echo "Cancelled." >&2
+            exit 1
+        }
+        [ -n "$SQL_FILE" ] || {
+            echo "Cancelled." >&2
+            exit 1
+        }
+    fi
+    if [ -f "$SQL_FILE" ] && [ -r "$SQL_FILE" ]; then
+        break
+    fi
+    printf 'ERROR: cannot read SQL file: %s\n' "$SQL_FILE" >&2
+    SQL_FILE=
+done
 
-SERVER_VERSION_NUM=$("$PSQL_BIN" -X -Atqc "SHOW server_version_num") || exit 1
+SERVER_VERSION_NUM=$(run_psql -X -Atqc "SHOW server_version_num") || exit 1
 case $SERVER_VERSION_NUM in
     ''|*[!0-9]*)
         echo "ERROR: invalid server_version_num" >&2
@@ -221,20 +308,19 @@ addopt() {
 [ "$SUMMARY" = yes ] && addopt "SUMMARY"
 addopt "FORMAT $FORMAT"
 
-tmp="${TMPDIR:-/tmp}/pg_explain_$$.sql"
-plan_json="${TMPDIR:-/tmp}/pg_explain_plan_$$.json"
-rel_file="${TMPDIR:-/tmp}/pg_explain_rel_$$.txt"
-table_before="${TMPDIR:-/tmp}/pg_explain_table_before_$$.txt"
-table_after="${TMPDIR:-/tmp}/pg_explain_table_after_$$.txt"
-index_before="${TMPDIR:-/tmp}/pg_explain_index_before_$$.txt"
-index_after="${TMPDIR:-/tmp}/pg_explain_index_after_$$.txt"
-trap 'rm -f "$tmp" "$plan_json" "$rel_file" "$table_before" "$table_after" "$index_before" "$index_after"' EXIT HUP INT TERM
+tmp="$work_dir/explain.sql"
+plan_json="$work_dir/plan.json"
+rel_file="$work_dir/relations.txt"
+table_before="$work_dir/table_before.txt"
+table_after="$work_dir/table_after.txt"
+index_before="$work_dir/index_before.txt"
+index_after="$work_dir/index_after.txt"
 
 {
     printf 'EXPLAIN (VERBOSE, COSTS FALSE, FORMAT JSON)\n'
     cat "$SQL_FILE"
     printf '\n'
-} | "$PSQL_BIN" -X -At -v ON_ERROR_STOP=1 > "$plan_json" || {
+} | run_psql -X -At -v ON_ERROR_STOP=1 > "$plan_json" || {
     echo "ERROR: Could not generate JSON plan for relation extraction." >&2
     exit 1
 }
@@ -310,7 +396,7 @@ SELECT st.relid,
        COALESCE(st.n_tup_hot_upd,0)
 FROM pg_stat_all_tables st
 WHERE st.relid=:'rel'::regclass;
-" | "$PSQL_BIN" -X -At -F '|' -v ON_ERROR_STOP=1 -v rel="$rel" >> "$table_file"
+" | run_psql -X -At -F '|' -v ON_ERROR_STOP=1 -v rel="$rel" >> "$table_file"
 
         printf '%s\n' "
 SELECT si.indexrelid,
@@ -325,7 +411,7 @@ LEFT JOIN pg_statio_all_indexes io
   ON io.indexrelid=si.indexrelid
 WHERE si.relid=:'rel'::regclass
 ORDER BY si.indexrelid;
-" | "$PSQL_BIN" -X -At -F '|' -v ON_ERROR_STOP=1 -v rel="$rel" >> "$index_file"
+" | run_psql -X -At -F '|' -v ON_ERROR_STOP=1 -v rel="$rel" >> "$index_file"
     done < "$rel_file"
 }
 
@@ -412,7 +498,7 @@ echo "Generated: EXPLAIN ($opts)"
 if [ "$DML_ANALYZE" = yes ]; then
     echo "DML safety: BEGIN -> EXPLAIN ANALYZE -> ROLLBACK"
 fi
-"$PSQL_BIN" -X -v ON_ERROR_STOP=1 -f "$tmp" || exit 1
+run_psql -X -v ON_ERROR_STOP=1 -f "$tmp" || exit 1
 
 if [ "$ANALYZE" = yes ] && [ -s "$rel_file" ]; then
     snapshot_stats "$table_after" "$index_after"
@@ -433,7 +519,7 @@ DIAG=$(ask "Show additional Plan diagnostics? yes/no" yes)
 [ "$DIAG" = yes ] || exit 0
 
 section "Planner Settings"
-"$PSQL_BIN" -X -P pager=off -v ON_ERROR_STOP=1 <<'SQL'
+run_psql -X -P pager=off -v ON_ERROR_STOP=1 <<'SQL'
 SELECT name, setting, unit, source
 FROM pg_settings
 WHERE name IN (
@@ -465,7 +551,7 @@ run_relation_report() {
 
     section "$title : $rel"
     printf '%s\n' "$sql" | \
-        "$PSQL_BIN" -X -P pager=off -v ON_ERROR_STOP=1 -v rel="$rel"
+        run_psql -X -P pager=off -v ON_ERROR_STOP=1 -v rel="$rel"
 }
 
 SQL_TABLE_INFO='
