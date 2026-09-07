@@ -4,6 +4,8 @@ PostgreSQL SQL 실행계획과 Planner 관련 정보를 한 번에 확인하기 
 
 단순 `EXPLAIN` 출력뿐 아니라 실행계획에 실제로 사용된 Relation을 자동으로 추출하고, 해당 Table의 통계와 Column 통계, Extended Statistics, Index 구성과 Index 사용량까지 함께 확인합니다.
 
+`EXPLAIN ANALYZE` 사용 시에는 실행 직전/직후의 Table 및 Index 누적 통계를 Snapshot으로 저장한 뒤 Delta를 계산해 이번 실행 구간에서 증가한 통계도 함께 출력합니다.
+
 지원 범위: PostgreSQL 12 ~ 18
 
 실행 파일:
@@ -22,6 +24,7 @@ explain.sh
 - Extended Statistics 확인
 - Index 구성 및 Index Column 확인
 - Index 사용량 및 I/O 확인
+- `EXPLAIN ANALYZE` 실행 구간의 Table/Index 통계 Delta 확인
 - Cardinality 추정 오류 및 Index 사용 여부 분석 보조
 
 ## 실행
@@ -54,20 +57,7 @@ PG_HOME
 
 환경변수에서 확인할 수 없는 값만 실행 중 입력받습니다.
 
-출력 예시:
-
-```text
-Connection
-  psql     : /home/pg17/pgsql/bin/psql
-  host     : default/local socket
-  port     : 51700
-  user     : pg17
-  database : postgres
-```
-
 ## EXPLAIN 옵션 선택
-
-실행 시 PostgreSQL 버전을 확인한 뒤 해당 버전에서 사용 가능한 옵션만 선택할 수 있도록 구성되어 있습니다.
 
 | 옵션 | 출력 내용 | 주의사항 |
 | --- | --- | --- |
@@ -111,15 +101,82 @@ WAL
 Memory
 ```
 
+## 2. Table / Index Statistics Delta
+
+`ANALYZE=yes`일 때만 출력합니다.
+
+실행 순서:
+
+```text
+Plan Base Relation 자동 추출
+        ↓
+Table / Index 통계 Before Snapshot
+        ↓
+EXPLAIN ANALYZE 실제 실행
+        ↓
+Table / Index 통계 After Snapshot
+        ↓
+After - Before Delta 계산
+```
+
+### Table Statistics Delta
+
+`pg_stat_all_tables` 기준으로 다음 항목의 Before / After / Delta를 출력합니다.
+
+```text
+seq_scan
+seq_tup_read
+idx_scan
+idx_tup_fetch
+n_tup_ins
+n_tup_upd
+n_tup_del
+n_tup_hot_upd
+```
+
 예:
 
 ```text
-Update on public.pgbench_accounts
-  -> Seq Scan on public.pgbench_accounts
-       Filter: (aid >= 999009)
+metric                         before           after           delta
+seq_scan                           10              11              +1
+seq_tup_read                   966247         5962745        +4996498
+idx_scan                           10              10               0
+n_tup_upd                      198196         4198196        +4000000
 ```
 
-## 2. Planner Settings
+### Index Statistics / I/O Delta
+
+`pg_stat_all_indexes`, `pg_statio_all_indexes` 기준으로 다음 항목을 출력합니다.
+
+```text
+idx_scan
+idx_tup_read
+idx_tup_fetch
+idx_blks_read
+idx_blks_hit
+```
+
+예:
+
+```text
+metric                         before           after           delta
+idx_scan                           10              10               0
+idx_tup_read                        5               5               0
+idx_blks_read                   30165           30165               0
+idx_blks_hit                   410900          410900               0
+```
+
+### Delta 해석
+
+Delta는 PostgreSQL의 누적 통계를 실행 직전/직후에 조회해 계산한 값입니다.
+
+따라서 동일 Relation을 다른 Session에서도 동시에 사용하면 다른 Session의 증가분이 일부 포함될 수 있습니다.
+
+이번 SQL 자체의 Buffer 사용량은 `EXPLAIN (ANALYZE, BUFFERS)` 결과가 더 직접적인 기준이며, `pg_stat_*` Delta는 보조 진단값으로 사용합니다.
+
+`ANALYZE=no`에서는 대상 SQL이 실제 실행되지 않으므로 의미 있는 실행 구간 Delta를 만들 수 없습니다. 이 경우 기존 누적 통계를 그대로 출력합니다.
+
+## 3. Planner Settings
 
 실행계획 선택에 영향을 줄 수 있는 주요 Planner 설정값을 출력합니다.
 
@@ -182,18 +239,9 @@ jit
 plan_cache_mode
 ```
 
-설정값과 함께 PostgreSQL이 해당 값을 어디에서 읽었는지 확인할 수 있도록 `source`도 출력합니다.
+설정값과 함께 `source`도 출력합니다.
 
-예:
-
-```text
-name                    setting    source
-random_page_cost        4          default
-work_mem                4096       default
-plan_cache_mode         auto       default
-```
-
-## 3. Referenced Relations
+## 4. Referenced Relations
 
 대상 SQL 문자열에서 Table명을 단순 파싱하지 않습니다.
 
@@ -206,21 +254,11 @@ Referenced Relations (Plan Base Relations)
 public.pgbench_accounts
 ```
 
-### View 사용 시
-
 View가 Planner에서 펼쳐지는 경우 원본 SQL에 작성한 View명이 아니라 실제 하위 Relation이 표시될 수 있습니다.
 
-예를 들어 `pg_stat_activity` 같은 시스템 View를 조회하면 다음과 같은 객체가 Plan에 나타날 수 있습니다.
+따라서 이 목록은 원본 SQL에 작성한 Table 목록이 아니라 실제 실행계획에서 사용된 Base Relation 목록입니다.
 
-```text
-pg_catalog.pg_database
-pg_catalog.pg_authid
-pg_stat_get_activity()
-```
-
-따라서 이 목록은 **원본 SQL에 작성한 Table 목록이 아니라 실제 실행계획에서 사용된 Base Relation 목록**입니다.
-
-## 4. Table Information
+## 5. Table Information
 
 Plan에서 추출된 각 Relation에 대해 다음 정보를 출력합니다.
 
@@ -242,55 +280,9 @@ Indexes Size
 Total Relation Size
 ```
 
-주요 컬럼:
+## 6. Table Statistics
 
-```text
-relation
-owner
-tablespace
-relpersistence
-relkind
-reltuples
-relpages
-relallvisible
-relhasindex
-relrowsecurity
-relforcerowsecurity
-replica_identity
-table_size
-indexes_size
-total_size
-```
-
-`reltuples`, `relpages`는 Planner가 사용하는 추정 통계 확인에 사용합니다.
-
-## 5. Table Statistics
-
-`pg_stat_all_tables` 기준으로 Table의 누적 접근 및 변경 통계를 출력합니다.
-
-```text
-Sequential Scan 횟수
-Sequential Scan에서 읽은 Tuple 수
-Index Scan 횟수
-Index Scan을 통해 Fetch한 Tuple 수
-Live Tuple
-Dead Tuple
-Analyze 이후 변경 Tuple 수
-INSERT 수
-UPDATE 수
-DELETE 수
-HOT Update 수
-마지막 VACUUM 시각
-마지막 Auto Vacuum 시각
-마지막 ANALYZE 시각
-마지막 Auto Analyze 시각
-VACUUM 횟수
-Auto Vacuum 횟수
-ANALYZE 횟수
-Auto Analyze 횟수
-```
-
-주요 컬럼:
+`pg_stat_all_tables` 기준 누적 통계를 출력합니다.
 
 ```text
 seq_scan
@@ -314,9 +306,9 @@ analyze_count
 autoanalyze_count
 ```
 
-## 6. Column Information
+`ANALYZE=yes`에서는 위 누적값과 별도로 실행 전/후 Delta도 앞에서 출력합니다.
 
-대상 Table의 Column 구조를 출력합니다.
+## 7. Column Information
 
 ```text
 Column 순서
@@ -329,34 +321,9 @@ Generated Column 여부
 Statistics Target
 ```
 
-주요 컬럼:
+## 8. Column Statistics
 
-```text
-no
-column_name
-data_type
-nullable
-default_value
-identity
-generated
-statistics_target
-```
-
-## 7. Column Statistics
-
-`pg_stats` 기준으로 Planner의 Column 통계를 출력합니다.
-
-```text
-Null 비율
-평균 Column Width
-Distinct 추정값
-Most Common Values
-Most Common Frequencies
-Histogram Bounds
-Correlation
-```
-
-주요 컬럼:
+`pg_stats` 기준 Planner 통계를 출력합니다.
 
 ```text
 null_frac
@@ -368,7 +335,7 @@ histogram_bounds
 correlation
 ```
 
-### 주요 활용
+주요 활용:
 
 - Estimated Rows와 Actual Rows 차이 분석
 - 특정 값 분포 편향 확인
@@ -376,11 +343,9 @@ correlation
 - Join Cardinality 추정 오류 분석
 - ANALYZE 필요 여부 검토
 
-## 8. Extended Statistics
+## 9. Extended Statistics
 
 `pg_stats_ext` 기준으로 다중 Column Statistics를 확인합니다.
-
-출력 항목:
 
 ```text
 Schema
@@ -393,17 +358,9 @@ n_distinct
 Dependencies
 ```
 
-주요 활용:
-
-- 여러 WHERE 조건 Column 사이의 상관관계
-- 다중 Column Distinct 값 추정
-- 독립성 가정으로 인한 Cardinality 오류 확인
-
 Extended Statistics가 생성되지 않은 Table은 `0 rows`로 출력될 수 있습니다.
 
-## 9. Index Information
-
-대상 Table에 생성된 Index의 상세 정보를 출력합니다.
+## 10. Index Information
 
 ```text
 Index Name
@@ -424,41 +381,9 @@ Expression Index 식
 Index Definition
 ```
 
-주요 컬럼:
+## 11. Index Columns
 
-```text
-index_name
-method
-unique
-primary_key
-exclusion
-clustered
-valid
-ready
-live
-replica_identity
-key_columns
-include_columns
-index_size
-predicate
-expressions
-definition
-```
-
-Access Method 예:
-
-```text
-btree
-hash
-gin
-gist
-spgist
-brin
-```
-
-## 10. Index Columns
-
-Oracle의 Index Column 조회와 유사한 목적으로 Index를 구성하는 Column을 순서대로 출력합니다.
+Index를 구성하는 Column을 순서대로 출력합니다.
 
 ```text
 Index Name
@@ -467,13 +392,6 @@ KEY / INCLUDE 구분
 Column 또는 Expression
 Unique 여부
 Primary Key 여부
-```
-
-예:
-
-```text
-index_name               position  column_type  column_or_expression
-pgbench_accounts_pkey    1         KEY          aid
 ```
 
 다음 유형을 구분할 수 있습니다.
@@ -487,20 +405,9 @@ Primary Key Index
 Unique Index
 ```
 
-## 11. Index Usage / I/O
+## 12. Index Usage / I/O
 
-`pg_stat_all_indexes`, `pg_statio_all_indexes`를 이용해 Index 누적 사용량과 Block I/O를 출력합니다.
-
-```text
-Index Scan 횟수
-Index Entry Read 수
-Table Tuple Fetch 수
-Index Block Physical Read
-Index Block Cache Hit
-Index Cache Hit %
-```
-
-주요 컬럼:
+`pg_stat_all_indexes`, `pg_statio_all_indexes`의 현재 누적값을 출력합니다.
 
 ```text
 idx_scan
@@ -511,16 +418,11 @@ idx_blks_hit
 cache_hit_pct
 ```
 
-예:
-
-```text
-index_name               idx_scan  idx_blks_read  idx_blks_hit  cache_hit_pct
-pgbench_accounts_pkey    10        30165          410900        93.16
-```
+`ANALYZE=yes`에서는 누적값과 별도로 실행 구간 Delta도 함께 확인할 수 있습니다.
 
 ## 출력 순서
 
-전체 실행 흐름은 다음과 같습니다.
+### ANALYZE = no
 
 ```text
 PostgreSQL 연결
@@ -531,34 +433,46 @@ PostgreSQL Version 확인
         ↓
 EXPLAIN 옵션 선택
         ↓
+Plan Base Relation 자동 추출
+        ↓
 Execution Plan
         ↓
 Planner Settings
         ↓
-Referenced Relations 자동 추출
-        ↓
-Table Information
-        ↓
-Table Statistics
-        ↓
-Column Information
-        ↓
-Column Statistics
-        ↓
-Extended Statistics
-        ↓
-Index Information
-        ↓
-Index Columns
-        ↓
-Index Usage / I/O
+Table / Column / Statistics / Index 누적 정보
 ```
 
-여러 Table이 Plan에 포함된 경우 각 Relation별로 위 진단 항목을 반복 출력합니다.
+### ANALYZE = yes
+
+```text
+PostgreSQL 연결
+        ↓
+대상 SQL 파일 선택
+        ↓
+PostgreSQL Version 확인
+        ↓
+EXPLAIN 옵션 선택
+        ↓
+Plan Base Relation 자동 추출
+        ↓
+Before Snapshot
+        ↓
+EXPLAIN ANALYZE 실제 실행
+        ↓
+After Snapshot
+        ↓
+Table Statistics Delta
+        ↓
+Index Statistics / I/O Delta
+        ↓
+Planner Settings
+        ↓
+Table / Column / Statistics / Index 현재 누적 정보
+```
+
+여러 Table이 Plan에 포함된 경우 각 Relation별로 진단 항목을 반복 출력합니다.
 
 ## ANALYZE 사용 시 주의
-
-`EXPLAIN`과 `EXPLAIN ANALYZE`는 동작이 다릅니다.
 
 ```text
 EXPLAIN
@@ -568,56 +482,32 @@ EXPLAIN ANALYZE
 → SQL 실제 수행 후 Actual Rows / Actual Time 확인
 ```
 
-특히 다음 SQL에 `ANALYZE`를 사용할 경우 실제 변경이 발생할 수 있습니다.
+특히 `INSERT`, `UPDATE`, `DELETE`, `MERGE`에 `ANALYZE`를 사용할 경우 실제 변경이 발생할 수 있습니다.
 
-```text
-INSERT
-UPDATE
-DELETE
-MERGE
-```
+스크립트는 `ANALYZE=yes` 선택 시 `EXECUTE` 문자열을 추가 입력해야 진행됩니다.
 
-스크립트는 `ANALYZE=yes` 선택 시 `EXECUTE` 문자열을 추가로 입력해야 진행되도록 구성되어 있습니다.
-
-Transaction으로 감싸더라도 Sequence 증가, 외부 함수 호출 등 Transaction 외부 부수효과는 완전히 복구되지 않을 수 있으므로 운영 환경에서 주의가 필요합니다.
+Transaction으로 감싸더라도 Sequence 증가, 외부 함수 호출 등 Transaction 외부 부수효과는 완전히 복구되지 않을 수 있습니다.
 
 ## 통계 해석 시 주의
 
-다음 값은 대부분 누적 통계이므로 특정 SQL 한 번의 결과로 해석하면 안 됩니다.
+`ANALYZE=no`에서 표시되는 `pg_stat_*` 값은 누적 통계입니다.
+
+`ANALYZE=yes`에서는 실행 직전/직후 Snapshot을 이용해 Delta를 추가로 출력하지만, 해당 Relation에 대한 동시 Session의 활동이 섞일 수 있습니다.
+
+따라서 다음 기준으로 해석합니다.
 
 ```text
-seq_scan
-idx_scan
-n_tup_ins
-n_tup_upd
-n_tup_del
-idx_blks_read
-idx_blks_hit
+Actual Rows / Actual Time
+→ EXPLAIN ANALYZE
+
+해당 실행의 Buffer 사용
+→ EXPLAIN ANALYZE + BUFFERS
+
+Table / Index 누적 상태
+→ pg_stat_* 현재값
+
+실행 구간 Table / Index 변화량
+→ pg_stat_* Before / After Delta
 ```
 
 또한 `reltuples`, `n_live_tup`, `n_dead_tup` 등은 정확한 실시간 Row Count가 아니라 통계 기반 추정값일 수 있습니다.
-
-## 분석 예시
-
-실행계획에서 다음과 같이 대량 Seq Scan이 확인된 경우:
-
-```text
-Seq Scan on public.pgbench_accounts
-  Filter: (aid >= 999009)
-```
-
-함께 출력되는 정보를 기준으로 다음 항목을 확인할 수 있습니다.
-
-```text
-1. Table 전체 크기
-2. Planner 예상 Row 수
-3. Column의 n_distinct / Histogram
-4. 해당 조건 Column의 Index 존재 여부
-5. 복합 Index의 Column 순서
-6. Index 사용 횟수
-7. random_page_cost / seq_page_cost
-8. effective_cache_size
-9. Statistics 최신 여부
-```
-
-따라서 단순히 `Seq Scan이므로 Index 필요`라고 판단하는 대신 Planner 통계와 Table 크기, 조건 선택도, Index 구성까지 함께 확인하는 용도로 사용합니다.
