@@ -202,18 +202,6 @@ case $FORMAT in
         ;;
 esac
 
-if [ "$ANALYZE" = yes ]; then
-    echo
-    echo "WARNING: EXPLAIN ANALYZE executes the statement."
-    echo "DML은 실제 변경을 발생시킬 수 있으며 Sequence/외부 함수 등은 ROLLBACK으로 복구되지 않을 수 있음."
-    printf 'Type EXECUTE to continue: ' >&2
-    IFS= read -r confirm
-    [ "$confirm" = EXECUTE ] || {
-        echo "Cancelled."
-        exit 1
-    }
-fi
-
 opts=""
 addopt() {
     [ -z "$opts" ] && opts="$1" || opts="$opts, $1"
@@ -268,6 +256,36 @@ awk '
         }
     }
 ' "$plan_json" | sort -u > "$rel_file"
+
+DML_OPERATION=$(awk -F'"' '
+    /"Operation"[[:space:]]*:[[:space:]]*"(Insert|Update|Delete|Merge)"/ {
+        print $4
+        exit
+    }
+' "$plan_json")
+
+DML_ANALYZE=no
+if [ "$ANALYZE" = yes ]; then
+    echo
+    echo "WARNING: EXPLAIN ANALYZE executes the statement."
+
+    if [ -n "$DML_OPERATION" ]; then
+        DML_ANALYZE=yes
+        echo "DML detected : $DML_OPERATION"
+        echo "Execution    : BEGIN -> EXPLAIN ANALYZE -> ROLLBACK"
+        echo "Table row changes are rolled back automatically."
+        echo "Sequence increments, external functions, or other non-transactional side effects may remain."
+    else
+        echo "Read-only/non-DML plan detected: no automatic ROLLBACK wrapper."
+    fi
+
+    printf 'Type EXECUTE to continue: ' >&2
+    IFS= read -r confirm
+    [ "$confirm" = EXECUTE ] || {
+        echo "Cancelled."
+        exit 1
+    }
+fi
 
 snapshot_stats() {
     table_file=$1
@@ -374,14 +392,26 @@ if [ "$ANALYZE" = yes ] && [ -s "$rel_file" ]; then
     snapshot_stats "$table_before" "$index_before"
 fi
 
-{
-    printf 'EXPLAIN (%s)\n' "$opts"
-    cat "$SQL_FILE"
-    printf '\n'
-} > "$tmp"
+if [ "$DML_ANALYZE" = yes ]; then
+    {
+        printf 'BEGIN;\n'
+        printf 'EXPLAIN (%s)\n' "$opts"
+        cat "$SQL_FILE"
+        printf '\nROLLBACK;\n'
+    } > "$tmp"
+else
+    {
+        printf 'EXPLAIN (%s)\n' "$opts"
+        cat "$SQL_FILE"
+        printf '\n'
+    } > "$tmp"
+fi
 
 section "Execution Plan"
 echo "Generated: EXPLAIN ($opts)"
+if [ "$DML_ANALYZE" = yes ]; then
+    echo "DML safety: BEGIN -> EXPLAIN ANALYZE -> ROLLBACK"
+fi
 "$PSQL_BIN" -X -v ON_ERROR_STOP=1 -f "$tmp" || exit 1
 
 if [ "$ANALYZE" = yes ] && [ -s "$rel_file" ]; then
