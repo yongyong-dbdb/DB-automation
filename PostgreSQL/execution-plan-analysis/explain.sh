@@ -1,7 +1,7 @@
 #!/bin/sh
 set -u
 
-SCRIPT_VERSION="1.1.5"
+SCRIPT_VERSION="1.1.6"
 SCRIPT_DIR=$(CDPATH='' cd "$(dirname "$0")" && pwd)
 DEFAULT_OUTPUT_DIR="$SCRIPT_DIR/results"
 
@@ -581,6 +581,8 @@ SQL
 BIND=$(ask 'Use bind parameters ($1, $2, ...)? yes/no' no) || exit 1
 prepare_file="$work_dir/prepare.sql"
 execute_file="$work_dir/execute.sql"
+bind_values_file="$work_dir/bind-values-used.txt"
+: > "$bind_values_file"
 if [ "$BIND" = yes ]; then
     printf 'Parameter types, comma-separated [auto infer]: ' >&2
     IFS= read -r bind_types || exit 1
@@ -654,6 +656,15 @@ if [ "$BIND" = yes ]; then
                 break
             done
 
+            if [ "$bind_value" = '\N' ]; then
+                bind_display_value=NULL
+            elif [ -z "$bind_value" ]; then
+                bind_display_value='<empty string>'
+            else
+                bind_display_value=$bind_value
+            fi
+            printf '$%s [%s] = %s\n' "$bind_index" "$bind_type" "$bind_display_value" >> "$bind_values_file"
+
             [ "$bind_index" -eq 1 ] || printf ', ' >> "$execute_file"
             if [ "$bind_value" = '\N' ]; then
                 printf 'NULL' >> "$execute_file"
@@ -667,7 +678,16 @@ if [ "$BIND" = yes ]; then
         printf ')' >> "$execute_file"
     fi
     printf ';\n' >> "$execute_file"
-    unset bind_value bind_types
+
+    if [ -s "$bind_values_file" ]; then
+        echo
+        echo "Bind Values Used"
+        echo "----------------"
+        cat "$bind_values_file"
+        echo
+    fi
+
+    unset bind_value bind_types bind_display_value
 fi
 
 echo "PostgreSQL server_version_num: $SERVER_VERSION_NUM"
@@ -795,6 +815,15 @@ mkdir -p "$RESULT_DIR" || {
     echo "ERROR: Could not create result file: $RESULT_FILE" >&2
     exit 1
 }
+
+if [ "$BIND" = yes ] && [ -s "$bind_values_file" ]; then
+    {
+        echo "Bind Values Used"
+        echo "----------------"
+        cat "$bind_values_file"
+        echo
+    } >> "$RESULT_FILE"
+fi
 
 echo "Result file: $RESULT_FILE"
 
