@@ -226,6 +226,36 @@ section() {
     echo "============================================================"
 }
 
+# Query only the relation/column explicitly selected for this parameter.
+show_bind_candidates() {
+    while :; do
+        printf 'Candidate table for $%s (schema.table, empty to skip): ' "$bind_index" >&2
+        IFS= read -r sample_relation || return 1
+        [ -n "$sample_relation" ] || return 0
+        printf 'Candidate column (exact name, no surrounding quotes; empty to skip): ' >&2
+        IFS= read -r sample_column || return 1
+        [ -n "$sample_column" ] || return 0
+        printf '\nTable value candidates for $%s (up to %s; not historical bind values)\n' "$bind_index" "$BIND_SAMPLE_LIMIT"
+        if run_psql -X -q -P pager=off -v ON_ERROR_STOP=1 \
+            -v sample_relation="$sample_relation" -v sample_column="$sample_column" \
+            -v sample_limit="$BIND_SAMPLE_LIMIT" -v sample_timeout="$BIND_SAMPLE_TIMEOUT" <<'SQL'
+BEGIN READ ONLY;
+SELECT set_config('statement_timeout', :'sample_timeout', true) AS sample_timeout
+\gset
+SELECT format(
+    'SELECT %1$I AS candidate_value FROM %2$s WHERE %1$I IS NOT NULL LIMIT %3$s',
+    :'sample_column', :'sample_relation'::regclass, :'sample_limit'::integer)
+\gexec
+COMMIT;
+SQL
+        then
+            echo 'Candidates may repeat and do not apply the original SQL filters. Enter the desired value below.'
+            return 0
+        fi
+        echo 'Could not read candidates. Check table/column/permissions or retry; empty table skips candidates.' >&2
+    done
+}
+
 # Let PostgreSQL parse placeholders; do not count $n in comments or strings.
 BIND=$(ask 'Use bind parameters ($1, $2, ...)? yes/no' no) || exit 1
 prepare_file="$work_dir/prepare.sql"
@@ -253,6 +283,12 @@ if [ "$BIND" = yes ]; then
     case $BIND_COUNT in
         ''|*[!0-9]*) echo "ERROR: invalid parameter count" >&2; exit 1 ;;
     esac
+    BIND_SAMPLE_LIMIT=${BIND_SAMPLE_LIMIT:-3}
+    BIND_SAMPLE_TIMEOUT=${BIND_SAMPLE_TIMEOUT:-5s}
+    if ! printf '%s\n' "$BIND_SAMPLE_LIMIT" | grep -Eq '^[0-9]*[1-9][0-9]*$'; then
+        echo "ERROR: BIND_SAMPLE_LIMIT must be a positive integer." >&2
+        exit 1
+    fi
     echo "Bind parameter count: $BIND_COUNT"
     echo 'Enter each value as plain text (no SQL quotes). \N means SQL NULL; empty input means an empty string.'
     printf 'EXECUTE pg_explain_target' > "$execute_file"
@@ -260,6 +296,7 @@ if [ "$BIND" = yes ]; then
         printf '(' >> "$execute_file"
         bind_index=1
         while [ "$bind_index" -le "$BIND_COUNT" ]; do
+            show_bind_candidates || exit 1
             printf 'Value for $%s: ' "$bind_index" >&2
             IFS= read -r bind_value || exit 1
             [ "$bind_index" -eq 1 ] || printf ', ' >> "$execute_file"
