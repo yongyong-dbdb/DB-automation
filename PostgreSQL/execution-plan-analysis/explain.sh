@@ -226,6 +226,58 @@ section() {
     echo "============================================================"
 }
 
+# Let PostgreSQL parse placeholders; do not count $n in comments or strings.
+BIND=$(ask 'Use bind parameters ($1, $2, ...)? yes/no' no) || exit 1
+prepare_file="$work_dir/prepare.sql"
+execute_file="$work_dir/execute.sql"
+if [ "$BIND" = yes ]; then
+    printf 'Parameter types, comma-separated [auto infer]: ' >&2
+    IFS= read -r bind_types || exit 1
+    {
+        printf 'SET standard_conforming_strings = on;\n'
+        printf 'PREPARE pg_explain_target'
+        [ -z "$bind_types" ] || printf ' (%s)' "$bind_types"
+        printf ' AS\n'
+        cat "$SQL_FILE"
+        printf '\n;\n'
+    } > "$prepare_file"
+    BIND_COUNT=$(
+        {
+            cat "$prepare_file"
+            printf "SELECT cardinality(parameter_types) FROM pg_prepared_statements WHERE name = 'pg_explain_target';\n"
+        } | run_psql -X -qAt -v ON_ERROR_STOP=1
+    ) || {
+        echo "ERROR: Could not prepare SQL. Check the SQL and parameter types." >&2
+        exit 1
+    }
+    case $BIND_COUNT in
+        ''|*[!0-9]*) echo "ERROR: invalid parameter count" >&2; exit 1 ;;
+    esac
+    echo "Bind parameter count: $BIND_COUNT"
+    echo 'Enter each value as plain text (no SQL quotes). \N means SQL NULL; empty input means an empty string.'
+    printf 'EXECUTE pg_explain_target' > "$execute_file"
+    if [ "$BIND_COUNT" -gt 0 ]; then
+        printf '(' >> "$execute_file"
+        bind_index=1
+        while [ "$bind_index" -le "$BIND_COUNT" ]; do
+            printf 'Value for $%s: ' "$bind_index" >&2
+            IFS= read -r bind_value || exit 1
+            [ "$bind_index" -eq 1 ] || printf ', ' >> "$execute_file"
+            if [ "$bind_value" = '\N' ]; then
+                printf 'NULL' >> "$execute_file"
+            else
+                printf "'" >> "$execute_file"
+                printf '%s' "$bind_value" | sed "s/'/''/g" >> "$execute_file"
+                printf "'" >> "$execute_file"
+            fi
+            bind_index=$((bind_index + 1))
+        done
+        printf ')' >> "$execute_file"
+    fi
+    printf ';\n' >> "$execute_file"
+    unset bind_value bind_types
+fi
+
 echo "PostgreSQL server_version_num: $SERVER_VERSION_NUM"
 echo
 echo "ANALYZE  : SQL 실제 실행 + Actual Rows/Time. DML은 실제 변경 발생 가능."
@@ -264,7 +316,7 @@ if [ "$ANALYZE" = yes ]; then
         SERIALIZE=$(ask "Use SERIALIZE TEXT? yes/no" no)
     fi
 else
-    if [ "$SERVER_VERSION_NUM" -ge 160000 ]; then
+    if [ "$BIND" = yes ] || [ "$SERVER_VERSION_NUM" -ge 160000 ]; then
         echo "GENERIC_PLAN : Parameter 값과 무관한 Generic Plan. ANALYZE와 동시 사용 불가."
         GENERIC_PLAN=$(ask "Use GENERIC_PLAN? yes/no" no)
     fi
@@ -302,7 +354,7 @@ addopt() {
 [ "$WAL" = yes ] && addopt "WAL"
 [ "$TIMING" = yes ] && addopt "TIMING TRUE"
 [ "$ANALYZE" = yes ] && [ "$TIMING" = no ] && addopt "TIMING FALSE"
-[ "$GENERIC_PLAN" = yes ] && addopt "GENERIC_PLAN"
+[ "$GENERIC_PLAN" = yes ] && [ "$BIND" = no ] && addopt "GENERIC_PLAN"
 [ "$SERIALIZE" = yes ] && addopt "SERIALIZE TEXT"
 [ "$MEMORY" = yes ] && addopt "MEMORY"
 [ "$SUMMARY" = yes ] && addopt "SUMMARY"
@@ -316,11 +368,30 @@ table_after="$work_dir/table_after.txt"
 index_before="$work_dir/index_before.txt"
 index_after="$work_dir/index_after.txt"
 
-{
-    printf 'EXPLAIN (VERBOSE, COSTS FALSE, FORMAT JSON)\n'
-    cat "$SQL_FILE"
-    printf '\n'
-} | run_psql -X -At -v ON_ERROR_STOP=1 > "$plan_json" || {
+# PREPARE belongs to a connection: recreate it before each EXPLAIN.
+emit_plan() {
+    plan_options=$1
+    if [ "$BIND" = yes ]; then
+        cat "$prepare_file"
+        if [ "$GENERIC_PLAN" = yes ]; then
+            printf 'SET plan_cache_mode = force_generic_plan;\n'
+        else
+            printf 'SET plan_cache_mode = force_custom_plan;\n'
+        fi
+        printf 'EXPLAIN (%s)\n' "$plan_options"
+        cat "$execute_file"
+    else
+        printf 'EXPLAIN (%s)\n' "$plan_options"
+        cat "$SQL_FILE"
+        printf '\n'
+    fi
+}
+
+json_options='VERBOSE, COSTS FALSE, FORMAT JSON'
+if [ "$GENERIC_PLAN" = yes ] && [ "$BIND" = no ]; then
+    json_options="$json_options, GENERIC_PLAN"
+fi
+emit_plan "$json_options" | run_psql -X -qAt -v ON_ERROR_STOP=1 > "$plan_json" || {
     echo "ERROR: Could not generate JSON plan for relation extraction." >&2
     exit 1
 }
@@ -481,15 +552,12 @@ fi
 if [ "$DML_ANALYZE" = yes ]; then
     {
         printf 'BEGIN;\n'
-        printf 'EXPLAIN (%s)\n' "$opts"
-        cat "$SQL_FILE"
+        emit_plan "$opts"
         printf '\nROLLBACK;\n'
     } > "$tmp"
 else
     {
-        printf 'EXPLAIN (%s)\n' "$opts"
-        cat "$SQL_FILE"
-        printf '\n'
+        emit_plan "$opts"
     } > "$tmp"
 fi
 
@@ -498,7 +566,7 @@ echo "Generated: EXPLAIN ($opts)"
 if [ "$DML_ANALYZE" = yes ]; then
     echo "DML safety: BEGIN -> EXPLAIN ANALYZE -> ROLLBACK"
 fi
-run_psql -X -v ON_ERROR_STOP=1 -f "$tmp" || exit 1
+run_psql -X -q -v ON_ERROR_STOP=1 -f "$tmp" || exit 1
 
 if [ "$ANALYZE" = yes ] && [ -s "$rel_file" ]; then
     snapshot_stats "$table_after" "$index_after"
