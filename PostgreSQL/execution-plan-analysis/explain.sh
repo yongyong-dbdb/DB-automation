@@ -1,7 +1,7 @@
 #!/bin/sh
 set -u
 
-SCRIPT_VERSION="1.1.3"
+SCRIPT_VERSION="1.1.4"
 SCRIPT_DIR=$(CDPATH='' cd "$(dirname "$0")" && pwd)
 DEFAULT_OUTPUT_DIR="$SCRIPT_DIR/results"
 
@@ -1030,6 +1030,12 @@ if [ "$DIAG" != yes ]; then
     exit 0
 fi
 
+COLUMN_STATS_DETAIL=$(ask "Show full Column Statistics arrays? yes/no" no)
+{
+    echo "column_statistics_detail=$COLUMN_STATS_DETAIL"
+    echo
+} >> "$RESULT_FILE"
+
 section "Planner Settings" | tee -a "$RESULT_FILE"
 if run_psql -X -P pager=off -P format=wrapped -P columns=160 -v ON_ERROR_STOP=1 > "$report_output" 2>&1 <<'SQL'
 SELECT name, setting, unit, source
@@ -1147,7 +1153,36 @@ WHERE a.attrelid=:'\''rel'\''::regclass
 ORDER BY a.attnum;
 '
 
-SQL_COLUMN_STATS='
+SQL_COLUMN_STATS_SUMMARY='
+SELECT attname,
+       null_frac,
+       avg_width,
+       n_distinct,
+       correlation,
+       cardinality(most_common_vals) AS mcv_count,
+       cardinality(histogram_bounds) AS histogram_count,
+       CASE
+         WHEN most_common_vals IS NULL THEN NULL
+         WHEN length(most_common_vals::text) <= 60 THEN most_common_vals::text
+         ELSE left(most_common_vals::text,57) || '\''...'\''
+       END AS mcv_sample,
+       CASE
+         WHEN most_common_freqs IS NULL THEN NULL
+         WHEN length(most_common_freqs::text) <= 60 THEN most_common_freqs::text
+         ELSE left(most_common_freqs::text,57) || '\''...'\''
+       END AS mcv_freq_sample,
+       CASE
+         WHEN histogram_bounds IS NULL THEN NULL
+         WHEN length(histogram_bounds::text) <= 60 THEN histogram_bounds::text
+         ELSE left(histogram_bounds::text,57) || '\''...'\''
+       END AS histogram_sample
+FROM pg_stats
+WHERE schemaname = split_part(:'\''rel'\'','\''.'\'',1)
+  AND tablename  = split_part(:'\''rel'\'','\''.'\'',2)
+ORDER BY attname;
+'
+
+SQL_COLUMN_STATS_DETAIL='
 SELECT attname,
        null_frac,
        avg_width,
@@ -1252,7 +1287,10 @@ do
     run_relation_report "$rel" "Table Information" "$SQL_TABLE_INFO"
     run_relation_report "$rel" "Table Statistics" "$SQL_TABLE_STATS"
     run_relation_report "$rel" "Column Information" "$SQL_COLUMN_INFO"
-    run_relation_report "$rel" "Column Statistics" "$SQL_COLUMN_STATS"
+    run_relation_report "$rel" "Column Statistics Summary" "$SQL_COLUMN_STATS_SUMMARY"
+    if [ "$COLUMN_STATS_DETAIL" = yes ]; then
+        run_relation_report "$rel" "Column Statistics Detail" "$SQL_COLUMN_STATS_DETAIL"
+    fi
     run_relation_report "$rel" "Extended Statistics" "$SQL_EXT_STATS"
     run_relation_report "$rel" "Index Information" "$SQL_INDEX_INFO"
     run_relation_report "$rel" "Index Columns" "$SQL_INDEX_COLUMNS"
