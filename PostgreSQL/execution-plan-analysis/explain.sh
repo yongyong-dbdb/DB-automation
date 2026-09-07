@@ -1,6 +1,8 @@
 #!/bin/sh
 set -u
 
+SCRIPT_VERSION="1.1.0"
+
 PSQL_BIN=${PSQL_BIN:-}
 
 if [ -z "$PSQL_BIN" ]; then
@@ -76,6 +78,7 @@ export PGPORT PGUSER PGDATABASE
 
 echo
 echo "Connection"
+echo "  version  : $SCRIPT_VERSION"
 echo "  psql     : $PSQL_BIN"
 echo "  host     : ${PGHOST:-default/local socket}"
 echo "  port     : $PGPORT"
@@ -311,8 +314,103 @@ BIND_MAP_SQL
     fi
 }
 
-# Prefer an unambiguous plan-derived column; prompt only as fallback.
+# Resolve direct SQL constant comparisons (for example: 0 = $2) from the
+# same non-executing generic plan. Only one unambiguous literal per bind is used.
+build_bind_constant_map() {
+    bind_constant_map="$work_dir/bind-constant-map.txt"
+    if ! {
+        cat "$prepare_file"
+        cat <<'BIND_CONSTANT_SQL'
+BEGIN;
+SELECT set_config('statement_timeout', :'sample_timeout', true) AS map_timeout
+\gset
+SET plan_cache_mode = force_generic_plan;
+CREATE TEMP TABLE explain_bind_constant_plan (plan jsonb) ON COMMIT DROP;
+DO $map$
+DECLARE
+    args text;
+    result json;
+BEGIN
+    SELECT string_agg('NULL', ', ' ORDER BY n)
+      INTO args
+      FROM pg_prepared_statements p,
+           generate_series(1, cardinality(p.parameter_types)) n
+     WHERE p.name = 'pg_explain_target';
+    EXECUTE 'EXPLAIN (VERBOSE, COSTS FALSE, FORMAT JSON) EXECUTE pg_explain_target'
+         || CASE WHEN args IS NULL THEN '' ELSE '(' || args || ')' END
+      INTO result;
+    INSERT INTO explain_bind_constant_plan VALUES (result::jsonb);
+END
+$map$;
+WITH RECURSIVE nodes(node) AS (
+    SELECT plan->0->'Plan' FROM explain_bind_constant_plan
+    UNION ALL
+    SELECT child FROM nodes,
+         LATERAL jsonb_array_elements(COALESCE(node->'Plans', '[]'::jsonb)) child
+), expressions AS (
+    SELECT DISTINCT term
+    FROM nodes, LATERAL jsonb_each_text(node) e,
+         LATERAL regexp_split_to_table(e.value, '\s+(?:AND|OR)\s+') term
+    WHERE e.key IN ('Filter', 'Index Cond', 'Recheck Cond', 'Hash Cond', 'Merge Cond', 'Join Filter', 'One-Time Filter')
+), patterns AS (
+    SELECT '(?:NULL|true|false|[-+]?[0-9]+(?:\.[0-9]+)?|''(?:[^'']|'''')*'')' AS literal,
+           '(?:::(?:text|integer|bigint|smallint|numeric|boolean|date|uuid|character varying|double precision))?' AS cast_pattern
+), matches AS (
+    SELECT regexp_match(term,
+      '^\s*\(*\s*(' || literal || ')\)*' || cast_pattern ||
+      '\)*\s*(?:=|<>|!=|<=|>=|<|>)\s*\(*\$([1-9][0-9]*)\)*' || cast_pattern || '\)*\s*$') AS m,
+      false AS reversed
+    FROM expressions, patterns
+    UNION ALL
+    SELECT regexp_match(term,
+      '^\s*\(*\$([1-9][0-9]*)\)*' || cast_pattern ||
+      '\)*\s*(?:=|<>|!=|<=|>=|<|>)\s*\(*(' || literal || ')\)*' || cast_pattern || '\)*\s*$'),
+      true
+    FROM expressions, patterns
+), normalized AS (
+    SELECT CASE WHEN reversed THEN m[1] ELSE m[2] END AS parameter,
+           CASE WHEN reversed THEN m[2] ELSE m[1] END AS literal
+    FROM matches
+    WHERE m IS NOT NULL
+), literal_values AS (
+    SELECT parameter,
+           CASE
+             WHEN literal = 'NULL' THEN '\N'
+             WHEN literal LIKE '''%''' THEN replace(substr(literal, 2, length(literal) - 2), '''''', '''')
+             ELSE literal
+           END AS default_value
+    FROM normalized
+), unique_value AS (
+    SELECT parameter, min(default_value) AS default_value
+    FROM literal_values
+    GROUP BY parameter
+    HAVING count(DISTINCT default_value) = 1
+)
+SELECT parameter, default_value
+FROM unique_value
+WHERE default_value !~ E'[|\n\r]'
+ORDER BY parameter::integer;
+ROLLBACK;
+BIND_CONSTANT_SQL
+    } | run_psql -X -qAt -F '|' -v ON_ERROR_STOP=1 \
+        -v sample_timeout="$BIND_SAMPLE_TIMEOUT" > "$bind_constant_map" 2>"$work_dir/bind-constant-map.err"; then
+        : > "$bind_constant_map"
+    fi
+}
+
+# Prefer an unambiguous plan-derived constant or column; prompt only as fallback.
 show_bind_candidates() {
+    bind_default_available=no
+    bind_default_value=
+
+    constant_line=$(awk -F'|' -v n="$bind_index" '$1 == n {print; exit}' "$bind_constant_map")
+    if [ -n "$constant_line" ]; then
+        bind_default_value=${constant_line#*|}
+        bind_default_available=yes
+        printf 'Auto-detected $%s -> SQL constant default: %s\n' "$bind_index" "$bind_default_value"
+        return 0
+    fi
+
     sample_relation=$(awk -F'|' -v n="$bind_index" '$1 == n {print $2; exit}' "$bind_map")
     sample_column=$(awk -F'|' -v n="$bind_index" '$1 == n {print $3; exit}' "$bind_map")
     if [ -n "$sample_relation" ] && [ -n "$sample_column" ]; then
@@ -343,6 +441,24 @@ SELECT format(
 COMMIT;
 SQL
         then
+            bind_default_value=$(
+                run_psql -X -qAt -v ON_ERROR_STOP=1 \
+                    -v sample_relation="$sample_relation" -v sample_column="$sample_column" \
+                    -v sample_timeout="$BIND_SAMPLE_TIMEOUT" <<'SQL'
+BEGIN READ ONLY;
+SELECT set_config('statement_timeout', :'sample_timeout', true) AS sample_timeout
+\gset
+SELECT format(
+    'SELECT %1$I::text FROM %2$s WHERE %1$I IS NOT NULL AND %1$I::text !~ E''[\n\r]'' LIMIT 1',
+    :'sample_column', :'sample_relation'::regclass)
+\gexec
+COMMIT;
+SQL
+            ) || bind_default_value=
+            if [ -n "$bind_default_value" ]; then
+                bind_default_available=yes
+                printf 'Default for $%s: %s\n' "$bind_index" "$bind_default_value"
+            fi
             echo 'Candidates may repeat and do not apply the original SQL filters. Enter the desired value below.'
             return 0
         fi
@@ -386,16 +502,24 @@ if [ "$BIND" = yes ]; then
         exit 1
     fi
     build_bind_map
+    build_bind_constant_map
     echo "Bind parameter count: $BIND_COUNT"
-    echo 'Enter each value as plain text (no SQL quotes). \N means SQL NULL; empty input means an empty string.'
+    echo 'Enter each value as plain text (no SQL quotes). \N means SQL NULL. If a default is shown, Enter accepts it; otherwise empty input means an empty string.'
     printf 'EXECUTE pg_explain_target' > "$execute_file"
     if [ "$BIND_COUNT" -gt 0 ]; then
         printf '(' >> "$execute_file"
         bind_index=1
         while [ "$bind_index" -le "$BIND_COUNT" ]; do
             show_bind_candidates || exit 1
-            printf 'Value for $%s: ' "$bind_index" >&2
+            if [ "$bind_default_available" = yes ]; then
+                printf 'Value for $%s [%s]: ' "$bind_index" "$bind_default_value" >&2
+            else
+                printf 'Value for $%s: ' "$bind_index" >&2
+            fi
             IFS= read -r bind_value || exit 1
+            if [ -z "$bind_value" ] && [ "$bind_default_available" = yes ]; then
+                bind_value=$bind_default_value
+            fi
             [ "$bind_index" -eq 1 ] || printf ', ' >> "$execute_file"
             if [ "$bind_value" = '\N' ]; then
                 printf 'NULL' >> "$execute_file"
