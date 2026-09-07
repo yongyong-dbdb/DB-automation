@@ -226,15 +226,109 @@ section() {
     echo "============================================================"
 }
 
-# Query only the relation/column explicitly selected for this parameter.
+# Resolve aliases and base relations using a non-executing generic plan.
+build_bind_map() {
+    bind_map="$work_dir/bind-map.txt"
+    if ! {
+        cat "$prepare_file"
+        cat <<'BIND_MAP_SQL'
+BEGIN;
+SELECT set_config('statement_timeout', :'sample_timeout', true) AS map_timeout
+\gset
+SET plan_cache_mode = force_generic_plan;
+CREATE TEMP TABLE explain_bind_plan (plan jsonb) ON COMMIT DROP;
+DO $map$
+DECLARE
+    args text;
+    result json;
+BEGIN
+    SELECT string_agg('NULL', ', ' ORDER BY n)
+      INTO args
+      FROM pg_prepared_statements p,
+           generate_series(1, cardinality(p.parameter_types)) n
+     WHERE p.name = 'pg_explain_target';
+    EXECUTE 'EXPLAIN (VERBOSE, COSTS FALSE, FORMAT JSON) EXECUTE pg_explain_target'
+         || CASE WHEN args IS NULL THEN '' ELSE '(' || args || ')' END
+      INTO result;
+    INSERT INTO explain_bind_plan VALUES (result::jsonb);
+END
+$map$;
+WITH RECURSIVE nodes(node) AS (
+    SELECT plan->0->'Plan' FROM explain_bind_plan
+    UNION ALL
+    SELECT child FROM nodes,
+         LATERAL jsonb_array_elements(COALESCE(node->'Plans', '[]'::jsonb)) child
+), relations AS (
+    SELECT DISTINCT node->>'Alias' AS alias,
+           format('%I.%I', node->>'Schema', node->>'Relation Name') AS relation
+    FROM nodes
+    WHERE node ? 'Schema' AND node ? 'Relation Name' AND node ? 'Alias'
+), expressions AS (
+    SELECT DISTINCT term
+    FROM nodes, LATERAL jsonb_each_text(node) e,
+         LATERAL regexp_split_to_table(e.value, '\s+(?:AND|OR)\s+') term
+    WHERE e.key IN ('Filter', 'Index Cond', 'Recheck Cond', 'Hash Cond', 'Merge Cond', 'Join Filter')
+), patterns AS (
+    -- Match a whole simple comparison only: never infer lower(col), arithmetic,
+    -- CASE, array expressions or ambiguous column lineage from a substring.
+    SELECT '(?:[a-z_][a-z_0-9$]*|"(?:[^"]|"")+")' AS ident,
+           '(?:::(?:text|integer|bigint|smallint|numeric|boolean|date|uuid|character varying|double precision))?' AS cast_pattern
+), matches AS (
+    SELECT regexp_match(term,
+      '^\s*\(*\s*(' || ident || '\.' || ident || ')\)*' || cast_pattern ||
+      '\)*\s*(?:=|<>|!=|<=|>=|<|>|~~\*?|!~~\*?)\s*\(*\$([1-9][0-9]*)\)*' || cast_pattern || '\)*\s*$') AS m,
+      false AS reversed
+    FROM expressions, patterns
+    UNION ALL
+    SELECT regexp_match(term,
+      '^\s*\(*\$([1-9][0-9]*)\)*' || cast_pattern ||
+      '\)*\s*(?:=|<>|!=|<=|>=|<|>)\s*\(*(' || ident || '\.' || ident || ')\)*' || cast_pattern || '\)*\s*$'),
+      true
+    FROM expressions, patterns
+), refs AS (
+    SELECT CASE WHEN reversed THEN m[1] ELSE m[2] END AS parameter,
+           parse_ident(CASE WHEN reversed THEN m[2] ELSE m[1] END) AS names
+    FROM matches WHERE m IS NOT NULL
+), candidates AS (
+    SELECT DISTINCT parameter, relation, names[2] AS column_name
+    FROM refs JOIN relations ON alias = names[1]
+    JOIN pg_attribute a ON a.attrelid = to_regclass(relation)
+                       AND a.attname = names[2] AND a.attnum > 0 AND NOT a.attisdropped
+), unique_mapping AS (
+    SELECT parameter, min(relation) AS relation, min(column_name) AS column_name
+    FROM candidates GROUP BY parameter HAVING count(*) = 1
+)
+SELECT parameter, relation, column_name FROM unique_mapping
+-- The shell map is line-delimited. Unusual delimiters safely use manual input.
+WHERE relation !~ E'[|\n\r]' AND column_name !~ E'[|\n\r]'
+ORDER BY parameter::integer;
+ROLLBACK;
+BIND_MAP_SQL
+    } | run_psql -X -qAt -F '|' -v ON_ERROR_STOP=1 \
+        -v sample_timeout="$BIND_SAMPLE_TIMEOUT" > "$bind_map" 2>"$work_dir/bind-map.err"; then
+        : > "$bind_map"
+        echo 'Automatic bind-column mapping unavailable; manual selection will be offered.' >&2
+    fi
+}
+
+# Prefer an unambiguous plan-derived column; prompt only as fallback.
 show_bind_candidates() {
+    sample_relation=$(awk -F'|' -v n="$bind_index" '$1 == n {print $2; exit}' "$bind_map")
+    sample_column=$(awk -F'|' -v n="$bind_index" '$1 == n {print $3; exit}' "$bind_map")
+    if [ -n "$sample_relation" ] && [ -n "$sample_column" ]; then
+        printf 'Auto-detected $%s -> %s / %s\n' "$bind_index" "$sample_relation" "$sample_column"
+    else
+        echo "No unique direct column found for this parameter; select manually or skip." >&2
+    fi
     while :; do
-        printf 'Candidate table for $%s (schema.table, empty to skip): ' "$bind_index" >&2
-        IFS= read -r sample_relation || return 1
-        [ -n "$sample_relation" ] || return 0
-        printf 'Candidate column (exact name, no surrounding quotes; empty to skip): ' >&2
-        IFS= read -r sample_column || return 1
-        [ -n "$sample_column" ] || return 0
+        if [ -z "$sample_relation" ] || [ -z "$sample_column" ]; then
+            printf 'Candidate table for $%s (schema.table, empty to skip): ' "$bind_index" >&2
+            IFS= read -r sample_relation || return 1
+            [ -n "$sample_relation" ] || return 0
+            printf 'Candidate column (exact name, no surrounding quotes; empty to skip): ' >&2
+            IFS= read -r sample_column || return 1
+            [ -n "$sample_column" ] || return 0
+        fi
         printf '\nTable value candidates for $%s (up to %s; not historical bind values)\n' "$bind_index" "$BIND_SAMPLE_LIMIT"
         if run_psql -X -q -P pager=off -v ON_ERROR_STOP=1 \
             -v sample_relation="$sample_relation" -v sample_column="$sample_column" \
@@ -253,6 +347,8 @@ SQL
             return 0
         fi
         echo 'Could not read candidates. Check table/column/permissions or retry; empty table skips candidates.' >&2
+        sample_relation=
+        sample_column=
     done
 }
 
@@ -289,6 +385,7 @@ if [ "$BIND" = yes ]; then
         echo "ERROR: BIND_SAMPLE_LIMIT must be a positive integer." >&2
         exit 1
     fi
+    build_bind_map
     echo "Bind parameter count: $BIND_COUNT"
     echo 'Enter each value as plain text (no SQL quotes). \N means SQL NULL; empty input means an empty string.'
     printf 'EXECUTE pg_explain_target' > "$execute_file"
