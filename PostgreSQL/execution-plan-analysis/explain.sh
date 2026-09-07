@@ -1,7 +1,7 @@
 #!/bin/sh
 set -u
 
-SCRIPT_VERSION="1.1.4"
+SCRIPT_VERSION="1.1.5"
 SCRIPT_DIR=$(CDPATH='' cd "$(dirname "$0")" && pwd)
 DEFAULT_OUTPUT_DIR="$SCRIPT_DIR/results"
 
@@ -88,7 +88,6 @@ echo "  user     : $PGUSER"
 echo "  database : $PGDATABASE"
 echo
 
-# Private temporary files for this invocation.
 work_dir=$(umask 077; mktemp -d "${TMPDIR:-/tmp}/pg_explain.XXXXXXXX") || exit 1
 tty_state=
 cleanup() {
@@ -261,7 +260,8 @@ WITH RECURSIVE nodes(node) AS (
          LATERAL jsonb_array_elements(COALESCE(node->'Plans', '[]'::jsonb)) child
 ), relations AS (
     SELECT DISTINCT node->>'Alias' AS alias,
-           format('%I.%I', node->>'Schema', node->>'Relation Name') AS relation
+           format('%I.%I', node->>'Schema', node->>'Relation Name') AS relation,
+           to_regclass(format('%I.%I', node->>'Schema', node->>'Relation Name')) AS relid
     FROM nodes
     WHERE node ? 'Schema' AND node ? 'Relation Name' AND node ? 'Alias'
 ), expressions AS (
@@ -272,7 +272,7 @@ WITH RECURSIVE nodes(node) AS (
 ), patterns AS (
     SELECT '(?:[a-z_][a-z_0-9$]*|"(?:[^"]|"")+")' AS ident,
            '(?:::(?:text|integer|bigint|smallint|numeric|boolean|date|uuid|character varying|double precision))?' AS cast_pattern
-), matches AS (
+), qualified_matches AS (
     SELECT regexp_match(term,
       '^\s*\(*\s*(' || ident || '\.' || ident || ')\)*' || cast_pattern ||
       '\)*\s*(?:=|<>|!=|<=|>=|<|>|~~\*?|!~~\*?)\s*\(*\$([1-9][0-9]*)\)*' || cast_pattern || '\)*\s*$') AS m,
@@ -284,22 +284,67 @@ WITH RECURSIVE nodes(node) AS (
       '\)*\s*(?:=|<>|!=|<=|>=|<|>)\s*\(*(' || ident || '\.' || ident || ')\)*' || cast_pattern || '\)*\s*$'),
       true
     FROM expressions, patterns
-), refs AS (
+), qualified_refs AS (
     SELECT CASE WHEN reversed THEN m[1] ELSE m[2] END AS parameter,
            parse_ident(CASE WHEN reversed THEN m[2] ELSE m[1] END) AS names
-    FROM matches WHERE m IS NOT NULL
-), candidates AS (
-    SELECT DISTINCT parameter, relation, names[2] AS column_name
-    FROM refs JOIN relations ON alias = names[1]
-    JOIN pg_attribute a ON a.attrelid = to_regclass(relation)
-                       AND a.attname = names[2] AND a.attnum > 0 AND NOT a.attisdropped
-), unique_mapping AS (
-    SELECT parameter, min(relation) AS relation, min(column_name) AS column_name
-    FROM candidates GROUP BY parameter HAVING count(*) = 1
+    FROM qualified_matches WHERE m IS NOT NULL
+), unqualified_matches AS (
+    SELECT regexp_match(term,
+      '^\s*\(*\s*(' || ident || ')\)*' || cast_pattern ||
+      '\)*\s*(?:=|<>|!=|<=|>=|<|>|~~\*?|!~~\*?)\s*\(*\$([1-9][0-9]*)\)*' || cast_pattern || '\)*\s*$') AS m,
+      false AS reversed
+    FROM expressions, patterns
+    UNION ALL
+    SELECT regexp_match(term,
+      '^\s*\(*\$([1-9][0-9]*)\)*' || cast_pattern ||
+      '\)*\s*(?:=|<>|!=|<=|>=|<|>)\s*\(*(' || ident || ')\)*' || cast_pattern || '\)*\s*$'),
+      true
+    FROM expressions, patterns
+), unqualified_refs AS (
+    SELECT CASE WHEN reversed THEN m[1] ELSE m[2] END AS parameter,
+           (parse_ident(CASE WHEN reversed THEN m[2] ELSE m[1] END))[1] AS column_name
+    FROM unqualified_matches WHERE m IS NOT NULL
+), direct_candidates AS (
+    SELECT DISTINCT q.parameter, r.relid, q.names[2] AS column_name, 1 AS priority
+    FROM qualified_refs q
+    JOIN relations r ON r.alias = q.names[1]
+    JOIN pg_attribute a ON a.attrelid = r.relid
+                       AND a.attname = q.names[2]
+                       AND a.attnum > 0 AND NOT a.attisdropped
+), unqualified_candidates AS (
+    SELECT DISTINCT u.parameter, r.relid, u.column_name, 2 AS priority
+    FROM unqualified_refs u
+    CROSS JOIN relations r
+    JOIN pg_attribute a ON a.attrelid = r.relid
+                       AND a.attname = u.column_name
+                       AND a.attnum > 0 AND NOT a.attisdropped
+), all_candidates AS (
+    SELECT * FROM direct_candidates
+    UNION ALL
+    SELECT * FROM unqualified_candidates
+), normalized AS (
+    SELECT DISTINCT c.parameter,
+           CASE WHEN pc.relispartition THEN pg_partition_root(c.relid) ELSE c.relid END AS normalized_relid,
+           c.column_name,
+           c.priority
+    FROM all_candidates c
+    JOIN pg_class pc ON pc.oid = c.relid
+), best_priority AS (
+    SELECT parameter, min(priority) AS priority
+    FROM normalized
+    GROUP BY parameter
 )
-SELECT parameter, relation, column_name FROM unique_mapping
-WHERE relation !~ E'[|\n\r]' AND column_name !~ E'[|\n\r]'
-ORDER BY parameter::integer;
+SELECT n.parameter,
+       format('%I.%I', ns.nspname, cls.relname) AS relation,
+       n.column_name,
+       n.priority
+FROM normalized n
+JOIN best_priority b USING (parameter, priority)
+JOIN pg_class cls ON cls.oid = n.normalized_relid
+JOIN pg_namespace ns ON ns.oid = cls.relnamespace
+WHERE format('%I.%I', ns.nspname, cls.relname) !~ E'[|\n\r]'
+  AND n.column_name !~ E'[|\n\r]'
+ORDER BY n.parameter::integer, n.priority, relation, n.column_name;
 ROLLBACK;
 BIND_MAP_SQL
     } | run_psql -X -qAt -F '|' -v ON_ERROR_STOP=1 \
@@ -435,12 +480,49 @@ show_bind_candidates() {
         return 0
     fi
 
-    sample_relation=$(awk -F'|' -v n="$bind_index" '$1 == n {print $2; exit}' "$bind_map")
-    sample_column=$(awk -F'|' -v n="$bind_index" '$1 == n {print $3; exit}' "$bind_map")
-    if [ -n "$sample_relation" ] && [ -n "$sample_column" ]; then
+    bind_candidate_file="$work_dir/bind-candidates-$bind_index.txt"
+    awk -F'|' -v n="$bind_index" '$1 == n {print $2 "|" $3}' "$bind_map" | sort -u > "$bind_candidate_file"
+    bind_candidate_count=$(awk 'END {print NR+0}' "$bind_candidate_file")
+
+    sample_relation=
+    sample_column=
+
+    if [ "$bind_candidate_count" -eq 1 ]; then
+        candidate_line=$(sed -n '1p' "$bind_candidate_file")
+        sample_relation=${candidate_line%%|*}
+        sample_column=${candidate_line#*|}
         printf 'Auto-detected $%s -> %s / %s\n' "$bind_index" "$sample_relation" "$sample_column"
+    elif [ "$bind_candidate_count" -gt 1 ]; then
+        echo "Multiple candidate relations found for parameter \$$bind_index:"
+        candidate_no=1
+        while IFS='|' read -r candidate_relation candidate_column
+        do
+            printf '  %s) %s / %s\n' "$candidate_no" "$candidate_relation" "$candidate_column"
+            candidate_no=$((candidate_no + 1))
+        done < "$bind_candidate_file"
+
+        while :; do
+            printf 'Select candidate for $%s [1]: ' "$bind_index" >&2
+            IFS= read -r candidate_choice || return 1
+            [ -n "$candidate_choice" ] || candidate_choice=1
+            case $candidate_choice in
+                *[!0-9]*|'')
+                    echo "ERROR: enter a candidate number." >&2
+                    continue
+                    ;;
+            esac
+            if [ "$candidate_choice" -lt 1 ] || [ "$candidate_choice" -gt "$bind_candidate_count" ]; then
+                printf 'ERROR: choose 1-%s.\n' "$bind_candidate_count" >&2
+                continue
+            fi
+            candidate_line=$(sed -n "${candidate_choice}p" "$bind_candidate_file")
+            sample_relation=${candidate_line%%|*}
+            sample_column=${candidate_line#*|}
+            printf 'Selected $%s -> %s / %s\n' "$bind_index" "$sample_relation" "$sample_column"
+            break
+        done
     else
-        echo "No unique direct column found for this parameter." >&2
+        echo "No automatic relation candidate found for this parameter." >&2
         echo "The following table/column is only used to look up example values; press Enter to skip candidate lookup." >&2
     fi
 
