@@ -236,7 +236,143 @@ addopt "FORMAT $FORMAT"
 tmp="${TMPDIR:-/tmp}/pg_explain_$$.sql"
 plan_json="${TMPDIR:-/tmp}/pg_explain_plan_$$.json"
 rel_file="${TMPDIR:-/tmp}/pg_explain_rel_$$.txt"
-trap 'rm -f "$tmp" "$plan_json" "$rel_file"' EXIT HUP INT TERM
+table_before="${TMPDIR:-/tmp}/pg_explain_table_before_$$.txt"
+table_after="${TMPDIR:-/tmp}/pg_explain_table_after_$$.txt"
+index_before="${TMPDIR:-/tmp}/pg_explain_index_before_$$.txt"
+index_after="${TMPDIR:-/tmp}/pg_explain_index_after_$$.txt"
+trap 'rm -f "$tmp" "$plan_json" "$rel_file" "$table_before" "$table_after" "$index_before" "$index_after"' EXIT HUP INT TERM
+
+{
+    printf 'EXPLAIN (VERBOSE, COSTS FALSE, FORMAT JSON)\n'
+    cat "$SQL_FILE"
+    printf '\n'
+} | "$PSQL_BIN" -X -At -v ON_ERROR_STOP=1 > "$plan_json" || {
+    echo "ERROR: Could not generate JSON plan for relation extraction." >&2
+    exit 1
+}
+
+awk '
+    /"Schema"[[:space:]]*:/ {
+        line=$0
+        sub(/^.*"Schema"[[:space:]]*:[[:space:]]*"/,"",line)
+        sub(/".*$/,"",line)
+        schema=line
+    }
+    /"Relation Name"[[:space:]]*:/ {
+        line=$0
+        sub(/^.*"Relation Name"[[:space:]]*:[[:space:]]*"/,"",line)
+        sub(/".*$/,"",line)
+        rel=line
+        if (schema != "" && rel != "") {
+            print schema "." rel
+        }
+    }
+' "$plan_json" | sort -u > "$rel_file"
+
+snapshot_stats() {
+    table_file=$1
+    index_file=$2
+    : > "$table_file"
+    : > "$index_file"
+
+    while IFS= read -r rel
+    do
+        [ -n "$rel" ] || continue
+
+        printf '%s\n' "
+SELECT st.relid,
+       st.schemaname || '.' || st.relname,
+       COALESCE(st.seq_scan,0),
+       COALESCE(st.seq_tup_read,0),
+       COALESCE(st.idx_scan,0),
+       COALESCE(st.idx_tup_fetch,0),
+       COALESCE(st.n_tup_ins,0),
+       COALESCE(st.n_tup_upd,0),
+       COALESCE(st.n_tup_del,0),
+       COALESCE(st.n_tup_hot_upd,0)
+FROM pg_stat_all_tables st
+WHERE st.relid=:'rel'::regclass;
+" | "$PSQL_BIN" -X -At -F '|' -v ON_ERROR_STOP=1 -v rel="$rel" >> "$table_file"
+
+        printf '%s\n' "
+SELECT si.indexrelid,
+       si.indexrelid::regclass::text,
+       COALESCE(si.idx_scan,0),
+       COALESCE(si.idx_tup_read,0),
+       COALESCE(si.idx_tup_fetch,0),
+       COALESCE(io.idx_blks_read,0),
+       COALESCE(io.idx_blks_hit,0)
+FROM pg_stat_all_indexes si
+LEFT JOIN pg_statio_all_indexes io
+  ON io.indexrelid=si.indexrelid
+WHERE si.relid=:'rel'::regclass
+ORDER BY si.indexrelid;
+" | "$PSQL_BIN" -X -At -F '|' -v ON_ERROR_STOP=1 -v rel="$rel" >> "$index_file"
+    done < "$rel_file"
+}
+
+print_table_delta() {
+    [ -s "$table_before" ] && [ -s "$table_after" ] || return 0
+    awk -F'|' '
+        NR==FNR {
+            for (i=3;i<=10;i++) b[$1,i]=$i
+            name[$1]=$2
+            next
+        }
+        {
+            id=$1
+            printf "\n%s\n", name[id]
+            printf "%-24s %15s %15s %15s\n", "metric", "before", "after", "delta"
+            printf "%-24s %15s %15s %15s\n", "------------------------", "---------------", "---------------", "---------------"
+            label[3]="seq_scan"
+            label[4]="seq_tup_read"
+            label[5]="idx_scan"
+            label[6]="idx_tup_fetch"
+            label[7]="n_tup_ins"
+            label[8]="n_tup_upd"
+            label[9]="n_tup_del"
+            label[10]="n_tup_hot_upd"
+            for (i=3;i<=10;i++) {
+                before=(b[id,i]==""?0:b[id,i])
+                after=$i
+                delta=after-before
+                printf "%-24s %15s %15s %+15d\n", label[i], before, after, delta
+            }
+        }
+    ' "$table_before" "$table_after"
+}
+
+print_index_delta() {
+    [ -s "$index_before" ] && [ -s "$index_after" ] || return 0
+    awk -F'|' '
+        NR==FNR {
+            for (i=3;i<=7;i++) b[$1,i]=$i
+            name[$1]=$2
+            next
+        }
+        {
+            id=$1
+            printf "\n%s\n", name[id]
+            printf "%-24s %15s %15s %15s\n", "metric", "before", "after", "delta"
+            printf "%-24s %15s %15s %15s\n", "------------------------", "---------------", "---------------", "---------------"
+            label[3]="idx_scan"
+            label[4]="idx_tup_read"
+            label[5]="idx_tup_fetch"
+            label[6]="idx_blks_read"
+            label[7]="idx_blks_hit"
+            for (i=3;i<=7;i++) {
+                before=(b[id,i]==""?0:b[id,i])
+                after=$i
+                delta=after-before
+                printf "%-24s %15s %15s %+15d\n", label[i], before, after, delta
+            }
+        }
+    ' "$index_before" "$index_after"
+}
+
+if [ "$ANALYZE" = yes ] && [ -s "$rel_file" ]; then
+    snapshot_stats "$table_before" "$index_before"
+fi
 
 {
     printf 'EXPLAIN (%s)\n' "$opts"
@@ -247,6 +383,21 @@ trap 'rm -f "$tmp" "$plan_json" "$rel_file"' EXIT HUP INT TERM
 section "Execution Plan"
 echo "Generated: EXPLAIN ($opts)"
 "$PSQL_BIN" -X -v ON_ERROR_STOP=1 -f "$tmp" || exit 1
+
+if [ "$ANALYZE" = yes ] && [ -s "$rel_file" ]; then
+    snapshot_stats "$table_after" "$index_after"
+
+    section "Table Statistics Delta"
+    print_table_delta
+
+    section "Index Statistics / I/O Delta"
+    print_index_delta
+
+    echo
+    echo "NOTE: Delta is calculated from cumulative pg_stat_* counters before/after this run."
+    echo "      Concurrent sessions using the same relation can be included in the delta."
+    echo "      The per-query I/O shown by EXPLAIN (ANALYZE, BUFFERS) is more specific to this execution."
+fi
 
 DIAG=$(ask "Show additional Plan diagnostics? yes/no" yes)
 [ "$DIAG" = yes ] || exit 0
@@ -267,33 +418,6 @@ WHERE name IN (
 )
 ORDER BY name;
 SQL
-
-{
-    printf 'EXPLAIN (VERBOSE, COSTS FALSE, FORMAT JSON)\n'
-    cat "$SQL_FILE"
-    printf '\n'
-} | "$PSQL_BIN" -X -At -v ON_ERROR_STOP=1 > "$plan_json" || {
-    echo "WARNING: Could not generate JSON plan for relation extraction." >&2
-    exit 0
-}
-
-awk '
-    /"Schema"[[:space:]]*:/ {
-        line=$0
-        sub(/^.*"Schema"[[:space:]]*:[[:space:]]*"/,"",line)
-        sub(/".*$/,"",line)
-        schema=line
-    }
-    /"Relation Name"[[:space:]]*:/ {
-        line=$0
-        sub(/^.*"Relation Name"[[:space:]]*:[[:space:]]*"/,"",line)
-        sub(/".*$/,"",line)
-        rel=line
-        if (schema != "" && rel != "") {
-            print schema "." rel
-        }
-    }
-' "$plan_json" | sort -u > "$rel_file"
 
 if [ ! -s "$rel_file" ]; then
     echo
@@ -484,5 +608,4 @@ do
     run_relation_report "$rel" "Index Information" "$SQL_INDEX_INFO"
     run_relation_report "$rel" "Index Columns" "$SQL_INDEX_COLUMNS"
     run_relation_report "$rel" "Index Usage / I/O" "$SQL_INDEX_IO"
-
 done < "$rel_file"
