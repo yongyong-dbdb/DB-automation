@@ -1,7 +1,7 @@
 #!/bin/sh
 set -u
 
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.1.1"
 
 PSQL_BIN=${PSQL_BIN:-}
 
@@ -86,7 +86,6 @@ echo "  user     : $PGUSER"
 echo "  database : $PGDATABASE"
 echo
 
-
 # Private temporary files for this invocation.
 work_dir=$(umask 077; mktemp -d "${TMPDIR:-/tmp}/pg_explain.XXXXXXXX") || exit 1
 tty_state=
@@ -121,7 +120,6 @@ prompt_password_once() {
     tty_state=
     printf '\n' >/dev/tty
     [ "$_read_status" -eq 0 ] || { unset _password; return 1; }
-    # Host wildcard covers PGHOST retry and local sockets.
     (
         umask 077
         for _field in "$PGPORT" "$PGDATABASE" "$PGUSER" "$_password"; do
@@ -151,7 +149,6 @@ check_connection() {
     if LC_ALL=C run_psql -X -Atqc "SELECT 1;" >/dev/null 2>"$work_dir/connection.err"; then
         return 0
     fi
-    # Socket/network/database errors must not trigger a password prompt.
     if grep -Eq 'no password supplied|password authentication failed' "$work_dir/connection.err" &&
        [ "$password_prompted" = no ]; then
         prompt_password_once || return 1
@@ -229,7 +226,6 @@ section() {
     echo "============================================================"
 }
 
-# Resolve aliases and base relations using a non-executing generic plan.
 build_bind_map() {
     bind_map="$work_dir/bind-map.txt"
     if ! {
@@ -272,8 +268,6 @@ WITH RECURSIVE nodes(node) AS (
          LATERAL regexp_split_to_table(e.value, '\s+(?:AND|OR)\s+') term
     WHERE e.key IN ('Filter', 'Index Cond', 'Recheck Cond', 'Hash Cond', 'Merge Cond', 'Join Filter')
 ), patterns AS (
-    -- Match a whole simple comparison only: never infer lower(col), arithmetic,
-    -- CASE, array expressions or ambiguous column lineage from a substring.
     SELECT '(?:[a-z_][a-z_0-9$]*|"(?:[^"]|"")+")' AS ident,
            '(?:::(?:text|integer|bigint|smallint|numeric|boolean|date|uuid|character varying|double precision))?' AS cast_pattern
 ), matches AS (
@@ -302,7 +296,6 @@ WITH RECURSIVE nodes(node) AS (
     FROM candidates GROUP BY parameter HAVING count(*) = 1
 )
 SELECT parameter, relation, column_name FROM unique_mapping
--- The shell map is line-delimited. Unusual delimiters safely use manual input.
 WHERE relation !~ E'[|\n\r]' AND column_name !~ E'[|\n\r]'
 ORDER BY parameter::integer;
 ROLLBACK;
@@ -314,8 +307,6 @@ BIND_MAP_SQL
     fi
 }
 
-# Resolve direct SQL constant comparisons (for example: 0 = $2) from the
-# same non-executing generic plan. Only one unambiguous literal per bind is used.
 build_bind_constant_map() {
     bind_constant_map="$work_dir/bind-constant-map.txt"
     if ! {
@@ -398,10 +389,41 @@ BIND_CONSTANT_SQL
     fi
 }
 
-# Prefer an unambiguous plan-derived constant or column; prompt only as fallback.
+build_bind_type_map() {
+    bind_type_map="$work_dir/bind-type-map.txt"
+    if ! {
+        cat "$prepare_file"
+        cat <<'BIND_TYPE_SQL'
+SELECT n,
+       p.parameter_types[n]::text AS parameter_type,
+       CASE
+         WHEN COALESCE(base_type.typcategory, param_type.typcategory) = 'S' THEN 'yes'
+         ELSE 'no'
+       END AS empty_string_allowed
+FROM pg_prepared_statements p
+CROSS JOIN LATERAL generate_subscripts(p.parameter_types, 1) AS n
+JOIN pg_type param_type
+  ON param_type.oid = p.parameter_types[n]::oid
+LEFT JOIN pg_type base_type
+  ON base_type.oid = NULLIF(param_type.typbasetype, 0)
+WHERE p.name = 'pg_explain_target'
+ORDER BY n;
+BIND_TYPE_SQL
+    } | run_psql -X -qAt -F '|' -v ON_ERROR_STOP=1 > "$bind_type_map"; then
+        echo 'ERROR: Could not determine bind parameter types.' >&2
+        exit 1
+    fi
+}
+
 show_bind_candidates() {
     bind_default_available=no
     bind_default_value=
+    bind_type=$(awk -F'|' -v n="$bind_index" '$1 == n {print $2; exit}' "$bind_type_map")
+    bind_empty_string_allowed=$(awk -F'|' -v n="$bind_index" '$1 == n {print $3; exit}' "$bind_type_map")
+    [ -n "$bind_type" ] || bind_type=unknown
+    [ -n "$bind_empty_string_allowed" ] || bind_empty_string_allowed=no
+
+    printf 'Parameter $%s type: %s\n' "$bind_index" "$bind_type"
 
     constant_line=$(awk -F'|' -v n="$bind_index" '$1 == n {print; exit}' "$bind_constant_map")
     if [ -n "$constant_line" ]; then
@@ -416,18 +438,21 @@ show_bind_candidates() {
     if [ -n "$sample_relation" ] && [ -n "$sample_column" ]; then
         printf 'Auto-detected $%s -> %s / %s\n' "$bind_index" "$sample_relation" "$sample_column"
     else
-        echo "No unique direct column found for this parameter; select manually or skip." >&2
+        echo "No unique direct column found for this parameter." >&2
+        echo "The following table/column is only used to look up example values; press Enter to skip candidate lookup." >&2
     fi
+
     while :; do
         if [ -z "$sample_relation" ] || [ -z "$sample_column" ]; then
-            printf 'Candidate table for $%s (schema.table, empty to skip): ' "$bind_index" >&2
+            printf 'Candidate source table for $%s (schema.table, empty to skip): ' "$bind_index" >&2
             IFS= read -r sample_relation || return 1
             [ -n "$sample_relation" ] || return 0
-            printf 'Candidate column (exact name, no surrounding quotes; empty to skip): ' >&2
+            printf 'Candidate source column (exact name, empty to skip): ' >&2
             IFS= read -r sample_column || return 1
             [ -n "$sample_column" ] || return 0
         fi
-        printf '\nTable value candidates for $%s (up to %s; not historical bind values)\n' "$bind_index" "$BIND_SAMPLE_LIMIT"
+
+        printf '\nTable value candidates for $%s (up to %s distinct values; not historical bind values)\n' "$bind_index" "$BIND_SAMPLE_LIMIT"
         if run_psql -X -q -P pager=off -v ON_ERROR_STOP=1 \
             -v sample_relation="$sample_relation" -v sample_column="$sample_column" \
             -v sample_limit="$BIND_SAMPLE_LIMIT" -v sample_timeout="$BIND_SAMPLE_TIMEOUT" <<'SQL'
@@ -435,7 +460,7 @@ BEGIN READ ONLY;
 SELECT set_config('statement_timeout', :'sample_timeout', true) AS sample_timeout
 \gset
 SELECT format(
-    'SELECT %1$I AS candidate_value FROM %2$s WHERE %1$I IS NOT NULL LIMIT %3$s',
+    'SELECT DISTINCT %1$I AS candidate_value FROM %2$s WHERE %1$I IS NOT NULL LIMIT %3$s',
     :'sample_column', :'sample_relation'::regclass, :'sample_limit'::integer)
 \gexec
 COMMIT;
@@ -449,7 +474,7 @@ BEGIN READ ONLY;
 SELECT set_config('statement_timeout', :'sample_timeout', true) AS sample_timeout
 \gset
 SELECT format(
-    'SELECT %1$I::text FROM %2$s WHERE %1$I IS NOT NULL AND %1$I::text !~ E''[\n\r]'' LIMIT 1',
+    'SELECT DISTINCT %1$I::text FROM %2$s WHERE %1$I IS NOT NULL AND %1$I::text !~ E''[\n\r]'' LIMIT 1',
     :'sample_column', :'sample_relation'::regclass)
 \gexec
 COMMIT;
@@ -459,16 +484,16 @@ SQL
                 bind_default_available=yes
                 printf 'Default for $%s: %s\n' "$bind_index" "$bind_default_value"
             fi
-            echo 'Candidates may repeat and do not apply the original SQL filters. Enter the desired value below.'
+            echo 'Candidates are distinct current table values and do not apply the original SQL filters.'
             return 0
         fi
+
         echo 'Could not read candidates. Check table/column/permissions or retry; empty table skips candidates.' >&2
         sample_relation=
         sample_column=
     done
 }
 
-# Let PostgreSQL parse placeholders; do not count $n in comments or strings.
 BIND=$(ask 'Use bind parameters ($1, $2, ...)? yes/no' no) || exit 1
 prepare_file="$work_dir/prepare.sql"
 execute_file="$work_dir/execute.sql"
@@ -483,6 +508,7 @@ if [ "$BIND" = yes ]; then
         cat "$SQL_FILE"
         printf '\n;\n'
     } > "$prepare_file"
+
     BIND_COUNT=$(
         {
             cat "$prepare_file"
@@ -492,34 +518,58 @@ if [ "$BIND" = yes ]; then
         echo "ERROR: Could not prepare SQL. Check the SQL and parameter types." >&2
         exit 1
     }
+
     case $BIND_COUNT in
         ''|*[!0-9]*) echo "ERROR: invalid parameter count" >&2; exit 1 ;;
     esac
+
     BIND_SAMPLE_LIMIT=${BIND_SAMPLE_LIMIT:-3}
     BIND_SAMPLE_TIMEOUT=${BIND_SAMPLE_TIMEOUT:-5s}
     if ! printf '%s\n' "$BIND_SAMPLE_LIMIT" | grep -Eq '^[0-9]*[1-9][0-9]*$'; then
         echo "ERROR: BIND_SAMPLE_LIMIT must be a positive integer." >&2
         exit 1
     fi
+
     build_bind_map
     build_bind_constant_map
+    build_bind_type_map
+
     echo "Bind parameter count: $BIND_COUNT"
-    echo 'Enter each value as plain text (no SQL quotes). \N means SQL NULL. If a default is shown, Enter accepts it; otherwise empty input means an empty string.'
+    echo 'Enter each value as plain text (no SQL quotes). \N means SQL NULL. If a default is shown, Enter accepts it.'
+    echo 'Without a default, empty input is allowed only for PostgreSQL string types; non-string types require a value or \N.'
+
     printf 'EXECUTE pg_explain_target' > "$execute_file"
     if [ "$BIND_COUNT" -gt 0 ]; then
         printf '(' >> "$execute_file"
         bind_index=1
         while [ "$bind_index" -le "$BIND_COUNT" ]; do
             show_bind_candidates || exit 1
-            if [ "$bind_default_available" = yes ]; then
-                printf 'Value for $%s [%s]: ' "$bind_index" "$bind_default_value" >&2
-            else
-                printf 'Value for $%s: ' "$bind_index" >&2
-            fi
-            IFS= read -r bind_value || exit 1
-            if [ -z "$bind_value" ] && [ "$bind_default_available" = yes ]; then
-                bind_value=$bind_default_value
-            fi
+
+            while :; do
+                if [ "$bind_default_available" = yes ]; then
+                    printf 'Value for $%s [%s]: ' "$bind_index" "$bind_default_value" >&2
+                elif [ "$bind_empty_string_allowed" = yes ]; then
+                    printf 'Value for $%s (empty string allowed, \\N for NULL): ' "$bind_index" >&2
+                else
+                    printf 'Value for $%s (required, \\N for NULL): ' "$bind_index" >&2
+                fi
+
+                IFS= read -r bind_value || exit 1
+
+                if [ -z "$bind_value" ] && [ "$bind_default_available" = yes ]; then
+                    bind_value=$bind_default_value
+                    break
+                fi
+
+                if [ -z "$bind_value" ] && [ "$bind_empty_string_allowed" != yes ]; then
+                    printf 'ERROR: $%s type %s does not accept an implicit empty-string input here. Enter a value or \\N for SQL NULL.\n' \
+                        "$bind_index" "$bind_type" >&2
+                    continue
+                fi
+
+                break
+            done
+
             [ "$bind_index" -eq 1 ] || printf ', ' >> "$execute_file"
             if [ "$bind_value" = '\N' ]; then
                 printf 'NULL' >> "$execute_file"
@@ -626,7 +676,6 @@ table_after="$work_dir/table_after.txt"
 index_before="$work_dir/index_before.txt"
 index_after="$work_dir/index_after.txt"
 
-# PREPARE belongs to a connection: recreate it before each EXPLAIN.
 emit_plan() {
     plan_options=$1
     if [ "$BIND" = yes ]; then
