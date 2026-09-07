@@ -1,7 +1,9 @@
 #!/bin/sh
 set -u
 
-SCRIPT_VERSION="1.1.1"
+SCRIPT_VERSION="1.1.2"
+SCRIPT_DIR=$(CDPATH='' cd "$(dirname "$0")" && pwd)
+DEFAULT_OUTPUT_DIR="$SCRIPT_DIR/results"
 
 PSQL_BIN=${PSQL_BIN:-}
 
@@ -675,6 +677,34 @@ table_before="$work_dir/table_before.txt"
 table_after="$work_dir/table_after.txt"
 index_before="$work_dir/index_before.txt"
 index_after="$work_dir/index_after.txt"
+plan_output="$work_dir/plan-output.txt"
+report_output="$work_dir/report-output.txt"
+
+result_timestamp=$(date '+%Y%m%d_%H%M%S')
+result_database=$(printf '%s' "$PGDATABASE" | tr -c '[:alnum:]_.-' '_')
+RESULT_DIR=${EXPLAIN_RESULT_DIR:-$DEFAULT_OUTPUT_DIR}
+RESULT_FILE="$RESULT_DIR/explain_${result_database}_${result_timestamp}.log"
+mkdir -p "$RESULT_DIR" || {
+    echo "ERROR: Could not create result directory: $RESULT_DIR" >&2
+    exit 1
+}
+{
+    echo "PostgreSQL execution plan analysis"
+    echo "script_version=$SCRIPT_VERSION"
+    echo "generated_at=$(date '+%Y-%m-%dT%H:%M:%S%z')"
+    echo "database=$PGDATABASE"
+    echo "host=${PGHOST:-default/local socket}"
+    echo "port=$PGPORT"
+    echo "user=$PGUSER"
+    echo "sql_file=$SQL_FILE"
+    echo "explain_options=$opts"
+    echo
+} > "$RESULT_FILE" || {
+    echo "ERROR: Could not create result file: $RESULT_FILE" >&2
+    exit 1
+}
+
+echo "Result file: $RESULT_FILE"
 
 emit_plan() {
     plan_options=$1
@@ -868,33 +898,49 @@ else
     } > "$tmp"
 fi
 
-section "Execution Plan"
-echo "Generated: EXPLAIN ($opts)"
-if [ "$DML_ANALYZE" = yes ]; then
-    echo "DML safety: BEGIN -> EXPLAIN ANALYZE -> ROLLBACK"
+section "Execution Plan" | tee -a "$RESULT_FILE"
+{
+    echo "Generated: EXPLAIN ($opts)"
+    if [ "$DML_ANALYZE" = yes ]; then
+        echo "DML safety: BEGIN -> EXPLAIN ANALYZE -> ROLLBACK"
+    fi
+} | tee -a "$RESULT_FILE"
+
+if run_psql -X -q -P pager=off -v ON_ERROR_STOP=1 -f "$tmp" > "$plan_output" 2>&1; then
+    cat "$plan_output" | tee -a "$RESULT_FILE"
+else
+    plan_status=$?
+    cat "$plan_output" | tee -a "$RESULT_FILE" >&2
+    echo "Execution plan failed. Result file: $RESULT_FILE" >&2
+    exit "$plan_status"
 fi
-run_psql -X -q -v ON_ERROR_STOP=1 -f "$tmp" || exit 1
 
 if [ "$ANALYZE" = yes ] && [ -s "$rel_file" ]; then
     snapshot_stats "$table_after" "$index_after"
 
-    section "Table Statistics Delta"
-    print_table_delta
+    section "Table Statistics Delta" | tee -a "$RESULT_FILE"
+    print_table_delta | tee -a "$RESULT_FILE"
 
-    section "Index Statistics / I/O Delta"
-    print_index_delta
+    section "Index Statistics / I/O Delta" | tee -a "$RESULT_FILE"
+    print_index_delta | tee -a "$RESULT_FILE"
 
-    echo
-    echo "NOTE: Delta is calculated from cumulative pg_stat_* counters before/after this run."
-    echo "      Concurrent sessions using the same relation can be included in the delta."
-    echo "      The per-query I/O shown by EXPLAIN (ANALYZE, BUFFERS) is more specific to this execution."
+    {
+        echo
+        echo "NOTE: Delta is calculated from cumulative pg_stat_* counters before/after this run."
+        echo "      Concurrent sessions using the same relation can be included in the delta."
+        echo "      The per-query I/O shown by EXPLAIN (ANALYZE, BUFFERS) is more specific to this execution."
+    } | tee -a "$RESULT_FILE"
 fi
 
+echo "Current result saved: $RESULT_FILE"
 DIAG=$(ask "Show additional Plan diagnostics? yes/no" yes)
-[ "$DIAG" = yes ] || exit 0
+if [ "$DIAG" != yes ]; then
+    echo "Final result file: $RESULT_FILE"
+    exit 0
+fi
 
-section "Planner Settings"
-run_psql -X -P pager=off -v ON_ERROR_STOP=1 <<'SQL'
+section "Planner Settings" | tee -a "$RESULT_FILE"
+if run_psql -X -P pager=off -P format=wrapped -P columns=160 -v ON_ERROR_STOP=1 > "$report_output" 2>&1 <<'SQL'
 SELECT name, setting, unit, source
 FROM pg_settings
 WHERE name IN (
@@ -909,24 +955,41 @@ WHERE name IN (
 )
 ORDER BY name;
 SQL
+then
+    cat "$report_output" | tee -a "$RESULT_FILE"
+else
+    report_status=$?
+    cat "$report_output" | tee -a "$RESULT_FILE" >&2
+    exit "$report_status"
+fi
 
 if [ ! -s "$rel_file" ]; then
-    echo
-    echo "Referenced relation could not be identified automatically from the plan."
+    {
+        echo
+        echo "Referenced relation could not be identified automatically from the plan."
+        echo "Final result file: $RESULT_FILE"
+    } | tee -a "$RESULT_FILE"
     exit 0
 fi
 
-section "Referenced Relations (Plan Base Relations)"
-cat "$rel_file"
+section "Referenced Relations (Plan Base Relations)" | tee -a "$RESULT_FILE"
+cat "$rel_file" | tee -a "$RESULT_FILE"
 
 run_relation_report() {
     rel=$1
     title=$2
     sql=$3
 
-    section "$title : $rel"
-    printf '%s\n' "$sql" | \
-        run_psql -X -P pager=off -v ON_ERROR_STOP=1 -v rel="$rel"
+    section "$title : $rel" | tee -a "$RESULT_FILE"
+    if printf '%s\n' "$sql" | \
+        run_psql -X -P pager=off -P format=wrapped -P columns=160 \
+            -v ON_ERROR_STOP=1 -v rel="$rel" > "$report_output" 2>&1; then
+        cat "$report_output" | tee -a "$RESULT_FILE"
+    else
+        report_status=$?
+        cat "$report_output" | tee -a "$RESULT_FILE" >&2
+        return "$report_status"
+    fi
 }
 
 SQL_TABLE_INFO='
@@ -1100,3 +1163,5 @@ do
     run_relation_report "$rel" "Index Columns" "$SQL_INDEX_COLUMNS"
     run_relation_report "$rel" "Index Usage / I/O" "$SQL_INDEX_IO"
 done < "$rel_file"
+
+echo "Final result file: $RESULT_FILE" | tee -a "$RESULT_FILE"
