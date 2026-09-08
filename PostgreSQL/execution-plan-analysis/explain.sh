@@ -1,7 +1,7 @@
 #!/bin/sh
 set -u
 
-SCRIPT_VERSION="1.1.7"
+SCRIPT_VERSION="1.1.8"
 SCRIPT_DIR=$(CDPATH='' cd "$(dirname "$0")" && pwd)
 DEFAULT_OUTPUT_DIR="$SCRIPT_DIR/results"
 
@@ -862,76 +862,196 @@ print_plan_tree() {
     input_file=$1
 
     awk '
+        function trim(s) {
+            sub(/^[[:space:]]+/, "", s)
+            sub(/[[:space:]]+$/, "", s)
+            return s
+        }
+
+        function leading_spaces(s) {
+            match(s, /^[[:space:]]*/)
+            return RLENGTH
+        }
+
         function mark_never(s) {
             gsub(/\(never executed\)/, "[NEVER EXECUTED]", s)
             return s
         }
 
+        function is_structure_label(s) {
+            return (s ~ /^InitPlan[[:space:]]+[0-9]+/ ||
+                    s ~ /^SubPlan[[:space:]]+[0-9]+/ ||
+                    s ~ /^CTE[[:space:]]+[^[:space:]]+/)
+        }
+
+        function is_detail_line(s) {
+            return (s ~ /^(Index Cond|Recheck Cond|Filter|Hash Cond|Merge Cond|Join Filter|One-Time Filter|Heap Fetches|Heap Blocks|Sort Key|Sort Method|Presorted Key|Group Key|Rows Removed by Filter|Rows Removed by Join Filter|Rows Removed by Index Recheck|Function Call|Workers Planned|Workers Launched|Disabled|Buckets|Batches|Memory Usage|Peak Memory Usage|Disk Usage|Cache Key|Cache Mode|Hits|Misses|Evictions|Overflows|Full-sort Groups|Pre-sorted Groups|Buffers|I\/O Timings|WAL):/)
+        }
+
+        function add_node(indent, text, kind,    i, p) {
+            node_count++
+            node_indent[node_count] = indent
+            node_text[node_count] = mark_never(text)
+            node_kind[node_count] = kind
+
+            if (node_count == 1) {
+                node_parent[node_count] = 0
+                return node_count
+            }
+
+            p = 0
+            for (i = node_count - 1; i >= 1; i--) {
+                if (node_indent[i] < indent) {
+                    p = i
+                    break
+                }
+            }
+
+            if (p == 0) {
+                parse_error = 1
+                parse_error_line = text
+            }
+
+            node_parent[node_count] = p
+            return node_count
+        }
+
+        function attach_detail(indent, text,    i, p, key) {
+            p = 0
+            for (i = node_count; i >= 1; i--) {
+                if (node_indent[i] < indent) {
+                    p = i
+                    break
+                }
+            }
+
+            if (p > 0) {
+                detail_count[p]++
+                key = p SUBSEP detail_count[p]
+                detail_text[key] = text
+            } else {
+                global_detail_count++
+                global_detail[global_detail_count] = text
+            }
+        }
+
+        function is_last_child(i,    p, j) {
+            p = node_parent[i]
+            for (j = i + 1; j <= node_count; j++) {
+                if (node_parent[j] == p) return 0
+            }
+            return 1
+        }
+
+        function ancestor_prefix(i, include_self,    p, n, j, a, prefix) {
+            n = 0
+            p = node_parent[i]
+            while (p > 0) {
+                chain[++n] = p
+                p = node_parent[p]
+            }
+
+            prefix = ""
+            for (j = n; j >= 1; j--) {
+                a = chain[j]
+                if (node_parent[a] == 0) continue
+                prefix = prefix (is_last_child(a) ? "   " : "│  ")
+            }
+
+            if (include_self && node_parent[i] != 0) {
+                prefix = prefix (is_last_child(i) ? "   " : "│  ")
+            }
+
+            return prefix
+        }
+
         BEGIN {
-            in_plan=0
-            root_done=0
-            node_count=0
+            in_plan = 0
+            root_done = 0
+            node_count = 0
+            parse_error = 0
         }
 
         {
-            raw=$0
-            text=raw
-            sub(/^[[:space:]]+/, "", text)
+            raw = $0
+            text = trim(raw)
 
             if (!in_plan) {
-                if (text == "QUERY PLAN") {
-                    in_plan=1
-                }
+                if (text == "QUERY PLAN") in_plan = 1
                 next
             }
 
-            if (!root_done && text ~ /^-+$/) {
-                next
-            }
+            if (!root_done && text ~ /^-+$/) next
 
             if (text ~ /^\([0-9]+ rows?\)$/) {
-                exit
-            }
-
-            if (text == "") {
+                in_plan = 0
                 next
             }
 
+            if (!in_plan || text == "") next
+
             if (!root_done) {
-                if (text ~ /^(Planning Time|Execution Time):/) {
-                    next
-                }
-                print mark_never(text)
-                root_done=1
-                node_count++
+                if (text ~ /^(Planning Time|Execution Time):/) next
+                add_node(leading_spaces(raw), text, "plan")
+                root_done = 1
                 next
             }
 
             if (text ~ /^->/) {
-                match(raw, /^[[:space:]]*/)
-                indent=substr(raw, 1, RLENGTH)
+                indent = leading_spaces(raw)
                 sub(/^->[[:space:]]*/, "", text)
-                printf "%s|-- %s\n", indent, mark_never(text)
-                node_count++
+                add_node(indent, text, "plan")
                 next
             }
 
-            if (text ~ /^(Index Cond|Recheck Cond|Filter|Hash Cond|Merge Cond|Join Filter|One-Time Filter|Heap Fetches|Sort Method|Rows Removed by Filter|Rows Removed by Join Filter|Rows Removed by Index Recheck|Batches|Memory Usage|Disk Usage):/) {
-                match(raw, /^[[:space:]]*/)
-                indent=substr(raw, 1, RLENGTH)
-                printf "%s    * %s\n", indent, text
+            if (is_structure_label(text)) {
+                add_node(leading_spaces(raw), text, "group")
+                next
+            }
+
+            if (is_detail_line(text)) {
+                attach_detail(leading_spaces(raw), text)
                 next
             }
 
             if (text ~ /^(Planning Time|Execution Time):/) {
-                printf "    * %s\n", text
+                global_detail_count++
+                global_detail[global_detail_count] = text
                 next
             }
         }
 
         END {
             if (node_count == 0) {
-                print "(simplified tree parsing unavailable)"
+                print "(tree parsing unavailable: no PostgreSQL plan nodes found)"
+                exit 2
+            }
+
+            if (parse_error) {
+                print "(tree parsing unavailable: structural indentation could not be resolved)"
+                if (parse_error_line != "") print "unresolved: " parse_error_line
+                exit 2
+            }
+
+            for (i = 1; i <= node_count; i++) {
+                if (node_parent[i] == 0) {
+                    print node_text[i]
+                } else {
+                    print ancestor_prefix(i, 0) (is_last_child(i) ? "└─ " : "├─ ") node_text[i]
+                }
+
+                for (k = 1; k <= detail_count[i]; k++) {
+                    key = i SUBSEP k
+                    if (node_parent[i] == 0) {
+                        print "   · " detail_text[key]
+                    } else {
+                        print ancestor_prefix(i, 1) "· " detail_text[key]
+                    }
+                }
+            }
+
+            for (i = 1; i <= global_detail_count; i++) {
+                print "· " global_detail[i]
             }
         }
     ' "$input_file"
@@ -1202,17 +1322,28 @@ section "Execution Plan" | tee -a "$RESULT_FILE"
 
 if run_psql -X -q -P pager=off -v ON_ERROR_STOP=1 -f "$tmp" > "$plan_output" 2>&1; then
     if [ "$FORMAT" = TEXT ]; then
-        print_plan_tree "$plan_output" > "$plan_tree_output"
-        section "Execution Plan Tree (Simplified)" | tee -a "$RESULT_FILE"
-        cat "$plan_tree_output" | tee -a "$RESULT_FILE"
-        {
-            echo
-            echo "NOTE: The tree is derived from the captured TEXT plan and does not execute the SQL again."
-            echo "      [NEVER EXECUTED] means the node was planned but not run during this execution."
-        } | tee -a "$RESULT_FILE"
+        section "Execution Plan Tree (Structural)" | tee -a "$RESULT_FILE"
+        if print_plan_tree "$plan_output" > "$plan_tree_output"; then
+            cat "$plan_tree_output" | tee -a "$RESULT_FILE"
+            {
+                echo
+                echo "NOTE: Structural hierarchy is parsed from the captured PostgreSQL TEXT plan."
+                echo "      The SQL / EXPLAIN ANALYZE is not executed again for Tree output."
+                echo "      Plan nodes and InitPlan/SubPlan/CTE groups are preserved; selected node attributes are summarized."
+                echo "      Ancillary details remain available in Execution Plan (Raw)."
+                echo "      [NEVER EXECUTED] means the node was planned but not run during this execution."
+            } | tee -a "$RESULT_FILE"
+        else
+            tree_status=$?
+            cat "$plan_tree_output" | tee -a "$RESULT_FILE" >&2
+            {
+                echo "WARNING: Structural Tree generation was stopped instead of guessing an unresolved hierarchy."
+                echo "         Use Execution Plan (Raw) as the authoritative output for this plan."
+            } | tee -a "$RESULT_FILE" >&2
+        fi
     else
-        section "Execution Plan Tree (Simplified)" | tee -a "$RESULT_FILE"
-        echo "Tree summary is available when FORMAT=TEXT. Raw $FORMAT output is preserved below." | tee -a "$RESULT_FILE"
+        section "Execution Plan Tree (Structural)" | tee -a "$RESULT_FILE"
+        echo "Structural Tree is available when FORMAT=TEXT. Raw $FORMAT output is preserved below." | tee -a "$RESULT_FILE"
     fi
 
     section "Execution Plan (Raw)" | tee -a "$RESULT_FILE"
