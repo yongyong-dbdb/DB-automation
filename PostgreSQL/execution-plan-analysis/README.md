@@ -8,6 +8,8 @@ PostgreSQL SQL 실행계획과 Planner 관련 정보를 한 번에 확인하기 
 
 지원 범위: PostgreSQL 12 ~ 18
 
+현재 스크립트 버전: `v1.1.7`
+
 실행 파일:
 
 ```text
@@ -17,6 +19,9 @@ explain.sh
 ## 주요 목적
 
 - SQL 실행계획 확인
+- `FORMAT=TEXT` 실행계획의 간략 Tree 출력
+- Parent / Child 구조와 `never executed` Node 식별 보조
+- 원본 PostgreSQL 실행계획 보존
 - Planner Cost 및 설정값 확인
 - 실행계획에 사용된 Table 자동 식별
 - Table 통계 상태 확인
@@ -41,6 +46,33 @@ sh explain.sh /path/to/test.sql
 ```
 
 스크립트는 `/bin/sh` 기준으로 작성되어 있습니다.
+
+## Yes / No 입력 처리
+
+`yes/no` 입력 항목은 대소문자를 구분하지 않습니다.
+
+```text
+yes
+YES
+Yes
+yEs
+
+no
+NO
+No
+```
+
+모두 정상 입력으로 처리합니다.
+
+`yes`, `no` 이외의 값을 입력한 경우 스크립트를 종료하지 않고 동일 질문을 다시 출력합니다.
+
+예:
+
+```text
+Use ANALYZE? yes/no [no]: yse
+ERROR: enter yes or no. Please retry.
+Use ANALYZE? yes/no [no]: YES
+```
 
 ## 접속 정보 확인
 
@@ -125,6 +157,46 @@ Transaction 외부 Side Effect
 
 선택한 EXPLAIN 옵션에 따라 실행계획을 출력합니다.
 
+`FORMAT=TEXT` 선택 시 동일한 실행 결과를 기준으로 간략 Tree와 PostgreSQL 원본 Plan을 함께 출력합니다.
+
+```text
+Execution Plan Tree (Simplified)
+        ↓
+Execution Plan (Raw)
+```
+
+Tree 출력을 위해 대상 SQL이나 `EXPLAIN ANALYZE`를 다시 실행하지 않습니다.
+
+이미 실행하여 저장한 TEXT Plan을 읽어 Tree를 생성하므로 `ANALYZE=yes`인 SQL도 실제 실행 횟수는 기존과 동일합니다.
+
+예:
+
+```text
+Sort  (cost=6.62..6.62 rows=1 width=360) (actual time=1.725..1.728 rows=0 loops=1)
+   |-- Nested Loop Left Join  (cost=4.38..6.61 rows=1 width=360) (actual time=1.717..1.719 rows=0 loops=1)
+         |-- Hash Join  (cost=3.98..5.36 rows=1 width=232) (actual time=1.717..1.719 rows=0 loops=1)
+               |-- Function Scan on pg_catalog.pg_stat_get_progress_info s_1
+               |-- Hash  [NEVER EXECUTED]
+```
+
+원본 Plan의 `(never executed)`는 Tree에서 다음과 같이 표시합니다.
+
+```text
+[NEVER EXECUTED]
+```
+
+`never executed` Node 확인 시 해당 Node 자체보다 Parent Node와 Sibling Branch의 `actual rows`, `loops`를 함께 확인하는 방식으로 원인 분석이 가능합니다.
+
+예:
+
+```text
+Hash Join
+├─ Left Branch  : actual rows=0 loops=1
+└─ Right Branch : [NEVER EXECUTED]
+```
+
+`FORMAT=JSON`, `YAML`, `XML` 선택 시 해당 Raw Format은 그대로 유지하며 간략 Tree는 생성하지 않습니다.
+
 주요 확인 항목:
 
 ```text
@@ -163,10 +235,16 @@ EXPLAIN ANALYZE 실행
         ↓
 DML이면 ROLLBACK
         ↓
+Execution Plan Tree 생성
+        ↓
+원본 Execution Plan 출력
+        ↓
 Table / Index After Snapshot
         ↓
 After - Before Delta 계산
 ```
+
+Tree 생성 단계는 이미 저장된 Plan Text를 가공하는 과정으로 SQL 재실행이 발생하지 않습니다.
 
 ### Table Statistics Delta
 
@@ -468,7 +546,9 @@ EXPLAIN 옵션 선택
         ↓
 Plan Base Relation 자동 추출
         ↓
-Execution Plan
+Execution Plan Tree (FORMAT=TEXT)
+        ↓
+Execution Plan Raw
         ↓
 Planner Settings
         ↓
@@ -483,6 +563,10 @@ Plan Base Relation 자동 추출
 Before Snapshot
         ↓
 EXPLAIN ANALYZE 실제 실행
+        ↓
+Execution Plan Tree (FORMAT=TEXT)
+        ↓
+Execution Plan Raw
         ↓
 After Snapshot
         ↓
@@ -503,6 +587,10 @@ BEGIN
 EXPLAIN ANALYZE INSERT / UPDATE / DELETE / MERGE
         ↓
 ROLLBACK
+        ↓
+Execution Plan Tree (FORMAT=TEXT)
+        ↓
+Execution Plan Raw
         ↓
 After Snapshot
         ↓
