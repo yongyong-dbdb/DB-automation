@@ -30,7 +30,7 @@ if [ -z "$PYTHON3_BIN" ]; then
         PYTHON3_BIN=$(command -v python3)
     elif [ -x /usr/libexec/platform-python ]; then
         PYTHON3_BIN=/usr/libexec/platform-python
-    elif command -v python >/dev/null 2>&1 && command -v python >/dev/null 2>&1 && \
+    elif command -v python >/dev/null 2>&1 && \
          "$(command -v python)" -c 'import sys; raise SystemExit(0 if sys.version_info[0] >= 3 else 1)' >/dev/null 2>&1; then
         PYTHON3_BIN=$(command -v python)
     fi
@@ -756,7 +756,7 @@ fi
 
 echo "PostgreSQL server_version_num: $SERVER_VERSION_NUM"
 echo
-echo "ANALYZE  : SQL 실제 실행 + Actual Rows/Time. DML은 실제 변경 발생 가능."
+echo "ANALYZE  : SQL 실제 실행 + Actual Rows/Time. 모든 ANALYZE 실행은 BEGIN/ROLLBACK 적용."
 ANALYZE=$(ask "Use ANALYZE? yes/no" no)
 
 echo "VERBOSE  : Output column, schema-qualified object 등 상세 표시."
@@ -823,18 +823,25 @@ add_base_opt() {
     [ -z "$base_plan_opts" ] && base_plan_opts="$1" || base_plan_opts="$base_plan_opts, $1"
 }
 
-[ "$ANALYZE" = yes ] && add_base_opt "ANALYZE"
-[ "$VERBOSE" = yes ] && add_base_opt "VERBOSE"
+[ "$ANALYZE" = yes ] && add_base_opt "ANALYZE TRUE"
+[ "$VERBOSE" = yes ] && add_base_opt "VERBOSE TRUE" || add_base_opt "VERBOSE FALSE"
 [ "$COSTS" = yes ] && add_base_opt "COSTS TRUE" || add_base_opt "COSTS FALSE"
-[ "$SETTINGS" = yes ] && add_base_opt "SETTINGS"
-[ "$BUFFERS" = yes ] && add_base_opt "BUFFERS"
-[ "$WAL" = yes ] && add_base_opt "WAL"
-[ "$TIMING" = yes ] && add_base_opt "TIMING TRUE"
-[ "$ANALYZE" = yes ] && [ "$TIMING" = no ] && add_base_opt "TIMING FALSE"
-[ "$GENERIC_PLAN" = yes ] && [ "$BIND" = no ] && add_base_opt "GENERIC_PLAN"
-[ "$SERIALIZE" = yes ] && add_base_opt "SERIALIZE TEXT"
-[ "$MEMORY" = yes ] && add_base_opt "MEMORY"
-[ "$SUMMARY" = yes ] && add_base_opt "SUMMARY"
+[ "$SETTINGS" = yes ] && add_base_opt "SETTINGS TRUE" || add_base_opt "SETTINGS FALSE"
+if [ "$ANALYZE" = yes ]; then
+    [ "$BUFFERS" = yes ] && add_base_opt "BUFFERS TRUE" || add_base_opt "BUFFERS FALSE"
+    if [ "$SERVER_VERSION_NUM" -ge 130000 ]; then
+        [ "$WAL" = yes ] && add_base_opt "WAL TRUE" || add_base_opt "WAL FALSE"
+    fi
+    [ "$TIMING" = yes ] && add_base_opt "TIMING TRUE" || add_base_opt "TIMING FALSE"
+    if [ "$SERVER_VERSION_NUM" -ge 170000 ]; then
+        [ "$SERIALIZE" = yes ] && add_base_opt "SERIALIZE TEXT" || add_base_opt "SERIALIZE NONE"
+    fi
+fi
+[ "$GENERIC_PLAN" = yes ] && [ "$BIND" = no ] && add_base_opt "GENERIC_PLAN TRUE"
+if [ "$SERVER_VERSION_NUM" -ge 170000 ]; then
+    [ "$MEMORY" = yes ] && add_base_opt "MEMORY TRUE" || add_base_opt "MEMORY FALSE"
+fi
+[ "$SUMMARY" = yes ] && add_base_opt "SUMMARY TRUE" || add_base_opt "SUMMARY FALSE"
 
 actual_json_opts="$base_plan_opts, FORMAT JSON"
 
@@ -842,12 +849,14 @@ planned_base_opts=""
 add_planned_opt() {
     [ -z "$planned_base_opts" ] && planned_base_opts="$1" || planned_base_opts="$planned_base_opts, $1"
 }
-[ "$VERBOSE" = yes ] && add_planned_opt "VERBOSE"
+[ "$VERBOSE" = yes ] && add_planned_opt "VERBOSE TRUE" || add_planned_opt "VERBOSE FALSE"
 [ "$COSTS" = yes ] && add_planned_opt "COSTS TRUE" || add_planned_opt "COSTS FALSE"
-[ "$SETTINGS" = yes ] && add_planned_opt "SETTINGS"
-[ "$GENERIC_PLAN" = yes ] && [ "$BIND" = no ] && add_planned_opt "GENERIC_PLAN"
-[ "$MEMORY" = yes ] && add_planned_opt "MEMORY"
-[ "$SUMMARY" = yes ] && add_planned_opt "SUMMARY"
+[ "$SETTINGS" = yes ] && add_planned_opt "SETTINGS TRUE" || add_planned_opt "SETTINGS FALSE"
+[ "$GENERIC_PLAN" = yes ] && [ "$BIND" = no ] && add_planned_opt "GENERIC_PLAN TRUE"
+if [ "$SERVER_VERSION_NUM" -ge 170000 ]; then
+    [ "$MEMORY" = yes ] && add_planned_opt "MEMORY TRUE" || add_planned_opt "MEMORY FALSE"
+fi
+[ "$SUMMARY" = yes ] && add_planned_opt "SUMMARY TRUE" || add_planned_opt "SUMMARY FALSE"
 planned_raw_opts="$planned_base_opts, FORMAT $FORMAT"
 
 precheck_json="$work_dir/precheck-plan.json"
@@ -927,9 +936,9 @@ emit_plan() {
     fi
 }
 
-precheck_options='VERBOSE, COSTS FALSE, FORMAT JSON'
+precheck_options='VERBOSE TRUE, COSTS FALSE, FORMAT JSON'
 if [ "$GENERIC_PLAN" = yes ] && [ "$BIND" = no ]; then
-    precheck_options="$precheck_options, GENERIC_PLAN"
+    precheck_options="$precheck_options, GENERIC_PLAN TRUE"
 fi
 emit_plan "$precheck_options" | run_psql -X -qAt -v ON_ERROR_STOP=1 > "$precheck_json" 2>"$plan_error" || {
     cat "$plan_error" >&2
@@ -943,20 +952,15 @@ emit_plan "$precheck_options" | run_psql -X -qAt -v ON_ERROR_STOP=1 > "$precheck
 }
 DML_OPERATION=$(sed -n '1p' "$dml_file")
 
-DML_ANALYZE=no
 if [ "$ANALYZE" = yes ]; then
     echo
     echo "WARNING: EXPLAIN ANALYZE executes the statement."
-
+    echo "Safety     : BEGIN -> EXPLAIN ANALYZE FORMAT JSON -> ROLLBACK"
     if [ -n "$DML_OPERATION" ]; then
-        DML_ANALYZE=yes
-        echo "DML detected : $DML_OPERATION"
-        echo "Execution    : BEGIN -> EXPLAIN ANALYZE FORMAT JSON -> ROLLBACK"
-        echo "Table row changes are rolled back automatically."
-        echo "Sequence increments, external functions, or other non-transactional side effects may remain."
-    else
-        echo "Read-only/non-DML plan detected: no automatic ROLLBACK wrapper."
+        echo "DML detected: $DML_OPERATION"
     fi
+    echo "Transactional table/DDL changes are rolled back."
+    echo "Sequence increments, external functions, or other non-transactional side effects may remain."
 
     printf 'Type EXECUTE to continue: ' >&2
     IFS= read -r confirm
@@ -1152,7 +1156,7 @@ if [ "$ANALYZE" = yes ] && [ -s "$rel_file" ]; then
     snapshot_stats "$table_before" "$index_before"
 fi
 
-if [ "$DML_ANALYZE" = yes ]; then
+if [ "$ANALYZE" = yes ]; then
     {
         printf 'BEGIN;\n'
         emit_plan "$actual_json_opts"
@@ -1166,10 +1170,8 @@ section "Execution Plan" | tee -a "$RESULT_FILE"
 {
     echo "Tree source : PostgreSQL FORMAT JSON"
     echo "Options     : EXPLAIN ($actual_json_opts)"
-    if [ "$DML_ANALYZE" = yes ]; then
-        echo "DML safety  : BEGIN -> EXPLAIN ANALYZE FORMAT JSON -> ROLLBACK"
-    fi
     if [ "$ANALYZE" = yes ]; then
+        echo "Safety      : BEGIN -> EXPLAIN ANALYZE FORMAT JSON -> ROLLBACK"
         echo "Execution   : target statement executed exactly once"
     else
         echo "Execution   : target statement not executed"
@@ -1373,62 +1375,77 @@ ORDER BY a.attnum;
 '
 
 SQL_COLUMN_STATS_SUMMARY='
-SELECT attname,
-       null_frac,
-       avg_width,
-       n_distinct,
-       correlation,
-       cardinality(most_common_vals) AS mcv_count,
-       cardinality(histogram_bounds) AS histogram_count,
+WITH target AS (
+  SELECT n.nspname AS schemaname, c.relname AS tablename
+  FROM pg_class c
+  JOIN pg_namespace n ON n.oid=c.relnamespace
+  WHERE c.oid=:'\''rel'\''::regclass
+)
+SELECT s.attname,
+       s.null_frac,
+       s.avg_width,
+       s.n_distinct,
+       s.correlation,
+       cardinality(s.most_common_vals) AS mcv_count,
+       cardinality(s.histogram_bounds) AS histogram_count,
        CASE
-         WHEN most_common_vals IS NULL THEN NULL
-         WHEN length(most_common_vals::text) <= 60 THEN most_common_vals::text
-         ELSE left(most_common_vals::text,57) || '\''...'\''
+         WHEN s.most_common_vals IS NULL THEN NULL
+         WHEN length(s.most_common_vals::text) <= 60 THEN s.most_common_vals::text
+         ELSE left(s.most_common_vals::text,57) || '\''...'\''
        END AS mcv_sample,
        CASE
-         WHEN most_common_freqs IS NULL THEN NULL
-         WHEN length(most_common_freqs::text) <= 60 THEN most_common_freqs::text
-         ELSE left(most_common_freqs::text,57) || '\''...'\''
+         WHEN s.most_common_freqs IS NULL THEN NULL
+         WHEN length(s.most_common_freqs::text) <= 60 THEN s.most_common_freqs::text
+         ELSE left(s.most_common_freqs::text,57) || '\''...'\''
        END AS mcv_freq_sample,
        CASE
-         WHEN histogram_bounds IS NULL THEN NULL
-         WHEN length(histogram_bounds::text) <= 60 THEN histogram_bounds::text
-         ELSE left(histogram_bounds::text,57) || '\''...'\''
+         WHEN s.histogram_bounds IS NULL THEN NULL
+         WHEN length(s.histogram_bounds::text) <= 60 THEN s.histogram_bounds::text
+         ELSE left(s.histogram_bounds::text,57) || '\''...'\''
        END AS histogram_sample
-FROM pg_stats
-WHERE schemaname = split_part(:'\''rel'\'','\''.'\'',1)
-  AND tablename  = split_part(:'\''rel'\'','\''.'\'',2)
-ORDER BY attname;
+FROM pg_stats s
+JOIN target t USING (schemaname,tablename)
+ORDER BY s.attname;
 '
 
 SQL_COLUMN_STATS_DETAIL='
-SELECT attname,
-       null_frac,
-       avg_width,
-       n_distinct,
-       most_common_vals,
-       most_common_freqs,
-       histogram_bounds,
-       correlation
-FROM pg_stats
-WHERE schemaname = split_part(:'\''rel'\'','\''.'\'',1)
-  AND tablename  = split_part(:'\''rel'\'','\''.'\'',2)
-ORDER BY attname;
+WITH target AS (
+  SELECT n.nspname AS schemaname, c.relname AS tablename
+  FROM pg_class c
+  JOIN pg_namespace n ON n.oid=c.relnamespace
+  WHERE c.oid=:'\''rel'\''::regclass
+)
+SELECT s.attname,
+       s.null_frac,
+       s.avg_width,
+       s.n_distinct,
+       s.most_common_vals,
+       s.most_common_freqs,
+       s.histogram_bounds,
+       s.correlation
+FROM pg_stats s
+JOIN target t USING (schemaname,tablename)
+ORDER BY s.attname;
 '
 
 SQL_EXT_STATS='
-SELECT schemaname,
-       tablename,
-       statistics_name,
-       attnames,
-       exprs,
-       kinds,
-       n_distinct,
-       dependencies
-FROM pg_stats_ext
-WHERE schemaname = split_part(:'\''rel'\'','\''.'\'',1)
-  AND tablename  = split_part(:'\''rel'\'','\''.'\'',2)
-ORDER BY statistics_name;
+WITH target AS (
+  SELECT n.nspname AS schemaname, c.relname AS tablename
+  FROM pg_class c
+  JOIN pg_namespace n ON n.oid=c.relnamespace
+  WHERE c.oid=:'\''rel'\''::regclass
+)
+SELECT s.schemaname,
+       s.tablename,
+       s.statistics_name,
+       s.attnames,
+       s.exprs,
+       s.kinds,
+       s.n_distinct,
+       s.dependencies
+FROM pg_stats_ext s
+JOIN target t USING (schemaname,tablename)
+ORDER BY s.statistics_name;
 '
 
 SQL_INDEX_INFO='
