@@ -8,7 +8,7 @@ PostgreSQL SQL 실행계획과 Planner 관련 정보를 한 번에 확인하기 
 
 지원 범위: PostgreSQL 12 ~ 18
 
-현재 스크립트 버전: `v1.1.7`
+현재 스크립트 버전: `v1.1.8`
 
 실행 파일:
 
@@ -19,8 +19,11 @@ explain.sh
 ## 주요 목적
 
 - SQL 실행계획 확인
-- `FORMAT=TEXT` 실행계획의 간략 Tree 출력
-- Parent / Child 구조와 `never executed` Node 식별 보조
+- `FORMAT=TEXT` 실행계획의 Structural Tree 출력
+- Plan Node Parent / Child 구조 보존
+- `InitPlan`, `SubPlan`, `CTE` 구조 그룹 보존
+- `never executed` Node 식별 보조
+- 구조 해석 실패 시 추측 출력 중단 및 Raw Plan 우선 처리
 - 원본 PostgreSQL 실행계획 보존
 - Planner Cost 및 설정값 확인
 - 실행계획에 사용된 Table 자동 식별
@@ -49,7 +52,7 @@ sh explain.sh /path/to/test.sql
 
 ## Yes / No 입력 처리
 
-`yes/no` 입력 항목은 대소문자를 구분하지 않습니다.
+`yes/no` 입력 항목의 대소문자 미구분 처리.
 
 ```text
 yes
@@ -62,9 +65,9 @@ NO
 No
 ```
 
-모두 정상 입력으로 처리합니다.
+모두 정상 입력 처리.
 
-`yes`, `no` 이외의 값을 입력한 경우 스크립트를 종료하지 않고 동일 질문을 다시 출력합니다.
+`yes`, `no` 이외의 값 입력 시 스크립트 종료 없이 동일 질문 재입력 처리.
 
 예:
 
@@ -73,6 +76,40 @@ Use ANALYZE? yes/no [no]: yse
 ERROR: enter yes or no. Please retry.
 Use ANALYZE? yes/no [no]: YES
 ```
+
+## Execution Plan Tree 정확성 기준
+
+PostgreSQL 공식 문서의 `EXPLAIN` 출력 구조 기준 적용.
+
+공식 문서 기준 핵심 사항:
+
+- Query Plan의 Plan Node Tree 구조
+- 각 Plan Node의 한 줄 Summary 출력
+- Node 속성의 해당 Node 하위 들여쓰기 출력
+- 하위 Plan Node의 `->` 표시 및 추가 들여쓰기 출력
+- `SubPlan`, `InitPlan`의 별도 하위 구조 표시
+- 프로그램 분석 목적의 JSON/XML/YAML 사용 권장
+
+참고 공식 문서:
+
+- PostgreSQL 18 `Using EXPLAIN`: https://www.postgresql.org/docs/18/using-explain.html
+- PostgreSQL 18 `EXPLAIN`: https://www.postgresql.org/docs/18/sql-explain.html
+- PostgreSQL 12 `EXPLAIN`: https://www.postgresql.org/docs/12/sql-explain.html
+
+`v1.1.8` Tree는 TEXT Plan의 실제 들여쓰기와 `->` Node 관계를 기준으로 Parent / Child 관계 계산.
+
+`InitPlan`, `SubPlan`, `CTE` Label의 구조 Group 보존.
+
+구조 Parent를 확정할 수 없는 경우 임의 추정 금지 및 Tree 생성 중단 처리.
+
+```text
+WARNING: Structural Tree generation was stopped instead of guessing an unresolved hierarchy.
+Use Execution Plan (Raw) as the authoritative output for this plan.
+```
+
+Tree는 학습 및 빠른 구조 확인용 보조 출력이며 PostgreSQL 원본 `Execution Plan (Raw)`의 항상 보존 처리.
+
+`EXPLAIN ANALYZE` Tree 생성을 위한 SQL 재실행 금지.
 
 ## 접속 정보 확인
 
@@ -157,10 +194,10 @@ Transaction 외부 Side Effect
 
 선택한 EXPLAIN 옵션에 따라 실행계획을 출력합니다.
 
-`FORMAT=TEXT` 선택 시 동일한 실행 결과를 기준으로 간략 Tree와 PostgreSQL 원본 Plan을 함께 출력합니다.
+`FORMAT=TEXT` 선택 시 동일한 실행 결과를 기준으로 Structural Tree와 PostgreSQL 원본 Plan을 함께 출력합니다.
 
 ```text
-Execution Plan Tree (Simplified)
+Execution Plan Tree (Structural)
         ↓
 Execution Plan (Raw)
 ```
@@ -173,10 +210,13 @@ Tree 출력을 위해 대상 SQL이나 `EXPLAIN ANALYZE`를 다시 실행하지 
 
 ```text
 Sort  (cost=6.62..6.62 rows=1 width=360) (actual time=1.725..1.728 rows=0 loops=1)
-   |-- Nested Loop Left Join  (cost=4.38..6.61 rows=1 width=360) (actual time=1.717..1.719 rows=0 loops=1)
-         |-- Hash Join  (cost=3.98..5.36 rows=1 width=232) (actual time=1.717..1.719 rows=0 loops=1)
-               |-- Function Scan on pg_catalog.pg_stat_get_progress_info s_1
-               |-- Hash  [NEVER EXECUTED]
+└─ Nested Loop Left Join  (cost=4.38..6.61 rows=1 width=360) (actual time=1.717..1.719 rows=0 loops=1)
+   ├─ Nested Loop Left Join  (...)
+   │  ├─ Hash Join  (...)
+   │  │  ├─ Function Scan on pg_catalog.pg_stat_get_progress_info s_1 (... rows=0 loops=1)
+   │  │  └─ Hash (...) [NEVER EXECUTED]
+   │  └─ Index Scan using pg_class_oid_index on pg_catalog.pg_class c [NEVER EXECUTED]
+   └─ Index Scan using pg_namespace_oid_index on pg_catalog.pg_namespace n [NEVER EXECUTED]
 ```
 
 원본 Plan의 `(never executed)`는 Tree에서 다음과 같이 표시합니다.
@@ -195,7 +235,44 @@ Hash Join
 └─ Right Branch : [NEVER EXECUTED]
 ```
 
-`FORMAT=JSON`, `YAML`, `XML` 선택 시 해당 Raw Format은 그대로 유지하며 간략 Tree는 생성하지 않습니다.
+공식 문서의 SubPlan 형태도 계층 유지 대상입니다.
+
+```text
+Seq Scan on public.tenk1 t
+└─ SubPlan 1
+   └─ Seq Scan on public.onek o
+```
+
+Tree에 함께 표시하는 주요 Node 속성:
+
+```text
+Index Cond
+Recheck Cond
+Filter
+Hash Cond
+Merge Cond
+Join Filter
+One-Time Filter
+Heap Fetches
+Heap Blocks
+Sort Key
+Sort Method
+Group Key
+Rows Removed by Filter
+Rows Removed by Join Filter
+Rows Removed by Index Recheck
+Function Call
+Workers Planned / Launched
+Buffers
+I/O Timings
+WAL
+Hash Bucket / Batch / Memory 정보
+Memoize Cache 정보
+```
+
+Tree에 생략된 세부 정보는 항상 `Execution Plan (Raw)`에서 확인합니다.
+
+`FORMAT=JSON`, `YAML`, `XML` 선택 시 해당 Raw Format은 그대로 유지하며 Structural Tree는 생성하지 않습니다.
 
 주요 확인 항목:
 
@@ -231,11 +308,11 @@ Plan Base Relation 자동 추출
         ↓
 Table / Index Before Snapshot
         ↓
-EXPLAIN ANALYZE 실행
+EXPLAIN ANALYZE 실제 실행
         ↓
 DML이면 ROLLBACK
         ↓
-Execution Plan Tree 생성
+Execution Plan Structural Tree 생성
         ↓
 원본 Execution Plan 출력
         ↓
