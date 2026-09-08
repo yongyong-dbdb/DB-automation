@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """PostgreSQL EXPLAIN (FORMAT JSON) structural renderer.
 
-This helper intentionally does not infer plan semantics.  It follows only the
+This helper intentionally does not infer plan semantics. It follows only the
 JSON structure returned by PostgreSQL: the top-level Plan object and each
-node's Plans array.  Node properties are emitted with their original JSON key
+node's Plans array. Node properties are emitted with their original JSON key
 names and values.
 """
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -60,7 +61,7 @@ def validate_node(node, path="Plan"):
 def render_tree(document, root, out):
     validate_node(root)
 
-    def walk(node, prefix="", connector="", path="Plan"):
+    def walk(node, prefix="", connector=""):
         out.write(f"{prefix}{connector}Node Type: {node['Node Type']}\n")
 
         detail_prefix = prefix + ("   " if connector == "" or connector.startswith("└") else "│  ")
@@ -77,7 +78,7 @@ def render_tree(document, root, out):
                 child_prefix = ""
             else:
                 child_prefix = prefix + ("   " if connector.startswith("└") else "│  ")
-            walk(child, child_prefix, child_connector, f"{path}.Plans[{idx}]")
+            walk(child, child_prefix, child_connector)
 
     walk(root)
 
@@ -90,6 +91,19 @@ def render_tree(document, root, out):
 
 def quote_ident(value: str) -> str:
     return '"' + value.replace('"', '""') + '"'
+
+
+def relation_reference(schema: str, relation: str) -> str:
+    """Return a regclass-safe relation reference.
+
+    Existing diagnostics historically consume ordinary schema.table strings,
+    so simple lower-case PostgreSQL identifiers remain unquoted. Identifiers
+    requiring quoting are quoted without changing their value.
+    """
+    simple_ident = re.compile(r"^[a-z_][a-z0-9_$]*$")
+    schema_ref = schema if simple_ident.match(schema) else quote_ident(schema)
+    relation_ref = relation if simple_ident.match(relation) else quote_ident(relation)
+    return f"{schema_ref}.{relation_ref}"
 
 
 def walk_nodes(root):
@@ -111,7 +125,7 @@ def write_metadata(root, relations_path: str, dml_path: str):
         schema = node.get("Schema")
         relation = node.get("Relation Name")
         if isinstance(schema, str) and isinstance(relation, str):
-            relations.add(f"{quote_ident(schema)}.{quote_ident(relation)}")
+            relations.add(relation_reference(schema, relation))
 
         operation = node.get("Operation")
         if operation in {"Insert", "Update", "Delete", "Merge"} and operation not in operations:
@@ -134,24 +148,13 @@ def count_nodes(root):
 
 def self_test():
     fixtures = [
-        {
-            "Plan": {
-                "Node Type": "Seq Scan",
-                "Relation Name": "t",
-                "Schema": "public",
-                "Plan Rows": 10,
-            }
-        },
+        {"Plan": {"Node Type": "Seq Scan", "Relation Name": "t", "Schema": "public", "Plan Rows": 10}},
         {
             "Plan": {
                 "Node Type": "Nested Loop",
                 "Plans": [
                     {"Node Type": "Seq Scan", "Parent Relationship": "Outer"},
-                    {
-                        "Node Type": "Index Scan",
-                        "Parent Relationship": "Inner",
-                        "Index Name": "t_pkey",
-                    },
+                    {"Node Type": "Index Scan", "Parent Relationship": "Inner", "Index Name": "t_pkey"},
                 ],
             }
         },
@@ -187,13 +190,7 @@ def self_test():
                 ],
             }
         },
-        {
-            "Plan": {
-                "Node Type": "ModifyTable",
-                "Operation": "Update",
-                "Plans": [{"Node Type": "Seq Scan"}],
-            }
-        },
+        {"Plan": {"Node Type": "ModifyTable", "Operation": "Update", "Plans": [{"Node Type": "Seq Scan"}]}},
         {
             "Plan": {
                 "Node Type": "Result",
@@ -251,11 +248,14 @@ def self_test():
         validate_node(root)
         actual = count_nodes(root)
         if actual != expected:
-            raise PlanFormatError(
-                f"self-test fixture {idx}: expected {expected} nodes, got {actual}"
-            )
+            raise PlanFormatError(f"self-test fixture {idx}: expected {expected} nodes, got {actual}")
 
-    print(f"plan_tree.py self-test passed: {len(fixtures)} fixtures")
+    if relation_reference("public", "orders") != "public.orders":
+        raise PlanFormatError("self-test: ordinary relation formatting failed")
+    if relation_reference("Mixed Schema", "Order.Table") != '"Mixed Schema"."Order.Table"':
+        raise PlanFormatError("self-test: quoted relation formatting failed")
+
+    print(f"plan_tree.py self-test passed: {len(fixtures)} structural fixtures")
 
 
 def main():
