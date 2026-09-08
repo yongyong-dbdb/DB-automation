@@ -1,7 +1,7 @@
 #!/bin/sh
 set -u
 
-SCRIPT_VERSION="1.1.6"
+SCRIPT_VERSION="1.1.7"
 SCRIPT_DIR=$(CDPATH='' cd "$(dirname "$0")" && pwd)
 DEFAULT_OUTPUT_DIR="$SCRIPT_DIR/results"
 
@@ -208,16 +208,28 @@ esac
 ask() {
     prompt=$1
     default=$2
-    printf '%s [%s]: ' "$prompt" "$default" >&2
-    IFS= read -r ans
-    [ -n "$ans" ] || ans=$default
-    case $ans in
-        yes|no) printf '%s' "$ans" ;;
-        *)
-            echo "ERROR: yes/no only" >&2
-            exit 1
-            ;;
-    esac
+
+    while :
+    do
+        printf '%s [%s]: ' "$prompt" "$default" >&2
+        IFS= read -r ans || {
+            echo "ERROR: input stream closed." >&2
+            return 1
+        }
+
+        [ -n "$ans" ] || ans=$default
+        ans=$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+
+        case $ans in
+            yes|no)
+                printf '%s' "$ans"
+                return 0
+                ;;
+            *)
+                echo "ERROR: enter yes or no. Please retry." >&2
+                ;;
+        esac
+    done
 }
 
 section() {
@@ -782,6 +794,7 @@ table_after="$work_dir/table_after.txt"
 index_before="$work_dir/index_before.txt"
 index_after="$work_dir/index_after.txt"
 plan_output="$work_dir/plan-output.txt"
+plan_tree_output="$work_dir/plan-tree-output.txt"
 report_output="$work_dir/report-output.txt"
 PARTITION_DIAG_LIMIT=${PARTITION_DIAG_LIMIT:-3}
 case $PARTITION_DIAG_LIMIT in
@@ -843,6 +856,85 @@ emit_plan() {
         cat "$SQL_FILE"
         printf '\n'
     fi
+}
+
+print_plan_tree() {
+    input_file=$1
+
+    awk '
+        function mark_never(s) {
+            gsub(/\(never executed\)/, "[NEVER EXECUTED]", s)
+            return s
+        }
+
+        BEGIN {
+            in_plan=0
+            root_done=0
+            node_count=0
+        }
+
+        {
+            raw=$0
+            text=raw
+            sub(/^[[:space:]]+/, "", text)
+
+            if (!in_plan) {
+                if (text == "QUERY PLAN") {
+                    in_plan=1
+                }
+                next
+            }
+
+            if (!root_done && text ~ /^-+$/) {
+                next
+            }
+
+            if (text ~ /^\([0-9]+ rows?\)$/) {
+                exit
+            }
+
+            if (text == "") {
+                next
+            }
+
+            if (!root_done) {
+                if (text ~ /^(Planning Time|Execution Time):/) {
+                    next
+                }
+                print mark_never(text)
+                root_done=1
+                node_count++
+                next
+            }
+
+            if (text ~ /^->/) {
+                match(raw, /^[[:space:]]*/)
+                indent=substr(raw, 1, RLENGTH)
+                sub(/^->[[:space:]]*/, "", text)
+                printf "%s|-- %s\n", indent, mark_never(text)
+                node_count++
+                next
+            }
+
+            if (text ~ /^(Index Cond|Recheck Cond|Filter|Hash Cond|Merge Cond|Join Filter|One-Time Filter|Heap Fetches|Sort Method|Rows Removed by Filter|Rows Removed by Join Filter|Rows Removed by Index Recheck|Batches|Memory Usage|Disk Usage):/) {
+                match(raw, /^[[:space:]]*/)
+                indent=substr(raw, 1, RLENGTH)
+                printf "%s    * %s\n", indent, text
+                next
+            }
+
+            if (text ~ /^(Planning Time|Execution Time):/) {
+                printf "    * %s\n", text
+                next
+            }
+        }
+
+        END {
+            if (node_count == 0) {
+                print "(simplified tree parsing unavailable)"
+            }
+        }
+    ' "$input_file"
 }
 
 json_options='VERBOSE, COSTS FALSE, FORMAT JSON'
@@ -1109,6 +1201,21 @@ section "Execution Plan" | tee -a "$RESULT_FILE"
 } | tee -a "$RESULT_FILE"
 
 if run_psql -X -q -P pager=off -v ON_ERROR_STOP=1 -f "$tmp" > "$plan_output" 2>&1; then
+    if [ "$FORMAT" = TEXT ]; then
+        print_plan_tree "$plan_output" > "$plan_tree_output"
+        section "Execution Plan Tree (Simplified)" | tee -a "$RESULT_FILE"
+        cat "$plan_tree_output" | tee -a "$RESULT_FILE"
+        {
+            echo
+            echo "NOTE: The tree is derived from the captured TEXT plan and does not execute the SQL again."
+            echo "      [NEVER EXECUTED] means the node was planned but not run during this execution."
+        } | tee -a "$RESULT_FILE"
+    else
+        section "Execution Plan Tree (Simplified)" | tee -a "$RESULT_FILE"
+        echo "Tree summary is available when FORMAT=TEXT. Raw $FORMAT output is preserved below." | tee -a "$RESULT_FILE"
+    fi
+
+    section "Execution Plan (Raw)" | tee -a "$RESULT_FILE"
     cat "$plan_output" | tee -a "$RESULT_FILE"
 else
     plan_status=$?
