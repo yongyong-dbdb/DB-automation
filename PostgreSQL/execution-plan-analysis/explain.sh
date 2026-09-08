@@ -1,11 +1,13 @@
 #!/bin/sh
 set -u
 
-SCRIPT_VERSION="1.1.8"
+SCRIPT_VERSION="1.1.9"
 SCRIPT_DIR=$(CDPATH='' cd "$(dirname "$0")" && pwd)
 DEFAULT_OUTPUT_DIR="$SCRIPT_DIR/results"
+PLAN_TREE_PY="$SCRIPT_DIR/plan_tree.py"
 
 PSQL_BIN=${PSQL_BIN:-}
+PYTHON3_BIN=${PYTHON3_BIN:-}
 
 if [ -z "$PSQL_BIN" ]; then
     if command -v psql >/dev/null 2>&1; then
@@ -20,6 +22,34 @@ fi
 
 [ -x "$PSQL_BIN" ] || {
     echo "ERROR: psql not found: $PSQL_BIN" >&2
+    exit 1
+}
+
+if [ -z "$PYTHON3_BIN" ]; then
+    if command -v python3 >/dev/null 2>&1; then
+        PYTHON3_BIN=$(command -v python3)
+    elif [ -x /usr/libexec/platform-python ]; then
+        PYTHON3_BIN=/usr/libexec/platform-python
+    elif command -v python >/dev/null 2>&1 && command -v python >/dev/null 2>&1 && \
+         "$(command -v python)" -c 'import sys; raise SystemExit(0 if sys.version_info[0] >= 3 else 1)' >/dev/null 2>&1; then
+        PYTHON3_BIN=$(command -v python)
+    fi
+fi
+
+[ -n "$PYTHON3_BIN" ] && [ -x "$PYTHON3_BIN" ] || {
+    echo "ERROR: Python 3 is required for exact EXPLAIN JSON parsing." >&2
+    echo "       Set PYTHON3_BIN to a Python 3 executable." >&2
+    exit 1
+}
+
+[ -r "$PLAN_TREE_PY" ] || {
+    echo "ERROR: JSON plan parser not found: $PLAN_TREE_PY" >&2
+    echo "       Keep plan_tree.py in the same directory as explain.sh." >&2
+    exit 1
+}
+
+"$PYTHON3_BIN" "$PLAN_TREE_PY" self-test >/dev/null 2>&1 || {
+    echo "ERROR: plan_tree.py self-test failed." >&2
     exit 1
 }
 
@@ -82,6 +112,7 @@ echo
 echo "Connection"
 echo "  version  : $SCRIPT_VERSION"
 echo "  psql     : $PSQL_BIN"
+echo "  python3  : $PYTHON3_BIN"
 echo "  host     : ${PGHOST:-default/local socket}"
 echo "  port     : $PGPORT"
 echo "  user     : $PGUSER"
@@ -228,6 +259,22 @@ ask() {
             *)
                 echo "ERROR: enter yes or no. Please retry." >&2
                 ;;
+        esac
+    done
+}
+
+ask_bind_plan_mode() {
+    while :
+    do
+        printf 'Prepared plan mode (AUTO/CUSTOM/GENERIC) [AUTO]: ' >&2
+        IFS= read -r ans || return 1
+        [ -n "$ans" ] || ans=AUTO
+        ans=$(printf '%s' "$ans" | tr '[:lower:]' '[:upper:]' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+        case $ans in
+            AUTO) printf '%s' auto; return 0 ;;
+            CUSTOM) printf '%s' force_custom_plan; return 0 ;;
+            GENERIC) printf '%s' force_generic_plan; return 0 ;;
+            *) echo "ERROR: enter AUTO, CUSTOM, or GENERIC. Please retry." >&2 ;;
         esac
     done
 }
@@ -595,6 +642,8 @@ prepare_file="$work_dir/prepare.sql"
 execute_file="$work_dir/execute.sql"
 bind_values_file="$work_dir/bind-values-used.txt"
 : > "$bind_values_file"
+BIND_PLAN_MODE=auto
+
 if [ "$BIND" = yes ]; then
     printf 'Parameter types, comma-separated [auto infer]: ' >&2
     IFS= read -r bind_types || exit 1
@@ -699,6 +748,9 @@ if [ "$BIND" = yes ]; then
         echo
     fi
 
+    echo "Prepared statement plan mode follows PostgreSQL plan_cache_mode semantics."
+    BIND_PLAN_MODE=$(ask_bind_plan_mode) || exit 1
+
     unset bind_value bind_types bind_display_value
 fi
 
@@ -740,7 +792,7 @@ if [ "$ANALYZE" = yes ]; then
         SERIALIZE=$(ask "Use SERIALIZE TEXT? yes/no" no)
     fi
 else
-    if [ "$BIND" = yes ] || [ "$SERVER_VERSION_NUM" -ge 160000 ]; then
+    if [ "$BIND" = no ] && [ "$SERVER_VERSION_NUM" -ge 160000 ]; then
         echo "GENERIC_PLAN : Parameter 값과 무관한 Generic Plan. ANALYZE와 동시 사용 불가."
         GENERIC_PLAN=$(ask "Use GENERIC_PLAN? yes/no" no)
     fi
@@ -754,9 +806,10 @@ fi
 echo "SUMMARY   : Planning/Execution 요약."
 SUMMARY=$(ask "Use SUMMARY? yes/no" yes)
 
-printf 'FORMAT (TEXT/JSON/YAML/XML) [TEXT]: ' >&2
+printf 'RAW FORMAT (TEXT/JSON/YAML/XML) [TEXT]: ' >&2
 IFS= read -r FORMAT
 [ -n "$FORMAT" ] || FORMAT=TEXT
+FORMAT=$(printf '%s' "$FORMAT" | tr '[:lower:]' '[:upper:]')
 case $FORMAT in
     TEXT|JSON|YAML|XML) ;;
     *)
@@ -765,27 +818,41 @@ case $FORMAT in
         ;;
 esac
 
-opts=""
-addopt() {
-    [ -z "$opts" ] && opts="$1" || opts="$opts, $1"
+base_plan_opts=""
+add_base_opt() {
+    [ -z "$base_plan_opts" ] && base_plan_opts="$1" || base_plan_opts="$base_plan_opts, $1"
 }
 
-[ "$ANALYZE" = yes ] && addopt "ANALYZE"
-[ "$VERBOSE" = yes ] && addopt "VERBOSE"
-[ "$COSTS" = yes ] && addopt "COSTS TRUE" || addopt "COSTS FALSE"
-[ "$SETTINGS" = yes ] && addopt "SETTINGS"
-[ "$BUFFERS" = yes ] && addopt "BUFFERS"
-[ "$WAL" = yes ] && addopt "WAL"
-[ "$TIMING" = yes ] && addopt "TIMING TRUE"
-[ "$ANALYZE" = yes ] && [ "$TIMING" = no ] && addopt "TIMING FALSE"
-[ "$GENERIC_PLAN" = yes ] && [ "$BIND" = no ] && addopt "GENERIC_PLAN"
-[ "$SERIALIZE" = yes ] && addopt "SERIALIZE TEXT"
-[ "$MEMORY" = yes ] && addopt "MEMORY"
-[ "$SUMMARY" = yes ] && addopt "SUMMARY"
-addopt "FORMAT $FORMAT"
+[ "$ANALYZE" = yes ] && add_base_opt "ANALYZE"
+[ "$VERBOSE" = yes ] && add_base_opt "VERBOSE"
+[ "$COSTS" = yes ] && add_base_opt "COSTS TRUE" || add_base_opt "COSTS FALSE"
+[ "$SETTINGS" = yes ] && add_base_opt "SETTINGS"
+[ "$BUFFERS" = yes ] && add_base_opt "BUFFERS"
+[ "$WAL" = yes ] && add_base_opt "WAL"
+[ "$TIMING" = yes ] && add_base_opt "TIMING TRUE"
+[ "$ANALYZE" = yes ] && [ "$TIMING" = no ] && add_base_opt "TIMING FALSE"
+[ "$GENERIC_PLAN" = yes ] && [ "$BIND" = no ] && add_base_opt "GENERIC_PLAN"
+[ "$SERIALIZE" = yes ] && add_base_opt "SERIALIZE TEXT"
+[ "$MEMORY" = yes ] && add_base_opt "MEMORY"
+[ "$SUMMARY" = yes ] && add_base_opt "SUMMARY"
 
-tmp="$work_dir/explain.sql"
-plan_json="$work_dir/plan.json"
+actual_json_opts="$base_plan_opts, FORMAT JSON"
+
+planned_base_opts=""
+add_planned_opt() {
+    [ -z "$planned_base_opts" ] && planned_base_opts="$1" || planned_base_opts="$planned_base_opts, $1"
+}
+[ "$VERBOSE" = yes ] && add_planned_opt "VERBOSE"
+[ "$COSTS" = yes ] && add_planned_opt "COSTS TRUE" || add_planned_opt "COSTS FALSE"
+[ "$SETTINGS" = yes ] && add_planned_opt "SETTINGS"
+[ "$GENERIC_PLAN" = yes ] && [ "$BIND" = no ] && add_planned_opt "GENERIC_PLAN"
+[ "$MEMORY" = yes ] && add_planned_opt "MEMORY"
+[ "$SUMMARY" = yes ] && add_planned_opt "SUMMARY"
+planned_raw_opts="$planned_base_opts, FORMAT $FORMAT"
+
+precheck_json="$work_dir/precheck-plan.json"
+actual_plan_json="$work_dir/actual-plan.json"
+dml_file="$work_dir/dml-operation.txt"
 rel_file="$work_dir/relations.txt"
 diag_map_file="$work_dir/diagnostic-relation-map.txt"
 diag_rel_file="$work_dir/diagnostic-relations.txt"
@@ -795,7 +862,10 @@ index_before="$work_dir/index_before.txt"
 index_after="$work_dir/index_after.txt"
 plan_output="$work_dir/plan-output.txt"
 plan_tree_output="$work_dir/plan-tree-output.txt"
+plan_error="$work_dir/plan-error.txt"
 report_output="$work_dir/report-output.txt"
+tmp="$work_dir/explain.sql"
+raw_tmp="$work_dir/raw-explain.sql"
 PARTITION_DIAG_LIMIT=${PARTITION_DIAG_LIMIT:-3}
 case $PARTITION_DIAG_LIMIT in
     ''|*[!0-9]*|0)
@@ -821,7 +891,10 @@ mkdir -p "$RESULT_DIR" || {
     echo "port=$PGPORT"
     echo "user=$PGUSER"
     echo "sql_file=$SQL_FILE"
-    echo "explain_options=$opts"
+    echo "tree_source=PostgreSQL EXPLAIN FORMAT JSON Plan/Plans structure"
+    echo "actual_json_options=$actual_json_opts"
+    echo "requested_raw_format=$FORMAT"
+    echo "bind_plan_cache_mode=$BIND_PLAN_MODE"
     echo "partition_diagnostic_limit=$PARTITION_DIAG_LIMIT"
     echo
 } > "$RESULT_FILE" || {
@@ -844,11 +917,7 @@ emit_plan() {
     plan_options=$1
     if [ "$BIND" = yes ]; then
         cat "$prepare_file"
-        if [ "$GENERIC_PLAN" = yes ]; then
-            printf 'SET plan_cache_mode = force_generic_plan;\n'
-        else
-            printf 'SET plan_cache_mode = force_custom_plan;\n'
-        fi
+        printf 'SET plan_cache_mode = %s;\n' "$BIND_PLAN_MODE"
         printf 'EXPLAIN (%s)\n' "$plan_options"
         cat "$execute_file"
     else
@@ -858,238 +927,21 @@ emit_plan() {
     fi
 }
 
-print_plan_tree() {
-    input_file=$1
-
-    awk '
-        function trim(s) {
-            sub(/^[[:space:]]+/, "", s)
-            sub(/[[:space:]]+$/, "", s)
-            return s
-        }
-
-        function leading_spaces(s) {
-            match(s, /^[[:space:]]*/)
-            return RLENGTH
-        }
-
-        function mark_never(s) {
-            gsub(/\(never executed\)/, "[NEVER EXECUTED]", s)
-            return s
-        }
-
-        function is_structure_label(s) {
-            return (s ~ /^InitPlan[[:space:]]+[0-9]+/ ||
-                    s ~ /^SubPlan[[:space:]]+[0-9]+/ ||
-                    s ~ /^CTE[[:space:]]+[^[:space:]]+/)
-        }
-
-        function is_detail_line(s) {
-            return (s ~ /^(Index Cond|Recheck Cond|Filter|Hash Cond|Merge Cond|Join Filter|One-Time Filter|Heap Fetches|Heap Blocks|Sort Key|Sort Method|Presorted Key|Group Key|Rows Removed by Filter|Rows Removed by Join Filter|Rows Removed by Index Recheck|Function Call|Workers Planned|Workers Launched|Disabled|Buckets|Batches|Memory Usage|Peak Memory Usage|Disk Usage|Cache Key|Cache Mode|Hits|Misses|Evictions|Overflows|Full-sort Groups|Pre-sorted Groups|Buffers|I\/O Timings|WAL):/)
-        }
-
-        function add_node(indent, text, kind,    i, p) {
-            node_count++
-            node_indent[node_count] = indent
-            node_text[node_count] = mark_never(text)
-            node_kind[node_count] = kind
-
-            if (node_count == 1) {
-                node_parent[node_count] = 0
-                return node_count
-            }
-
-            p = 0
-            for (i = node_count - 1; i >= 1; i--) {
-                if (node_indent[i] < indent) {
-                    p = i
-                    break
-                }
-            }
-
-            if (p == 0) {
-                parse_error = 1
-                parse_error_line = text
-            }
-
-            node_parent[node_count] = p
-            return node_count
-        }
-
-        function attach_detail(indent, text,    i, p, key) {
-            p = 0
-            for (i = node_count; i >= 1; i--) {
-                if (node_indent[i] < indent) {
-                    p = i
-                    break
-                }
-            }
-
-            if (p > 0) {
-                detail_count[p]++
-                key = p SUBSEP detail_count[p]
-                detail_text[key] = text
-            } else {
-                global_detail_count++
-                global_detail[global_detail_count] = text
-            }
-        }
-
-        function is_last_child(i,    p, j) {
-            p = node_parent[i]
-            for (j = i + 1; j <= node_count; j++) {
-                if (node_parent[j] == p) return 0
-            }
-            return 1
-        }
-
-        function ancestor_prefix(i, include_self,    p, n, j, a, prefix) {
-            n = 0
-            p = node_parent[i]
-            while (p > 0) {
-                chain[++n] = p
-                p = node_parent[p]
-            }
-
-            prefix = ""
-            for (j = n; j >= 1; j--) {
-                a = chain[j]
-                if (node_parent[a] == 0) continue
-                prefix = prefix (is_last_child(a) ? "   " : "│  ")
-            }
-
-            if (include_self && node_parent[i] != 0) {
-                prefix = prefix (is_last_child(i) ? "   " : "│  ")
-            }
-
-            return prefix
-        }
-
-        BEGIN {
-            in_plan = 0
-            root_done = 0
-            node_count = 0
-            parse_error = 0
-        }
-
-        {
-            raw = $0
-            text = trim(raw)
-
-            if (!in_plan) {
-                if (text == "QUERY PLAN") in_plan = 1
-                next
-            }
-
-            if (!root_done && text ~ /^-+$/) next
-
-            if (text ~ /^\([0-9]+ rows?\)$/) {
-                in_plan = 0
-                next
-            }
-
-            if (!in_plan || text == "") next
-
-            if (!root_done) {
-                if (text ~ /^(Planning Time|Execution Time):/) next
-                add_node(leading_spaces(raw), text, "plan")
-                root_done = 1
-                next
-            }
-
-            if (text ~ /^->/) {
-                indent = leading_spaces(raw)
-                sub(/^->[[:space:]]*/, "", text)
-                add_node(indent, text, "plan")
-                next
-            }
-
-            if (is_structure_label(text)) {
-                add_node(leading_spaces(raw), text, "group")
-                next
-            }
-
-            if (is_detail_line(text)) {
-                attach_detail(leading_spaces(raw), text)
-                next
-            }
-
-            if (text ~ /^(Planning Time|Execution Time):/) {
-                global_detail_count++
-                global_detail[global_detail_count] = text
-                next
-            }
-        }
-
-        END {
-            if (node_count == 0) {
-                print "(tree parsing unavailable: no PostgreSQL plan nodes found)"
-                exit 2
-            }
-
-            if (parse_error) {
-                print "(tree parsing unavailable: structural indentation could not be resolved)"
-                if (parse_error_line != "") print "unresolved: " parse_error_line
-                exit 2
-            }
-
-            for (i = 1; i <= node_count; i++) {
-                if (node_parent[i] == 0) {
-                    print node_text[i]
-                } else {
-                    print ancestor_prefix(i, 0) (is_last_child(i) ? "└─ " : "├─ ") node_text[i]
-                }
-
-                for (k = 1; k <= detail_count[i]; k++) {
-                    key = i SUBSEP k
-                    if (node_parent[i] == 0) {
-                        print "   · " detail_text[key]
-                    } else {
-                        print ancestor_prefix(i, 1) "· " detail_text[key]
-                    }
-                }
-            }
-
-            for (i = 1; i <= global_detail_count; i++) {
-                print "· " global_detail[i]
-            }
-        }
-    ' "$input_file"
-}
-
-json_options='VERBOSE, COSTS FALSE, FORMAT JSON'
+precheck_options='VERBOSE, COSTS FALSE, FORMAT JSON'
 if [ "$GENERIC_PLAN" = yes ] && [ "$BIND" = no ]; then
-    json_options="$json_options, GENERIC_PLAN"
+    precheck_options="$precheck_options, GENERIC_PLAN"
 fi
-emit_plan "$json_options" | run_psql -X -qAt -v ON_ERROR_STOP=1 > "$plan_json" || {
-    echo "ERROR: Could not generate JSON plan for relation extraction." >&2
+emit_plan "$precheck_options" | run_psql -X -qAt -v ON_ERROR_STOP=1 > "$precheck_json" 2>"$plan_error" || {
+    cat "$plan_error" >&2
+    echo "ERROR: Could not generate PostgreSQL JSON plan for precheck." >&2
     exit 1
 }
 
-awk '
-    /"Schema"[[:space:]]*:/ {
-        line=$0
-        sub(/^.*"Schema"[[:space:]]*:[[:space:]]*"/,"",line)
-        sub(/".*$/,"",line)
-        schema=line
-    }
-    /"Relation Name"[[:space:]]*:/ {
-        line=$0
-        sub(/^.*"Relation Name"[[:space:]]*:[[:space:]]*"/,"",line)
-        sub(/".*$/,"",line)
-        rel=line
-        if (schema != "" && rel != "") {
-            print schema "." rel
-        }
-    }
-' "$plan_json" | sort -u > "$rel_file"
-
-DML_OPERATION=$(awk -F'"' '
-    /"Operation"[[:space:]]*:[[:space:]]*"(Insert|Update|Delete|Merge)"/ {
-        print $4
-        exit
-    }
-' "$plan_json")
+"$PYTHON3_BIN" "$PLAN_TREE_PY" metadata "$precheck_json" "$rel_file" "$dml_file" || {
+    echo "ERROR: Could not parse PostgreSQL JSON precheck plan." >&2
+    exit 1
+}
+DML_OPERATION=$(sed -n '1p' "$dml_file")
 
 DML_ANALYZE=no
 if [ "$ANALYZE" = yes ]; then
@@ -1099,7 +951,7 @@ if [ "$ANALYZE" = yes ]; then
     if [ -n "$DML_OPERATION" ]; then
         DML_ANALYZE=yes
         echo "DML detected : $DML_OPERATION"
-        echo "Execution    : BEGIN -> EXPLAIN ANALYZE -> ROLLBACK"
+        echo "Execution    : BEGIN -> EXPLAIN ANALYZE FORMAT JSON -> ROLLBACK"
         echo "Table row changes are rolled back automatically."
         echo "Sequence increments, external functions, or other non-transactional side effects may remain."
     else
@@ -1303,56 +1155,74 @@ fi
 if [ "$DML_ANALYZE" = yes ]; then
     {
         printf 'BEGIN;\n'
-        emit_plan "$opts"
+        emit_plan "$actual_json_opts"
         printf '\nROLLBACK;\n'
     } > "$tmp"
 else
-    {
-        emit_plan "$opts"
-    } > "$tmp"
+    emit_plan "$actual_json_opts" > "$tmp"
 fi
 
 section "Execution Plan" | tee -a "$RESULT_FILE"
 {
-    echo "Generated: EXPLAIN ($opts)"
+    echo "Tree source : PostgreSQL FORMAT JSON"
+    echo "Options     : EXPLAIN ($actual_json_opts)"
     if [ "$DML_ANALYZE" = yes ]; then
-        echo "DML safety: BEGIN -> EXPLAIN ANALYZE -> ROLLBACK"
+        echo "DML safety  : BEGIN -> EXPLAIN ANALYZE FORMAT JSON -> ROLLBACK"
+    fi
+    if [ "$ANALYZE" = yes ]; then
+        echo "Execution   : target statement executed exactly once"
+    else
+        echo "Execution   : target statement not executed"
     fi
 } | tee -a "$RESULT_FILE"
 
-if run_psql -X -q -P pager=off -v ON_ERROR_STOP=1 -f "$tmp" > "$plan_output" 2>&1; then
-    if [ "$FORMAT" = TEXT ]; then
-        section "Execution Plan Tree (Structural)" | tee -a "$RESULT_FILE"
-        if print_plan_tree "$plan_output" > "$plan_tree_output"; then
-            cat "$plan_tree_output" | tee -a "$RESULT_FILE"
-            {
-                echo
-                echo "NOTE: Structural hierarchy is parsed from the captured PostgreSQL TEXT plan."
-                echo "      The SQL / EXPLAIN ANALYZE is not executed again for Tree output."
-                echo "      Plan nodes and InitPlan/SubPlan/CTE groups are preserved; selected node attributes are summarized."
-                echo "      Ancillary details remain available in Execution Plan (Raw)."
-                echo "      [NEVER EXECUTED] means the node was planned but not run during this execution."
-            } | tee -a "$RESULT_FILE"
-        else
-            tree_status=$?
-            cat "$plan_tree_output" | tee -a "$RESULT_FILE" >&2
-            {
-                echo "WARNING: Structural Tree generation was stopped instead of guessing an unresolved hierarchy."
-                echo "         Use Execution Plan (Raw) as the authoritative output for this plan."
-            } | tee -a "$RESULT_FILE" >&2
-        fi
-    else
-        section "Execution Plan Tree (Structural)" | tee -a "$RESULT_FILE"
-        echo "Structural Tree is available when FORMAT=TEXT. Raw $FORMAT output is preserved below." | tee -a "$RESULT_FILE"
-    fi
-
-    section "Execution Plan (Raw)" | tee -a "$RESULT_FILE"
-    cat "$plan_output" | tee -a "$RESULT_FILE"
+if run_psql -X -qAt -P pager=off -v ON_ERROR_STOP=1 -f "$tmp" > "$actual_plan_json" 2>"$plan_error"; then
+    :
 else
     plan_status=$?
-    cat "$plan_output" | tee -a "$RESULT_FILE" >&2
+    cat "$plan_error" | tee -a "$RESULT_FILE" >&2
     echo "Execution plan failed. Result file: $RESULT_FILE" >&2
     exit "$plan_status"
+fi
+
+if ! "$PYTHON3_BIN" "$PLAN_TREE_PY" tree "$actual_plan_json" > "$plan_tree_output" 2>"$plan_error"; then
+    cat "$plan_error" | tee -a "$RESULT_FILE" >&2
+    echo "ERROR: PostgreSQL JSON Tree parsing failed; no guessed Tree was produced." | tee -a "$RESULT_FILE" >&2
+    exit 1
+fi
+
+section "Execution Plan Tree (Official JSON Structure)" | tee -a "$RESULT_FILE"
+cat "$plan_tree_output" | tee -a "$RESULT_FILE"
+{
+    echo
+    echo "NOTE: Parent/child hierarchy follows only PostgreSQL JSON Plan -> Plans[]."
+    echo "      Node properties are printed with the JSON key names and values returned by PostgreSQL."
+    echo "      No Node Type-specific semantic inference is used by the Tree renderer."
+} | tee -a "$RESULT_FILE"
+
+if [ "$ANALYZE" = yes ]; then
+    section "Execution Plan Raw (JSON / Actual)" | tee -a "$RESULT_FILE"
+else
+    section "Execution Plan Raw (JSON / Planned)" | tee -a "$RESULT_FILE"
+fi
+cat "$actual_plan_json" | tee -a "$RESULT_FILE"
+
+if [ "$FORMAT" != JSON ]; then
+    emit_plan "$planned_raw_opts" > "$raw_tmp"
+    if run_psql -X -q -P pager=off -v ON_ERROR_STOP=1 -f "$raw_tmp" > "$plan_output" 2>"$plan_error"; then
+        section "Execution Plan Raw ($FORMAT / Planned Only)" | tee -a "$RESULT_FILE"
+        {
+            if [ "$ANALYZE" = yes ]; then
+                echo "NOTE: This $FORMAT plan is a non-ANALYZE planning snapshot and is not the executed Actual plan."
+                echo "      Actual execution statistics are authoritative in Raw JSON / Actual above."
+                echo
+            fi
+            cat "$plan_output"
+        } | tee -a "$RESULT_FILE"
+    else
+        cat "$plan_error" | tee -a "$RESULT_FILE" >&2
+        echo "WARNING: Requested non-executing $FORMAT Raw Plan could not be generated." | tee -a "$RESULT_FILE" >&2
+    fi
 fi
 
 if [ "$ANALYZE" = yes ] && [ -s "$rel_file" ]; then
@@ -1412,7 +1282,7 @@ fi
 if [ ! -s "$rel_file" ]; then
     {
         echo
-        echo "Referenced relation could not be identified automatically from the plan."
+        echo "Referenced relation could not be identified automatically from the PostgreSQL JSON Plan."
         echo "Final result file: $RESULT_FILE"
     } | tee -a "$RESULT_FILE"
     exit 0
