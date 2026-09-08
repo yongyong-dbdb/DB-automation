@@ -1,10 +1,9 @@
 #!/bin/sh
 set -u
 
-SCRIPT_VERSION="1.1.9"
+SCRIPT_VERSION="1.2.1"
 SCRIPT_DIR=$(CDPATH='' cd "$(dirname "$0")" && pwd)
 DEFAULT_OUTPUT_DIR="$SCRIPT_DIR/results"
-PLAN_TREE_PY="$SCRIPT_DIR/plan_tree.py"
 
 PSQL_BIN=${PSQL_BIN:-}
 PYTHON3_BIN=${PYTHON3_BIN:-}
@@ -39,17 +38,6 @@ fi
 [ -n "$PYTHON3_BIN" ] && [ -x "$PYTHON3_BIN" ] || {
     echo "ERROR: Python 3 is required for exact EXPLAIN JSON parsing." >&2
     echo "       Set PYTHON3_BIN to a Python 3 executable." >&2
-    exit 1
-}
-
-[ -r "$PLAN_TREE_PY" ] || {
-    echo "ERROR: JSON plan parser not found: $PLAN_TREE_PY" >&2
-    echo "       Keep plan_tree.py in the same directory as explain.sh." >&2
-    exit 1
-}
-
-"$PYTHON3_BIN" "$PLAN_TREE_PY" self-test >/dev/null 2>&1 || {
-    echo "ERROR: plan_tree.py self-test failed." >&2
     exit 1
 }
 
@@ -120,6 +108,206 @@ echo "  database : $PGDATABASE"
 echo
 
 work_dir=$(umask 077; mktemp -d "${TMPDIR:-/tmp}/pg_explain.XXXXXXXX") || exit 1
+PLAN_TREE_PY="$work_dir/plan_tree_embedded.py"
+cat > "$PLAN_TREE_PY" <<'PY'
+#!/usr/bin/env python3
+import argparse
+import json
+import re
+import sys
+from pathlib import Path
+
+RENDERER_VERSION = "1.2.1"
+
+class PlanFormatError(RuntimeError):
+    pass
+
+def load_document(path):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise PlanFormatError(f"cannot read PostgreSQL JSON plan: {exc}") from exc
+    if not isinstance(data, list) or not data or not isinstance(data[0], dict):
+        raise PlanFormatError("top-level EXPLAIN JSON value must be a non-empty array of objects")
+    document = data[0]
+    plan = document.get("Plan")
+    if not isinstance(plan, dict):
+        raise PlanFormatError("EXPLAIN JSON document does not contain an object-valued Plan field")
+    return document, plan
+
+def validate_node(node, path="Plan"):
+    if not isinstance(node, dict):
+        raise PlanFormatError(f"{path} must be an object")
+    if not isinstance(node.get("Node Type"), str) or not node.get("Node Type"):
+        raise PlanFormatError(f"{path} does not contain a non-empty Node Type string")
+    plans = node.get("Plans", [])
+    if not isinstance(plans, list):
+        raise PlanFormatError(f"{path}.Plans must be an array")
+    for idx, child in enumerate(plans):
+        validate_node(child, f"{path}.Plans[{idx}]")
+
+def compact_value(value):
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        text = ", ".join(str(item) for item in value)
+    elif isinstance(value, (dict, tuple)):
+        text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    else:
+        text = str(value)
+    return " ".join(text.replace("\t", " ").replace("\r", " ").replace("\n", " ").split())
+
+def node_display_name(node):
+    name = str(node.get("Node Type", ""))
+    if node.get("Index Name"):
+        name += f" using {node['Index Name']}"
+    relation = node.get("Relation Name")
+    if relation:
+        schema = node.get("Schema")
+        relation_name = f"{schema}.{relation}" if schema else str(relation)
+        name += f" on {relation_name}"
+        alias = node.get("Alias")
+        if alias and alias != relation:
+            name += f" {alias}"
+    if node.get("Subplan Name"):
+        name += f" [{node['Subplan Name']}]"
+    return name
+
+def tree_rows(root):
+    rows = []
+    def walk(node, ancestors_last=(), connector=""):
+        prefix = "".join("   " if is_last else "│  " for is_last in ancestors_last)
+        rows.append({
+            "Node-Type": f"{prefix}{connector}{node_display_name(node)}",
+            "Sort-Key": compact_value(node.get("Sort Key")),
+            "Index-Cond": compact_value(node.get("Index Cond")),
+            "Recheck-Cond": compact_value(node.get("Recheck Cond")),
+            "Hash-Cond": compact_value(node.get("Hash Cond")),
+            "Merge-Cond": compact_value(node.get("Merge Cond")),
+            "Join-Filter": compact_value(node.get("Join Filter")),
+            "Filter": compact_value(node.get("Filter")),
+        })
+        children = node.get("Plans", [])
+        for idx, child in enumerate(children):
+            last = idx == len(children) - 1
+            walk(child, ancestors_last + ((connector == "└─ "),) if connector else (), "└─ " if last else "├─ ")
+    walk(root)
+    return rows
+
+def render_summary(root, out):
+    validate_node(root)
+    rows = tree_rows(root)
+    columns = ["Node-Type", "Sort-Key", "Index-Cond", "Recheck-Cond", "Hash-Cond", "Merge-Cond", "Join-Filter", "Filter"]
+    minimums = {"Node-Type":30,"Sort-Key":12,"Index-Cond":14,"Recheck-Cond":14,"Hash-Cond":12,"Merge-Cond":12,"Join-Filter":12,"Filter":12}
+    maximums = {"Node-Type":56,"Sort-Key":32,"Index-Cond":48,"Recheck-Cond":40,"Hash-Cond":40,"Merge-Cond":40,"Join-Filter":40,"Filter":48}
+    widths = {}
+    for column in columns:
+        observed = max([len(column)] + [len(row[column]) for row in rows])
+        widths[column] = min(max(observed, minimums[column]), maximums[column])
+    def clip(text, width):
+        return text if len(text) <= width else text[:max(0, width - 3)] + "..."
+    def line(values):
+        return " | ".join(clip(values[column], widths[column]).ljust(widths[column]) for column in columns)
+    out.write("Plan Tree Summary\n")
+    out.write(line({column: column for column in columns}) + "\n")
+    out.write("-+-".join("-" * widths[column] for column in columns) + "\n")
+    for row in rows:
+        out.write(line(row) + "\n")
+
+def json_value(value):
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+def render_details(document, root, out):
+    validate_node(root)
+    def walk(node, prefix="", connector=""):
+        out.write(f"{prefix}{connector}Node Type: {node['Node Type']}\n")
+        detail_prefix = prefix + ("   " if connector == "" or connector.startswith("└") else "│  ")
+        for key, value in node.items():
+            if key in ("Node Type", "Plans"):
+                continue
+            out.write(f"{detail_prefix}· {key}: {json_value(value)}\n")
+        children = node.get("Plans", [])
+        for idx, child in enumerate(children):
+            last = idx == len(children) - 1
+            child_connector = "└─ " if last else "├─ "
+            child_prefix = "" if connector == "" else prefix + ("   " if connector.startswith("└") else "│  ")
+            walk(child, child_prefix, child_connector)
+    walk(root)
+    top_level = [(k, v) for k, v in document.items() if k != "Plan"]
+    if top_level:
+        out.write("\nEXPLAIN Document Properties\n")
+        for key, value in top_level:
+            out.write(f"· {key}: {json_value(value)}\n")
+
+def quote_ident(value):
+    return '"' + value.replace('"', '""') + '"'
+
+def relation_reference(schema, relation):
+    simple = re.compile(r"^[a-z_][a-z0-9_$]*$")
+    return f"{schema if simple.match(schema) else quote_ident(schema)}.{relation if simple.match(relation) else quote_ident(relation)}"
+
+def walk_nodes(root):
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        yield node
+        stack.extend(reversed(node.get("Plans", [])))
+
+def write_metadata(root, relations_path, dml_path):
+    validate_node(root)
+    relations = set()
+    operations = []
+    for node in walk_nodes(root):
+        schema = node.get("Schema")
+        relation = node.get("Relation Name")
+        if isinstance(schema, str) and isinstance(relation, str):
+            relations.add(relation_reference(schema, relation))
+        operation = node.get("Operation")
+        if operation in {"Insert", "Update", "Delete", "Merge"} and operation not in operations:
+            operations.append(operation)
+    Path(relations_path).write_text("".join(f"{rel}\n" for rel in sorted(relations)), encoding="utf-8")
+    Path(dml_path).write_text("".join(f"{op}\n" for op in operations), encoding="utf-8")
+
+def self_test():
+    root = {"Node Type":"Hash Join","Hash Cond":"(a.id = b.id)","Plans":[{"Node Type":"Seq Scan","Schema":"public","Relation Name":"a","Alias":"a"},{"Node Type":"Hash","Plans":[{"Node Type":"Index Scan","Index Name":"b_pkey","Schema":"public","Relation Name":"b","Alias":"b","Index Cond":"(b.id > 0)"}]}]}
+    validate_node(root)
+    rows = tree_rows(root)
+    if len(rows) != 4 or rows[0]["Hash-Cond"] != "(a.id = b.id)" or rows[3]["Index-Cond"] != "(b.id > 0)":
+        raise PlanFormatError("embedded renderer self-test failed")
+    print(f"embedded plan renderer v{RENDERER_VERSION} self-test passed")
+
+def main():
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="command", required=True)
+    p_tree = sub.add_parser("tree"); p_tree.add_argument("plan_json")
+    p_meta = sub.add_parser("metadata"); p_meta.add_argument("plan_json"); p_meta.add_argument("relations_file"); p_meta.add_argument("dml_file")
+    sub.add_parser("self-test")
+    args = parser.parse_args()
+    try:
+        if args.command == "self-test":
+            self_test(); return 0
+        document, root = load_document(args.plan_json)
+        if args.command == "tree":
+            render_summary(root, sys.stdout)
+            sys.stdout.write("\nNode Details\n------------\n")
+            render_details(document, root, sys.stdout)
+        elif args.command == "metadata":
+            write_metadata(root, args.relations_file, args.dml_file)
+        return 0
+    except (PlanFormatError, OSError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+PY
+
+"$PYTHON3_BIN" "$PLAN_TREE_PY" self-test >/dev/null 2>&1 || {
+    echo "ERROR: embedded JSON plan parser self-test failed." >&2
+    exit 1
+}
+
 tty_state=
 cleanup() {
     if [ -n "$tty_state" ]; then
@@ -239,7 +427,6 @@ esac
 ask() {
     prompt=$1
     default=$2
-
     while :
     do
         printf '%s [%s]: ' "$prompt" "$default" >&2
@@ -247,18 +434,11 @@ ask() {
             echo "ERROR: input stream closed." >&2
             return 1
         }
-
         [ -n "$ans" ] || ans=$default
         ans=$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
-
         case $ans in
-            yes|no)
-                printf '%s' "$ans"
-                return 0
-                ;;
-            *)
-                echo "ERROR: enter yes or no. Please retry." >&2
-                ;;
+            yes|no) printf '%s' "$ans"; return 0 ;;
+            *) echo "ERROR: enter yes or no. Please retry." >&2 ;;
         esac
     done
 }
@@ -528,9 +708,7 @@ show_bind_candidates() {
     bind_empty_string_allowed=$(awk -F'|' -v n="$bind_index" '$1 == n {print $3; exit}' "$bind_type_map")
     [ -n "$bind_type" ] || bind_type=unknown
     [ -n "$bind_empty_string_allowed" ] || bind_empty_string_allowed=no
-
     printf 'Parameter $%s type: %s\n' "$bind_index" "$bind_type"
-
     constant_line=$(awk -F'|' -v n="$bind_index" '$1 == n {print; exit}' "$bind_constant_map")
     if [ -n "$constant_line" ]; then
         bind_default_value=${constant_line#*|}
@@ -538,14 +716,11 @@ show_bind_candidates() {
         printf 'Auto-detected $%s -> SQL constant default: %s\n' "$bind_index" "$bind_default_value"
         return 0
     fi
-
     bind_candidate_file="$work_dir/bind-candidates-$bind_index.txt"
     awk -F'|' -v n="$bind_index" '$1 == n {print $2 "|" $3}' "$bind_map" | sort -u > "$bind_candidate_file"
     bind_candidate_count=$(awk 'END {print NR+0}' "$bind_candidate_file")
-
     sample_relation=
     sample_column=
-
     if [ "$bind_candidate_count" -eq 1 ]; then
         candidate_line=$(sed -n '1p' "$bind_candidate_file")
         sample_relation=${candidate_line%%|*}
@@ -559,16 +734,12 @@ show_bind_candidates() {
             printf '  %s) %s / %s\n' "$candidate_no" "$candidate_relation" "$candidate_column"
             candidate_no=$((candidate_no + 1))
         done < "$bind_candidate_file"
-
         while :; do
             printf 'Select candidate for $%s [1]: ' "$bind_index" >&2
             IFS= read -r candidate_choice || return 1
             [ -n "$candidate_choice" ] || candidate_choice=1
             case $candidate_choice in
-                *[!0-9]*|'')
-                    echo "ERROR: enter a candidate number." >&2
-                    continue
-                    ;;
+                *[!0-9]*|'') echo "ERROR: enter a candidate number." >&2; continue ;;
             esac
             if [ "$candidate_choice" -lt 1 ] || [ "$candidate_choice" -gt "$bind_candidate_count" ]; then
                 printf 'ERROR: choose 1-%s.\n' "$bind_candidate_count" >&2
@@ -584,7 +755,6 @@ show_bind_candidates() {
         echo "No automatic relation candidate found for this parameter." >&2
         echo "The following table/column is only used to look up example values; press Enter to skip candidate lookup." >&2
     fi
-
     while :; do
         if [ -z "$sample_relation" ] || [ -z "$sample_column" ]; then
             printf 'Candidate source table for $%s (schema.table, empty to skip): ' "$bind_index" >&2
@@ -594,7 +764,6 @@ show_bind_candidates() {
             IFS= read -r sample_column || return 1
             [ -n "$sample_column" ] || return 0
         fi
-
         printf '\nTable value candidates for $%s (up to %s distinct values; not historical bind values)\n' "$bind_index" "$BIND_SAMPLE_LIMIT"
         if run_psql -X -q -P pager=off -v ON_ERROR_STOP=1 \
             -v sample_relation="$sample_relation" -v sample_column="$sample_column" \
@@ -630,7 +799,6 @@ SQL
             echo 'Candidates are distinct current table values and do not apply the original SQL filters.'
             return 0
         fi
-
         echo 'Could not read candidates. Check table/column/permissions or retry; empty table skips candidates.' >&2
         sample_relation=
         sample_column=
@@ -655,7 +823,6 @@ if [ "$BIND" = yes ]; then
         cat "$SQL_FILE"
         printf '\n;\n'
     } > "$prepare_file"
-
     BIND_COUNT=$(
         {
             cat "$prepare_file"
@@ -665,33 +832,27 @@ if [ "$BIND" = yes ]; then
         echo "ERROR: Could not prepare SQL. Check the SQL and parameter types." >&2
         exit 1
     }
-
     case $BIND_COUNT in
         ''|*[!0-9]*) echo "ERROR: invalid parameter count" >&2; exit 1 ;;
     esac
-
     BIND_SAMPLE_LIMIT=${BIND_SAMPLE_LIMIT:-3}
     BIND_SAMPLE_TIMEOUT=${BIND_SAMPLE_TIMEOUT:-5s}
     if ! printf '%s\n' "$BIND_SAMPLE_LIMIT" | grep -Eq '^[0-9]*[1-9][0-9]*$'; then
         echo "ERROR: BIND_SAMPLE_LIMIT must be a positive integer." >&2
         exit 1
     fi
-
     build_bind_map
     build_bind_constant_map
     build_bind_type_map
-
     echo "Bind parameter count: $BIND_COUNT"
     echo 'Enter each value as plain text (no SQL quotes). \N means SQL NULL. If a default is shown, Enter accepts it.'
     echo 'Without a default, empty input is allowed only for PostgreSQL string types; non-string types require a value or \N.'
-
     printf 'EXECUTE pg_explain_target' > "$execute_file"
     if [ "$BIND_COUNT" -gt 0 ]; then
         printf '(' >> "$execute_file"
         bind_index=1
         while [ "$bind_index" -le "$BIND_COUNT" ]; do
             show_bind_candidates || exit 1
-
             while :; do
                 if [ "$bind_default_available" = yes ]; then
                     printf 'Value for $%s [%s]: ' "$bind_index" "$bind_default_value" >&2
@@ -700,23 +861,17 @@ if [ "$BIND" = yes ]; then
                 else
                     printf 'Value for $%s (required, \\N for NULL): ' "$bind_index" >&2
                 fi
-
                 IFS= read -r bind_value || exit 1
-
                 if [ -z "$bind_value" ] && [ "$bind_default_available" = yes ]; then
                     bind_value=$bind_default_value
                     break
                 fi
-
                 if [ -z "$bind_value" ] && [ "$bind_empty_string_allowed" != yes ]; then
-                    printf 'ERROR: $%s type %s does not accept an implicit empty-string input here. Enter a value or \\N for SQL NULL.\n' \
-                        "$bind_index" "$bind_type" >&2
+                    printf 'ERROR: $%s type %s does not accept an implicit empty-string input here. Enter a value or \\N for SQL NULL.\n' "$bind_index" "$bind_type" >&2
                     continue
                 fi
-
                 break
             done
-
             if [ "$bind_value" = '\N' ]; then
                 bind_display_value=NULL
             elif [ -z "$bind_value" ]; then
@@ -725,7 +880,6 @@ if [ "$BIND" = yes ]; then
                 bind_display_value=$bind_value
             fi
             printf '$%s [%s] = %s\n' "$bind_index" "$bind_type" "$bind_display_value" >> "$bind_values_file"
-
             [ "$bind_index" -eq 1 ] || printf ', ' >> "$execute_file"
             if [ "$bind_value" = '\N' ]; then
                 printf 'NULL' >> "$execute_file"
@@ -739,7 +893,6 @@ if [ "$BIND" = yes ]; then
         printf ')' >> "$execute_file"
     fi
     printf ';\n' >> "$execute_file"
-
     if [ -s "$bind_values_file" ]; then
         echo
         echo "Bind Values Used"
@@ -747,10 +900,8 @@ if [ "$BIND" = yes ]; then
         cat "$bind_values_file"
         echo
     fi
-
     echo "Prepared statement plan mode follows PostgreSQL plan_cache_mode semantics."
     BIND_PLAN_MODE=$(ask_bind_plan_mode) || exit 1
-
     unset bind_value bind_types bind_display_value
 fi
 
@@ -758,35 +909,27 @@ echo "PostgreSQL server_version_num: $SERVER_VERSION_NUM"
 echo
 echo "ANALYZE  : SQL 실제 실행 + Actual Rows/Time. 모든 ANALYZE 실행은 BEGIN/ROLLBACK 적용."
 ANALYZE=$(ask "Use ANALYZE? yes/no" no)
-
 echo "VERBOSE  : Output column, schema-qualified object 등 상세 표시."
 VERBOSE=$(ask "Use VERBOSE? yes/no" no)
-
 echo "COSTS    : Startup/Total Cost, Estimated Rows/Width 표시. 기본 ON."
 COSTS=$(ask "Use COSTS? yes/no" yes)
-
 echo "SETTINGS : Plan에 영향을 준 비기본 설정을 Plan 출력에 포함."
 SETTINGS=$(ask "Use SETTINGS? yes/no" yes)
-
 BUFFERS=no
 WAL=no
 TIMING=no
 GENERIC_PLAN=no
 SERIALIZE=no
 MEMORY=no
-
 if [ "$ANALYZE" = yes ]; then
     echo "BUFFERS   : shared/local/temp Buffer hit/read/write 및 I/O timing."
     BUFFERS=$(ask "Use BUFFERS? yes/no" yes)
-
     if [ "$SERVER_VERSION_NUM" -ge 130000 ]; then
         echo "WAL       : WAL record/FPI/bytes. PostgreSQL 13+."
         WAL=$(ask "Use WAL? yes/no" no)
     fi
-
     echo "TIMING    : Plan Node별 실제 수행시간. 측정 오버헤드 존재."
     TIMING=$(ask "Use TIMING? yes/no" yes)
-
     if [ "$SERVER_VERSION_NUM" -ge 170000 ]; then
         echo "SERIALIZE : Query 결과 직렬화 비용 측정. PostgreSQL 17+."
         SERIALIZE=$(ask "Use SERIALIZE TEXT? yes/no" no)
@@ -797,65 +940,44 @@ else
         GENERIC_PLAN=$(ask "Use GENERIC_PLAN? yes/no" no)
     fi
 fi
-
 if [ "$SERVER_VERSION_NUM" -ge 170000 ]; then
     echo "MEMORY    : Planner Memory 사용량. PostgreSQL 17+."
     MEMORY=$(ask "Use MEMORY? yes/no" no)
 fi
-
 echo "SUMMARY   : Planning/Execution 요약."
 SUMMARY=$(ask "Use SUMMARY? yes/no" yes)
-
 printf 'RAW FORMAT (TEXT/JSON/YAML/XML) [TEXT]: ' >&2
 IFS= read -r FORMAT
 [ -n "$FORMAT" ] || FORMAT=TEXT
 FORMAT=$(printf '%s' "$FORMAT" | tr '[:lower:]' '[:upper:]')
 case $FORMAT in
     TEXT|JSON|YAML|XML) ;;
-    *)
-        echo "ERROR: invalid format" >&2
-        exit 1
-        ;;
+    *) echo "ERROR: invalid format" >&2; exit 1 ;;
 esac
 
 base_plan_opts=""
-add_base_opt() {
-    [ -z "$base_plan_opts" ] && base_plan_opts="$1" || base_plan_opts="$base_plan_opts, $1"
-}
-
+add_base_opt() { [ -z "$base_plan_opts" ] && base_plan_opts="$1" || base_plan_opts="$base_plan_opts, $1"; }
 [ "$ANALYZE" = yes ] && add_base_opt "ANALYZE TRUE"
 [ "$VERBOSE" = yes ] && add_base_opt "VERBOSE TRUE" || add_base_opt "VERBOSE FALSE"
 [ "$COSTS" = yes ] && add_base_opt "COSTS TRUE" || add_base_opt "COSTS FALSE"
 [ "$SETTINGS" = yes ] && add_base_opt "SETTINGS TRUE" || add_base_opt "SETTINGS FALSE"
 if [ "$ANALYZE" = yes ]; then
     [ "$BUFFERS" = yes ] && add_base_opt "BUFFERS TRUE" || add_base_opt "BUFFERS FALSE"
-    if [ "$SERVER_VERSION_NUM" -ge 130000 ]; then
-        [ "$WAL" = yes ] && add_base_opt "WAL TRUE" || add_base_opt "WAL FALSE"
-    fi
+    if [ "$SERVER_VERSION_NUM" -ge 130000 ]; then [ "$WAL" = yes ] && add_base_opt "WAL TRUE" || add_base_opt "WAL FALSE"; fi
     [ "$TIMING" = yes ] && add_base_opt "TIMING TRUE" || add_base_opt "TIMING FALSE"
-    if [ "$SERVER_VERSION_NUM" -ge 170000 ]; then
-        [ "$SERIALIZE" = yes ] && add_base_opt "SERIALIZE TEXT" || add_base_opt "SERIALIZE NONE"
-    fi
+    if [ "$SERVER_VERSION_NUM" -ge 170000 ]; then [ "$SERIALIZE" = yes ] && add_base_opt "SERIALIZE TEXT" || add_base_opt "SERIALIZE NONE"; fi
 fi
 [ "$GENERIC_PLAN" = yes ] && [ "$BIND" = no ] && add_base_opt "GENERIC_PLAN TRUE"
-if [ "$SERVER_VERSION_NUM" -ge 170000 ]; then
-    [ "$MEMORY" = yes ] && add_base_opt "MEMORY TRUE" || add_base_opt "MEMORY FALSE"
-fi
+if [ "$SERVER_VERSION_NUM" -ge 170000 ]; then [ "$MEMORY" = yes ] && add_base_opt "MEMORY TRUE" || add_base_opt "MEMORY FALSE"; fi
 [ "$SUMMARY" = yes ] && add_base_opt "SUMMARY TRUE" || add_base_opt "SUMMARY FALSE"
-
 actual_json_opts="$base_plan_opts, FORMAT JSON"
-
 planned_base_opts=""
-add_planned_opt() {
-    [ -z "$planned_base_opts" ] && planned_base_opts="$1" || planned_base_opts="$planned_base_opts, $1"
-}
+add_planned_opt() { [ -z "$planned_base_opts" ] && planned_base_opts="$1" || planned_base_opts="$planned_base_opts, $1"; }
 [ "$VERBOSE" = yes ] && add_planned_opt "VERBOSE TRUE" || add_planned_opt "VERBOSE FALSE"
 [ "$COSTS" = yes ] && add_planned_opt "COSTS TRUE" || add_planned_opt "COSTS FALSE"
 [ "$SETTINGS" = yes ] && add_planned_opt "SETTINGS TRUE" || add_planned_opt "SETTINGS FALSE"
 [ "$GENERIC_PLAN" = yes ] && [ "$BIND" = no ] && add_planned_opt "GENERIC_PLAN TRUE"
-if [ "$SERVER_VERSION_NUM" -ge 170000 ]; then
-    [ "$MEMORY" = yes ] && add_planned_opt "MEMORY TRUE" || add_planned_opt "MEMORY FALSE"
-fi
+if [ "$SERVER_VERSION_NUM" -ge 170000 ]; then [ "$MEMORY" = yes ] && add_planned_opt "MEMORY TRUE" || add_planned_opt "MEMORY FALSE"; fi
 [ "$SUMMARY" = yes ] && add_planned_opt "SUMMARY TRUE" || add_planned_opt "SUMMARY FALSE"
 planned_raw_opts="$planned_base_opts, FORMAT $FORMAT"
 
@@ -877,20 +999,14 @@ tmp="$work_dir/explain.sql"
 raw_tmp="$work_dir/raw-explain.sql"
 PARTITION_DIAG_LIMIT=${PARTITION_DIAG_LIMIT:-3}
 case $PARTITION_DIAG_LIMIT in
-    ''|*[!0-9]*|0)
-        echo "ERROR: PARTITION_DIAG_LIMIT must be a positive integer." >&2
-        exit 1
-        ;;
+    ''|*[!0-9]*|0) echo "ERROR: PARTITION_DIAG_LIMIT must be a positive integer." >&2; exit 1 ;;
 esac
 
 result_timestamp=$(date '+%Y%m%d_%H%M%S')
 result_database=$(printf '%s' "$PGDATABASE" | tr -c '[:alnum:]_.-' '_')
 RESULT_DIR=${EXPLAIN_RESULT_DIR:-$DEFAULT_OUTPUT_DIR}
 RESULT_FILE="$RESULT_DIR/explain_${result_database}_${result_timestamp}.log"
-mkdir -p "$RESULT_DIR" || {
-    echo "ERROR: Could not create result directory: $RESULT_DIR" >&2
-    exit 1
-}
+mkdir -p "$RESULT_DIR" || { echo "ERROR: Could not create result directory: $RESULT_DIR" >&2; exit 1; }
 {
     echo "PostgreSQL execution plan analysis"
     echo "script_version=$SCRIPT_VERSION"
@@ -901,25 +1017,16 @@ mkdir -p "$RESULT_DIR" || {
     echo "user=$PGUSER"
     echo "sql_file=$SQL_FILE"
     echo "tree_source=PostgreSQL EXPLAIN FORMAT JSON Plan/Plans structure"
+    echo "renderer=embedded"
     echo "actual_json_options=$actual_json_opts"
     echo "requested_raw_format=$FORMAT"
     echo "bind_plan_cache_mode=$BIND_PLAN_MODE"
     echo "partition_diagnostic_limit=$PARTITION_DIAG_LIMIT"
     echo
-} > "$RESULT_FILE" || {
-    echo "ERROR: Could not create result file: $RESULT_FILE" >&2
-    exit 1
-}
-
+} > "$RESULT_FILE" || { echo "ERROR: Could not create result file: $RESULT_FILE" >&2; exit 1; }
 if [ "$BIND" = yes ] && [ -s "$bind_values_file" ]; then
-    {
-        echo "Bind Values Used"
-        echo "----------------"
-        cat "$bind_values_file"
-        echo
-    } >> "$RESULT_FILE"
+    { echo "Bind Values Used"; echo "----------------"; cat "$bind_values_file"; echo; } >> "$RESULT_FILE"
 fi
-
 echo "Result file: $RESULT_FILE"
 
 emit_plan() {
@@ -937,15 +1044,12 @@ emit_plan() {
 }
 
 precheck_options='VERBOSE TRUE, COSTS FALSE, FORMAT JSON'
-if [ "$GENERIC_PLAN" = yes ] && [ "$BIND" = no ]; then
-    precheck_options="$precheck_options, GENERIC_PLAN TRUE"
-fi
+if [ "$GENERIC_PLAN" = yes ] && [ "$BIND" = no ]; then precheck_options="$precheck_options, GENERIC_PLAN TRUE"; fi
 emit_plan "$precheck_options" | run_psql -X -qAt -v ON_ERROR_STOP=1 > "$precheck_json" 2>"$plan_error" || {
     cat "$plan_error" >&2
     echo "ERROR: Could not generate PostgreSQL JSON plan for precheck." >&2
     exit 1
 }
-
 "$PYTHON3_BIN" "$PLAN_TREE_PY" metadata "$precheck_json" "$rel_file" "$dml_file" || {
     echo "ERROR: Could not parse PostgreSQL JSON precheck plan." >&2
     exit 1
@@ -956,18 +1060,12 @@ if [ "$ANALYZE" = yes ]; then
     echo
     echo "WARNING: EXPLAIN ANALYZE executes the statement."
     echo "Safety     : BEGIN -> EXPLAIN ANALYZE FORMAT JSON -> ROLLBACK"
-    if [ -n "$DML_OPERATION" ]; then
-        echo "DML detected: $DML_OPERATION"
-    fi
+    if [ -n "$DML_OPERATION" ]; then echo "DML detected: $DML_OPERATION"; fi
     echo "Transactional table/DDL changes are rolled back."
     echo "Sequence increments, external functions, or other non-transactional side effects may remain."
-
     printf 'Type EXECUTE to continue: ' >&2
     IFS= read -r confirm
-    [ "$confirm" = EXECUTE ] || {
-        echo "Cancelled."
-        exit 1
-    }
+    [ "$confirm" = EXECUTE ] || { echo "Cancelled."; exit 1; }
 fi
 
 snapshot_stats() {
@@ -975,11 +1073,9 @@ snapshot_stats() {
     index_file=$2
     : > "$table_file"
     : > "$index_file"
-
     while IFS= read -r rel
     do
         [ -n "$rel" ] || continue
-
         printf '%s\n' "
 SELECT st.relid,
        st.schemaname || '.' || st.relname,
@@ -994,7 +1090,6 @@ SELECT st.relid,
 FROM pg_stat_all_tables st
 WHERE st.relid=:'rel'::regclass;
 " | run_psql -X -At -F '|' -v ON_ERROR_STOP=1 -v rel="$rel" >> "$table_file"
-
         printf '%s\n' "
 SELECT si.indexrelid,
        si.indexrelid::regclass::text,
@@ -1004,8 +1099,7 @@ SELECT si.indexrelid,
        COALESCE(io.idx_blks_read,0),
        COALESCE(io.idx_blks_hit,0)
 FROM pg_stat_all_indexes si
-LEFT JOIN pg_statio_all_indexes io
-  ON io.indexrelid=si.indexrelid
+LEFT JOIN pg_statio_all_indexes io ON io.indexrelid=si.indexrelid
 WHERE si.relid=:'rel'::regclass
 ORDER BY si.indexrelid;
 " | run_psql -X -At -F '|' -v ON_ERROR_STOP=1 -v rel="$rel" >> "$index_file"
@@ -1014,161 +1108,50 @@ ORDER BY si.indexrelid;
 
 print_table_delta() {
     [ -s "$table_before" ] && [ -s "$table_after" ] || return 0
-    awk -F'|' '
-        NR==FNR {
-            for (i=3;i<=10;i++) b[$1,i]=$i
-            name[$1]=$2
-            next
-        }
-        {
-            id=$1
-            printf "\n%s\n", name[id]
-            printf "%-24s %15s %15s %15s\n", "metric", "before", "after", "delta"
-            printf "%-24s %15s %15s %15s\n", "------------------------", "---------------", "---------------", "---------------"
-            label[3]="seq_scan"
-            label[4]="seq_tup_read"
-            label[5]="idx_scan"
-            label[6]="idx_tup_fetch"
-            label[7]="n_tup_ins"
-            label[8]="n_tup_upd"
-            label[9]="n_tup_del"
-            label[10]="n_tup_hot_upd"
-            for (i=3;i<=10;i++) {
-                before=(b[id,i]==""?0:b[id,i])
-                after=$i
-                delta=after-before
-                printf "%-24s %15s %15s %+15d\n", label[i], before, after, delta
-            }
-        }
-    ' "$table_before" "$table_after"
+    awk -F'|' 'NR==FNR {for(i=3;i<=10;i++) b[$1,i]=$i; name[$1]=$2; next} {id=$1; printf "\n%s\n",name[id]; printf "%-24s %15s %15s %15s\n","metric","before","after","delta"; printf "%-24s %15s %15s %15s\n","------------------------","---------------","---------------","---------------"; label[3]="seq_scan";label[4]="seq_tup_read";label[5]="idx_scan";label[6]="idx_tup_fetch";label[7]="n_tup_ins";label[8]="n_tup_upd";label[9]="n_tup_del";label[10]="n_tup_hot_upd"; for(i=3;i<=10;i++){before=(b[id,i]==""?0:b[id,i]);after=$i;delta=after-before;printf "%-24s %15s %15s %+15d\n",label[i],before,after,delta}}' "$table_before" "$table_after"
 }
 
 print_index_delta() {
     [ -s "$index_before" ] && [ -s "$index_after" ] || return 0
-    awk -F'|' '
-        NR==FNR {
-            for (i=3;i<=7;i++) b[$1,i]=$i
-            name[$1]=$2
-            next
-        }
-        {
-            id=$1
-            printf "\n%s\n", name[id]
-            printf "%-24s %15s %15s %15s\n", "metric", "before", "after", "delta"
-            printf "%-24s %15s %15s %15s\n", "------------------------", "---------------", "---------------", "---------------"
-            label[3]="idx_scan"
-            label[4]="idx_tup_read"
-            label[5]="idx_tup_fetch"
-            label[6]="idx_blks_read"
-            label[7]="idx_blks_hit"
-            for (i=3;i<=7;i++) {
-                before=(b[id,i]==""?0:b[id,i])
-                after=$i
-                delta=after-before
-                printf "%-24s %15s %15s %+15d\n", label[i], before, after, delta
-            }
-        }
-    ' "$index_before" "$index_after"
+    awk -F'|' 'NR==FNR {for(i=3;i<=7;i++) b[$1,i]=$i; name[$1]=$2; next} {id=$1; printf "\n%s\n",name[id]; printf "%-24s %15s %15s %15s\n","metric","before","after","delta"; printf "%-24s %15s %15s %15s\n","------------------------","---------------","---------------","---------------"; label[3]="idx_scan";label[4]="idx_tup_read";label[5]="idx_tup_fetch";label[6]="idx_blks_read";label[7]="idx_blks_hit"; for(i=3;i<=7;i++){before=(b[id,i]==""?0:b[id,i]);after=$i;delta=after-before;printf "%-24s %15s %15s %+15d\n",label[i],before,after,delta}}' "$index_before" "$index_after"
 }
 
 build_diagnostic_relation_list() {
     : > "$diag_map_file"
     : > "$diag_rel_file"
-
     while IFS= read -r rel
     do
         [ -n "$rel" ] || continue
         printf '%s\n' "
 WITH RECURSIVE ancestors AS (
-    SELECT i.inhparent AS parent_oid, 1 AS depth
-    FROM pg_inherits i
-    WHERE i.inhrelid = :'rel'::regclass
+    SELECT i.inhparent AS parent_oid, 1 AS depth FROM pg_inherits i WHERE i.inhrelid = :'rel'::regclass
   UNION ALL
-    SELECT i.inhparent, a.depth + 1
-    FROM ancestors a
-    JOIN pg_inherits i ON i.inhrelid = a.parent_oid
+    SELECT i.inhparent, a.depth + 1 FROM ancestors a JOIN pg_inherits i ON i.inhrelid = a.parent_oid
 ), top_parent AS (
-    SELECT parent_oid
-    FROM ancestors
-    ORDER BY depth DESC
-    LIMIT 1
+    SELECT parent_oid FROM ancestors ORDER BY depth DESC LIMIT 1
 )
 SELECT :'rel' AS relation_name,
-       COALESCE(
-           (SELECT format('%I.%I', n.nspname, c.relname)
-              FROM top_parent t
-              JOIN pg_class c ON c.oid = t.parent_oid
-              JOIN pg_namespace n ON n.oid = c.relnamespace),
-           :'rel'
-       ) AS family_name,
+       COALESCE((SELECT format('%I.%I', n.nspname, c.relname) FROM top_parent t JOIN pg_class c ON c.oid=t.parent_oid JOIN pg_namespace n ON n.oid=c.relnamespace), :'rel') AS family_name,
        EXISTS (SELECT 1 FROM ancestors) AS is_partition;
-" | run_psql -X -qAt -F '|' -v ON_ERROR_STOP=1 -v rel="$rel" >> "$diag_map_file" || {
-            echo "ERROR: Could not inspect partition hierarchy for relation: $rel" >&2
-            return 1
-        }
+" | run_psql -X -qAt -F '|' -v ON_ERROR_STOP=1 -v rel="$rel" >> "$diag_map_file" || return 1
     done < "$rel_file"
-
-    awk -F'|' -v limit="$PARTITION_DIAG_LIMIT" '
-        $3 == "t" {
-            if (selected[$2] < limit) {
-                print $1
-                selected[$2]++
-            }
-            next
-        }
-        { print $1 }
-    ' "$diag_map_file" > "$diag_rel_file"
+    awk -F'|' -v limit="$PARTITION_DIAG_LIMIT" '$3=="t" {if(selected[$2]<limit){print $1;selected[$2]++};next} {print $1}' "$diag_map_file" > "$diag_rel_file"
 }
 
 print_diagnostic_selection() {
-    awk -F'|' -v limit="$PARTITION_DIAG_LIMIT" '
-        {
-            relation[NR]=$1
-            family[NR]=$2
-            partitioned[NR]=$3
-            if ($3 == "t") total[$2]++
-        }
-        END {
-            for (i=1; i<=NR; i++) {
-                if (partitioned[i] != "t") {
-                    printf "Standalone relation : %s -> detailed diagnostic\n", relation[i]
-                    continue
-                }
-                f=family[i]
-                if (!shown[f]) {
-                    selected=(total[f] < limit ? total[f] : limit)
-                    printf "Partition family    : %s (plan partitions=%d, detailed=%d)\n", f, total[f], selected
-                    count=0
-                    for (j=1; j<=NR && count<limit; j++) {
-                        if (partitioned[j] == "t" && family[j] == f) {
-                            printf "  selected          : %s\n", relation[j]
-                            count++
-                        }
-                    }
-                    shown[f]=1
-                }
-            }
-        }
-    ' "$diag_map_file"
+    awk -F'|' -v limit="$PARTITION_DIAG_LIMIT" '{relation[NR]=$1;family[NR]=$2;partitioned[NR]=$3;if($3=="t")total[$2]++} END {for(i=1;i<=NR;i++){if(partitioned[i]!="t"){printf "Standalone relation : %s -> detailed diagnostic\n",relation[i];continue} f=family[i];if(!shown[f]){selected=(total[f]<limit?total[f]:limit);printf "Partition family    : %s (plan partitions=%d, detailed=%d)\n",f,total[f],selected;count=0;for(j=1;j<=NR&&count<limit;j++){if(partitioned[j]=="t"&&family[j]==f){printf "  selected          : %s\n",relation[j];count++}}shown[f]=1}}}' "$diag_map_file"
 }
 
-if [ "$ANALYZE" = yes ] && [ -s "$rel_file" ]; then
-    snapshot_stats "$table_before" "$index_before"
-fi
-
+if [ "$ANALYZE" = yes ] && [ -s "$rel_file" ]; then snapshot_stats "$table_before" "$index_before"; fi
 if [ "$ANALYZE" = yes ]; then
-    {
-        printf 'BEGIN;\n'
-        emit_plan "$actual_json_opts"
-        printf '\nROLLBACK;\n'
-    } > "$tmp"
+    { printf 'BEGIN;\n'; emit_plan "$actual_json_opts"; printf '\nROLLBACK;\n'; } > "$tmp"
 else
     emit_plan "$actual_json_opts" > "$tmp"
 fi
-
 section "Execution Plan" | tee -a "$RESULT_FILE"
 {
     echo "Tree source : PostgreSQL FORMAT JSON"
+    echo "Renderer    : embedded in explain.sh"
     echo "Options     : EXPLAIN ($actual_json_opts)"
     if [ "$ANALYZE" = yes ]; then
         echo "Safety      : BEGIN -> EXPLAIN ANALYZE FORMAT JSON -> ROLLBACK"
@@ -1177,86 +1160,51 @@ section "Execution Plan" | tee -a "$RESULT_FILE"
         echo "Execution   : target statement not executed"
     fi
 } | tee -a "$RESULT_FILE"
-
-if run_psql -X -qAt -P pager=off -v ON_ERROR_STOP=1 -f "$tmp" > "$actual_plan_json" 2>"$plan_error"; then
-    :
-else
+if ! run_psql -X -qAt -P pager=off -v ON_ERROR_STOP=1 -f "$tmp" > "$actual_plan_json" 2>"$plan_error"; then
     plan_status=$?
     cat "$plan_error" | tee -a "$RESULT_FILE" >&2
     echo "Execution plan failed. Result file: $RESULT_FILE" >&2
     exit "$plan_status"
 fi
-
 if ! "$PYTHON3_BIN" "$PLAN_TREE_PY" tree "$actual_plan_json" > "$plan_tree_output" 2>"$plan_error"; then
     cat "$plan_error" | tee -a "$RESULT_FILE" >&2
     echo "ERROR: PostgreSQL JSON Tree parsing failed; no guessed Tree was produced." | tee -a "$RESULT_FILE" >&2
     exit 1
 fi
-
 section "Execution Plan Tree (Official JSON Structure)" | tee -a "$RESULT_FILE"
 cat "$plan_tree_output" | tee -a "$RESULT_FILE"
 {
     echo
     echo "NOTE: Parent/child hierarchy follows only PostgreSQL JSON Plan -> Plans[]."
     echo "      Node properties are printed with the JSON key names and values returned by PostgreSQL."
-    echo "      No Node Type-specific semantic inference is used by the Tree renderer."
+    echo "      No external plan_tree.py file is required."
 } | tee -a "$RESULT_FILE"
-
-if [ "$ANALYZE" = yes ]; then
-    section "Execution Plan Raw (JSON / Actual)" | tee -a "$RESULT_FILE"
-else
-    section "Execution Plan Raw (JSON / Planned)" | tee -a "$RESULT_FILE"
-fi
+if [ "$ANALYZE" = yes ]; then section "Execution Plan Raw (JSON / Actual)" | tee -a "$RESULT_FILE"; else section "Execution Plan Raw (JSON / Planned)" | tee -a "$RESULT_FILE"; fi
 cat "$actual_plan_json" | tee -a "$RESULT_FILE"
-
 if [ "$FORMAT" != JSON ]; then
     emit_plan "$planned_raw_opts" > "$raw_tmp"
     if run_psql -X -q -P pager=off -v ON_ERROR_STOP=1 -f "$raw_tmp" > "$plan_output" 2>"$plan_error"; then
         section "Execution Plan Raw ($FORMAT / Planned Only)" | tee -a "$RESULT_FILE"
-        {
-            if [ "$ANALYZE" = yes ]; then
-                echo "NOTE: This $FORMAT plan is a non-ANALYZE planning snapshot and is not the executed Actual plan."
-                echo "      Actual execution statistics are authoritative in Raw JSON / Actual above."
-                echo
-            fi
-            cat "$plan_output"
-        } | tee -a "$RESULT_FILE"
+        { if [ "$ANALYZE" = yes ]; then echo "NOTE: This $FORMAT plan is a non-ANALYZE planning snapshot and is not the executed Actual plan."; echo "      Actual execution statistics are authoritative in Raw JSON / Actual above."; echo; fi; cat "$plan_output"; } | tee -a "$RESULT_FILE"
     else
         cat "$plan_error" | tee -a "$RESULT_FILE" >&2
         echo "WARNING: Requested non-executing $FORMAT Raw Plan could not be generated." | tee -a "$RESULT_FILE" >&2
     fi
 fi
-
 if [ "$ANALYZE" = yes ] && [ -s "$rel_file" ]; then
     snapshot_stats "$table_after" "$index_after"
-
     section "Table Statistics Delta" | tee -a "$RESULT_FILE"
     print_table_delta | tee -a "$RESULT_FILE"
-
     section "Index Statistics / I/O Delta" | tee -a "$RESULT_FILE"
     print_index_delta | tee -a "$RESULT_FILE"
-
-    {
-        echo
-        echo "NOTE: Delta is calculated from cumulative pg_stat_* counters before/after this run."
-        echo "      Concurrent sessions using the same relation can be included in the delta."
-        echo "      The per-query I/O shown by EXPLAIN (ANALYZE, BUFFERS) is more specific to this execution."
-    } | tee -a "$RESULT_FILE"
+    { echo; echo "NOTE: Delta is calculated from cumulative pg_stat_* counters before/after this run."; echo "      Concurrent sessions using the same relation can be included in the delta."; echo "      The per-query I/O shown by EXPLAIN (ANALYZE, BUFFERS) is more specific to this execution."; } | tee -a "$RESULT_FILE"
 fi
 
 echo "Current result saved: $RESULT_FILE"
 DIAG=$(ask "Show additional Plan diagnostics? yes/no" yes)
-if [ "$DIAG" != yes ]; then
-    echo "Final result file: $RESULT_FILE"
-    exit 0
-fi
-
+if [ "$DIAG" != yes ]; then echo "Final result file: $RESULT_FILE"; exit 0; fi
 COLUMN_STATS_DETAIL=$(ask "Show full Column Statistics arrays? yes/no" no)
-{
-    echo "column_statistics_detail=$COLUMN_STATS_DETAIL"
-    echo
-} >> "$RESULT_FILE"
-
+{ echo "column_statistics_detail=$COLUMN_STATS_DETAIL"; echo; } >> "$RESULT_FILE"
 section "Planner Settings" | tee -a "$RESULT_FILE"
 if run_psql -X -P pager=off -P format=wrapped -P columns=160 -v ON_ERROR_STOP=1 > "$report_output" 2>&1 <<'SQL'
 SELECT name, setting, unit, source
@@ -1280,19 +1228,12 @@ else
     cat "$report_output" | tee -a "$RESULT_FILE" >&2
     exit "$report_status"
 fi
-
 if [ ! -s "$rel_file" ]; then
-    {
-        echo
-        echo "Referenced relation could not be identified automatically from the PostgreSQL JSON Plan."
-        echo "Final result file: $RESULT_FILE"
-    } | tee -a "$RESULT_FILE"
+    { echo; echo "Referenced relation could not be identified automatically from the PostgreSQL JSON Plan."; echo "Final result file: $RESULT_FILE"; } | tee -a "$RESULT_FILE"
     exit 0
 fi
-
 section "Referenced Relations (Plan Base Relations)" | tee -a "$RESULT_FILE"
 cat "$rel_file" | tee -a "$RESULT_FILE"
-
 build_diagnostic_relation_list || exit 1
 section "Detailed Diagnostic Selection" | tee -a "$RESULT_FILE"
 print_diagnostic_selection | tee -a "$RESULT_FILE"
@@ -1301,11 +1242,8 @@ run_relation_report() {
     rel=$1
     title=$2
     sql=$3
-
     section "$title : $rel" | tee -a "$RESULT_FILE"
-    if printf '%s\n' "$sql" | \
-        run_psql -X -P pager=off -P format=wrapped -P columns=160 \
-            -v ON_ERROR_STOP=1 -v rel="$rel" > "$report_output" 2>&1; then
+    if printf '%s\n' "$sql" | run_psql -X -P pager=off -P format=wrapped -P columns=160 -v ON_ERROR_STOP=1 -v rel="$rel" > "$report_output" 2>&1; then
         cat "$report_output" | tee -a "$RESULT_FILE"
     else
         report_status=$?
@@ -1326,192 +1264,65 @@ SELECT c.oid::regclass AS relation,
        c.relhasindex,
        c.relrowsecurity,
        c.relforcerowsecurity,
-       CASE c.relreplident
-         WHEN '\''d'\'' THEN '\''DEFAULT'\''
-         WHEN '\''n'\'' THEN '\''NOTHING'\''
-         WHEN '\''f'\'' THEN '\''FULL'\''
-         WHEN '\''i'\'' THEN '\''INDEX'\''
-       END AS replica_identity,
+       CASE c.relreplident WHEN '\''d'\'' THEN '\''DEFAULT'\'' WHEN '\''n'\'' THEN '\''NOTHING'\'' WHEN '\''f'\'' THEN '\''FULL'\'' WHEN '\''i'\'' THEN '\''INDEX'\'' END AS replica_identity,
        pg_size_pretty(pg_relation_size(c.oid)) AS table_size,
        pg_size_pretty(pg_indexes_size(c.oid)) AS indexes_size,
        pg_size_pretty(pg_total_relation_size(c.oid)) AS total_size
 FROM pg_class c
-LEFT JOIN pg_tablespace ts
-  ON ts.oid = NULLIF(c.reltablespace,0)
-LEFT JOIN pg_database db
-  ON db.datname = current_database()
-LEFT JOIN pg_tablespace dt
-  ON dt.oid = db.dattablespace
+LEFT JOIN pg_tablespace ts ON ts.oid = NULLIF(c.reltablespace,0)
+LEFT JOIN pg_database db ON db.datname = current_database()
+LEFT JOIN pg_tablespace dt ON dt.oid = db.dattablespace
 WHERE c.oid=:'\''rel'\''::regclass;
 '
-
 SQL_TABLE_STATS='
-SELECT schemaname, relname,
-       seq_scan, seq_tup_read, idx_scan, idx_tup_fetch,
-       n_live_tup, n_dead_tup, n_mod_since_analyze,
-       n_tup_ins, n_tup_upd, n_tup_del, n_tup_hot_upd,
-       last_vacuum, last_autovacuum, last_analyze, last_autoanalyze,
-       vacuum_count, autovacuum_count, analyze_count, autoanalyze_count
+SELECT schemaname, relname, seq_scan, seq_tup_read, idx_scan, idx_tup_fetch, n_live_tup, n_dead_tup, n_mod_since_analyze, n_tup_ins, n_tup_upd, n_tup_del, n_tup_hot_upd, last_vacuum, last_autovacuum, last_analyze, last_autoanalyze, vacuum_count, autovacuum_count, analyze_count, autoanalyze_count
 FROM pg_stat_all_tables
 WHERE relid=:'\''rel'\''::regclass;
 '
-
 SQL_COLUMN_INFO='
-SELECT a.attnum AS no,
-       a.attname AS column_name,
-       format_type(a.atttypid,a.atttypmod) AS data_type,
-       NOT a.attnotnull AS nullable,
-       pg_get_expr(ad.adbin,ad.adrelid) AS default_value,
-       a.attidentity AS identity,
-       a.attgenerated AS generated,
-       a.attstattarget AS statistics_target
+SELECT a.attnum AS no, a.attname AS column_name, format_type(a.atttypid,a.atttypmod) AS data_type, NOT a.attnotnull AS nullable, pg_get_expr(ad.adbin,ad.adrelid) AS default_value, a.attidentity AS identity, a.attgenerated AS generated, a.attstattarget AS statistics_target
 FROM pg_attribute a
-LEFT JOIN pg_attrdef ad
-  ON ad.adrelid=a.attrelid AND ad.adnum=a.attnum
-WHERE a.attrelid=:'\''rel'\''::regclass
-  AND a.attnum>0
-  AND NOT a.attisdropped
+LEFT JOIN pg_attrdef ad ON ad.adrelid=a.attrelid AND ad.adnum=a.attnum
+WHERE a.attrelid=:'\''rel'\''::regclass AND a.attnum>0 AND NOT a.attisdropped
 ORDER BY a.attnum;
 '
-
 SQL_COLUMN_STATS_SUMMARY='
-WITH target AS (
-  SELECT n.nspname AS schemaname, c.relname AS tablename
-  FROM pg_class c
-  JOIN pg_namespace n ON n.oid=c.relnamespace
-  WHERE c.oid=:'\''rel'\''::regclass
-)
-SELECT s.attname,
-       s.null_frac,
-       s.avg_width,
-       s.n_distinct,
-       s.correlation,
-       cardinality(s.most_common_vals) AS mcv_count,
-       cardinality(s.histogram_bounds) AS histogram_count,
-       CASE
-         WHEN s.most_common_vals IS NULL THEN NULL
-         WHEN length(s.most_common_vals::text) <= 60 THEN s.most_common_vals::text
-         ELSE left(s.most_common_vals::text,57) || '\''...'\''
-       END AS mcv_sample,
-       CASE
-         WHEN s.most_common_freqs IS NULL THEN NULL
-         WHEN length(s.most_common_freqs::text) <= 60 THEN s.most_common_freqs::text
-         ELSE left(s.most_common_freqs::text,57) || '\''...'\''
-       END AS mcv_freq_sample,
-       CASE
-         WHEN s.histogram_bounds IS NULL THEN NULL
-         WHEN length(s.histogram_bounds::text) <= 60 THEN s.histogram_bounds::text
-         ELSE left(s.histogram_bounds::text,57) || '\''...'\''
-       END AS histogram_sample
-FROM pg_stats s
-JOIN target t USING (schemaname,tablename)
+WITH target AS (SELECT n.nspname AS schemaname, c.relname AS tablename FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.oid=:'\''rel'\''::regclass)
+SELECT s.attname, s.null_frac, s.avg_width, s.n_distinct, s.correlation, cardinality(s.most_common_vals) AS mcv_count, cardinality(s.histogram_bounds) AS histogram_count,
+       CASE WHEN s.most_common_vals IS NULL THEN NULL WHEN length(s.most_common_vals::text)<=60 THEN s.most_common_vals::text ELSE left(s.most_common_vals::text,57)||'\''...'\'' END AS mcv_sample,
+       CASE WHEN s.most_common_freqs IS NULL THEN NULL WHEN length(s.most_common_freqs::text)<=60 THEN s.most_common_freqs::text ELSE left(s.most_common_freqs::text,57)||'\''...'\'' END AS mcv_freq_sample,
+       CASE WHEN s.histogram_bounds IS NULL THEN NULL WHEN length(s.histogram_bounds::text)<=60 THEN s.histogram_bounds::text ELSE left(s.histogram_bounds::text,57)||'\''...'\'' END AS histogram_sample
+FROM pg_stats s JOIN target t USING (schemaname,tablename)
 ORDER BY s.attname;
 '
-
 SQL_COLUMN_STATS_DETAIL='
-WITH target AS (
-  SELECT n.nspname AS schemaname, c.relname AS tablename
-  FROM pg_class c
-  JOIN pg_namespace n ON n.oid=c.relnamespace
-  WHERE c.oid=:'\''rel'\''::regclass
-)
-SELECT s.attname,
-       s.null_frac,
-       s.avg_width,
-       s.n_distinct,
-       s.most_common_vals,
-       s.most_common_freqs,
-       s.histogram_bounds,
-       s.correlation
-FROM pg_stats s
-JOIN target t USING (schemaname,tablename)
+WITH target AS (SELECT n.nspname AS schemaname, c.relname AS tablename FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.oid=:'\''rel'\''::regclass)
+SELECT s.attname, s.null_frac, s.avg_width, s.n_distinct, s.most_common_vals, s.most_common_freqs, s.histogram_bounds, s.correlation
+FROM pg_stats s JOIN target t USING (schemaname,tablename)
 ORDER BY s.attname;
 '
-
 SQL_EXT_STATS='
-WITH target AS (
-  SELECT n.nspname AS schemaname, c.relname AS tablename
-  FROM pg_class c
-  JOIN pg_namespace n ON n.oid=c.relnamespace
-  WHERE c.oid=:'\''rel'\''::regclass
-)
-SELECT s.schemaname,
-       s.tablename,
-       s.statistics_name,
-       s.attnames,
-       s.exprs,
-       s.kinds,
-       s.n_distinct,
-       s.dependencies
-FROM pg_stats_ext s
-JOIN target t USING (schemaname,tablename)
+WITH target AS (SELECT n.nspname AS schemaname, c.relname AS tablename FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.oid=:'\''rel'\''::regclass)
+SELECT s.schemaname, s.tablename, s.statistics_name, s.attnames, s.exprs, s.kinds, s.n_distinct, s.dependencies
+FROM pg_stats_ext s JOIN target t USING (schemaname,tablename)
 ORDER BY s.statistics_name;
 '
-
 SQL_INDEX_INFO='
-SELECT i.indexrelid::regclass AS index_name,
-       am.amname AS method,
-       i.indisunique AS unique,
-       i.indisprimary AS primary_key,
-       i.indisexclusion AS exclusion,
-       i.indisclustered AS clustered,
-       i.indisvalid AS valid,
-       i.indisready AS ready,
-       i.indislive AS live,
-       i.indisreplident AS replica_identity,
-       i.indnkeyatts AS key_columns,
-       i.indnatts-i.indnkeyatts AS include_columns,
-       pg_size_pretty(pg_relation_size(i.indexrelid)) AS index_size,
-       pg_get_expr(i.indpred,i.indrelid) AS predicate,
-       pg_get_expr(i.indexprs,i.indrelid) AS expressions,
-       pg_get_indexdef(i.indexrelid) AS definition
-FROM pg_index i
-JOIN pg_class x ON x.oid=i.indexrelid
-JOIN pg_am am ON am.oid=x.relam
+SELECT i.indexrelid::regclass AS index_name, am.amname AS method, i.indisunique AS unique, i.indisprimary AS primary_key, i.indisexclusion AS exclusion, i.indisclustered AS clustered, i.indisvalid AS valid, i.indisready AS ready, i.indislive AS live, i.indisreplident AS replica_identity, i.indnkeyatts AS key_columns, i.indnatts-i.indnkeyatts AS include_columns, pg_size_pretty(pg_relation_size(i.indexrelid)) AS index_size, pg_get_expr(i.indpred,i.indrelid) AS predicate, pg_get_expr(i.indexprs,i.indrelid) AS expressions, pg_get_indexdef(i.indexrelid) AS definition
+FROM pg_index i JOIN pg_class x ON x.oid=i.indexrelid JOIN pg_am am ON am.oid=x.relam
 WHERE i.indrelid=:'\''rel'\''::regclass
 ORDER BY i.indisprimary DESC, i.indisunique DESC, i.indexrelid::regclass::text;
 '
-
 SQL_INDEX_COLUMNS='
-WITH idx AS (
-  SELECT i.indexrelid, i.indrelid, i.indnkeyatts,
-         i.indisunique, i.indisprimary,
-         i.indkey::int2[] AS indkey
-  FROM pg_index i
-  WHERE i.indrelid=:'\''rel'\''::regclass
-)
-SELECT x.indexrelid::regclass AS index_name,
-       k.ordinality AS position,
-       CASE WHEN k.ordinality<=x.indnkeyatts THEN '\''KEY'\'' ELSE '\''INCLUDE'\'' END AS column_type,
-       CASE
-         WHEN k.attnum=0 THEN pg_get_indexdef(x.indexrelid,k.ordinality::int,true)
-         ELSE a.attname
-       END AS column_or_expression,
-       x.indisunique,
-       x.indisprimary
-FROM idx x
-CROSS JOIN LATERAL unnest(x.indkey) WITH ORDINALITY AS k(attnum,ordinality)
-LEFT JOIN pg_attribute a
-  ON a.attrelid=x.indrelid
- AND a.attnum=k.attnum
+WITH idx AS (SELECT i.indexrelid, i.indrelid, i.indnkeyatts, i.indisunique, i.indisprimary, i.indkey::int2[] AS indkey FROM pg_index i WHERE i.indrelid=:'\''rel'\''::regclass)
+SELECT x.indexrelid::regclass AS index_name, k.ordinality AS position, CASE WHEN k.ordinality<=x.indnkeyatts THEN '\''KEY'\'' ELSE '\''INCLUDE'\'' END AS column_type, CASE WHEN k.attnum=0 THEN pg_get_indexdef(x.indexrelid,k.ordinality::int,true) ELSE a.attname END AS column_or_expression, x.indisunique, x.indisprimary
+FROM idx x CROSS JOIN LATERAL unnest(x.indkey) WITH ORDINALITY AS k(attnum,ordinality)
+LEFT JOIN pg_attribute a ON a.attrelid=x.indrelid AND a.attnum=k.attnum
 ORDER BY x.indexrelid::regclass::text,k.ordinality;
 '
-
 SQL_INDEX_IO='
-SELECT s.indexrelid::regclass AS index_name,
-       s.idx_scan,
-       s.idx_tup_read,
-       s.idx_tup_fetch,
-       io.idx_blks_read,
-       io.idx_blks_hit,
-       round(
-         100.0*io.idx_blks_hit/
-         NULLIF(io.idx_blks_hit+io.idx_blks_read,0),
-         2
-       ) AS cache_hit_pct
-FROM pg_stat_all_indexes s
-LEFT JOIN pg_statio_all_indexes io
-  ON io.indexrelid=s.indexrelid
+SELECT s.indexrelid::regclass AS index_name, s.idx_scan, s.idx_tup_read, s.idx_tup_fetch, io.idx_blks_read, io.idx_blks_hit, round(100.0*io.idx_blks_hit/NULLIF(io.idx_blks_hit+io.idx_blks_read,0),2) AS cache_hit_pct
+FROM pg_stat_all_indexes s LEFT JOIN pg_statio_all_indexes io ON io.indexrelid=s.indexrelid
 WHERE s.relid=:'\''rel'\''::regclass
 ORDER BY s.idx_scan DESC NULLS LAST,s.indexrelid::regclass::text;
 '
@@ -1519,14 +1330,11 @@ ORDER BY s.idx_scan DESC NULLS LAST,s.indexrelid::regclass::text;
 while IFS= read -r rel
 do
     [ -n "$rel" ] || continue
-
     run_relation_report "$rel" "Table Information" "$SQL_TABLE_INFO"
     run_relation_report "$rel" "Table Statistics" "$SQL_TABLE_STATS"
     run_relation_report "$rel" "Column Information" "$SQL_COLUMN_INFO"
     run_relation_report "$rel" "Column Statistics Summary" "$SQL_COLUMN_STATS_SUMMARY"
-    if [ "$COLUMN_STATS_DETAIL" = yes ]; then
-        run_relation_report "$rel" "Column Statistics Detail" "$SQL_COLUMN_STATS_DETAIL"
-    fi
+    if [ "$COLUMN_STATS_DETAIL" = yes ]; then run_relation_report "$rel" "Column Statistics Detail" "$SQL_COLUMN_STATS_DETAIL"; fi
     run_relation_report "$rel" "Extended Statistics" "$SQL_EXT_STATS"
     run_relation_report "$rel" "Index Information" "$SQL_INDEX_INFO"
     run_relation_report "$rel" "Index Columns" "$SQL_INDEX_COLUMNS"
