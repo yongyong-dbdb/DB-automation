@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """PostgreSQL EXPLAIN (FORMAT JSON) structural renderer.
 
-This helper intentionally does not infer plan semantics. It follows only the
-JSON structure returned by PostgreSQL: the top-level Plan object and each
-node's Plans array. Node properties are emitted with their original JSON key
-names and values.
+The renderer follows only PostgreSQL's JSON Plan/Plans hierarchy.  It emits a
+compact plan-tree summary first and then the complete node properties returned
+by PostgreSQL so existing detailed diagnostics remain available.
 """
 
 import argparse
@@ -12,6 +11,9 @@ import json
 import re
 import sys
 from pathlib import Path
+
+
+RENDERER_VERSION = "1.2.0"
 
 
 class PlanFormatError(RuntimeError):
@@ -58,7 +60,127 @@ def validate_node(node, path="Plan"):
             validate_node(child, f"{path}.Plans[{idx}]")
 
 
-def render_tree(document, root, out):
+def compact_value(value):
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        text = ", ".join(str(item) for item in value)
+    elif isinstance(value, (dict, tuple)):
+        text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    else:
+        text = str(value)
+    return " ".join(text.replace("\t", " ").replace("\r", " ").replace("\n", " ").split())
+
+
+def node_display_name(node):
+    name = str(node.get("Node Type", ""))
+    index_name = node.get("Index Name")
+    relation = node.get("Relation Name")
+    schema = node.get("Schema")
+    alias = node.get("Alias")
+
+    if index_name:
+        name += f" using {index_name}"
+
+    if relation:
+        relation_name = f"{schema}.{relation}" if schema else str(relation)
+        name += f" on {relation_name}"
+        if alias and alias != relation:
+            name += f" {alias}"
+
+    subplan_name = node.get("Subplan Name")
+    if subplan_name:
+        name += f" [{subplan_name}]"
+
+    return name
+
+
+def tree_rows(root):
+    rows = []
+
+    def walk(node, prefix="", connector=""):
+        rows.append(
+            {
+                "Node-Type": f"{prefix}{connector}{node_display_name(node)}",
+                "Sort-Key": compact_value(node.get("Sort Key")),
+                "Index-Cond": compact_value(node.get("Index Cond")),
+                "Recheck-Cond": compact_value(node.get("Recheck Cond")),
+                "Hash-Cond": compact_value(node.get("Hash Cond")),
+                "Merge-Cond": compact_value(node.get("Merge Cond")),
+                "Join-Filter": compact_value(node.get("Join Filter")),
+                "Filter": compact_value(node.get("Filter")),
+            }
+        )
+
+        children = node.get("Plans", [])
+        for idx, child in enumerate(children):
+            last = idx == len(children) - 1
+            child_connector = "└─ " if last else "├─ "
+            child_prefix = prefix + ("   " if connector.startswith("└") else "│  " if connector else "")
+            walk(child, child_prefix, child_connector)
+
+    walk(root)
+    return rows
+
+
+def render_summary(root, out):
+    validate_node(root)
+    rows = tree_rows(root)
+    columns = [
+        "Node-Type",
+        "Sort-Key",
+        "Index-Cond",
+        "Recheck-Cond",
+        "Hash-Cond",
+        "Merge-Cond",
+        "Join-Filter",
+        "Filter",
+    ]
+
+    widths = {}
+    minimums = {
+        "Node-Type": 30,
+        "Sort-Key": 12,
+        "Index-Cond": 14,
+        "Recheck-Cond": 14,
+        "Hash-Cond": 12,
+        "Merge-Cond": 12,
+        "Join-Filter": 12,
+        "Filter": 12,
+    }
+    maximums = {
+        "Node-Type": 56,
+        "Sort-Key": 32,
+        "Index-Cond": 48,
+        "Recheck-Cond": 40,
+        "Hash-Cond": 40,
+        "Merge-Cond": 40,
+        "Join-Filter": 40,
+        "Filter": 48,
+    }
+
+    for column in columns:
+        observed = max([len(column)] + [len(row[column]) for row in rows])
+        widths[column] = min(max(observed, minimums[column]), maximums[column])
+
+    def clip(text, width):
+        if len(text) <= width:
+            return text
+        if width <= 3:
+            return text[:width]
+        return text[: width - 3] + "..."
+
+    def line(values):
+        return " | ".join(clip(values[column], widths[column]).ljust(widths[column]) for column in columns)
+
+    out.write("Plan Tree Summary\n")
+    out.write(line({column: column for column in columns}) + "\n")
+    out.write("-+-".join("-" * widths[column] for column in columns) + "\n")
+    for row in rows:
+        out.write(line(row) + "\n")
+
+
+def render_details(document, root, out):
     validate_node(root)
 
     def walk(node, prefix="", connector=""):
@@ -87,6 +209,13 @@ def render_tree(document, root, out):
         out.write("\nEXPLAIN Document Properties\n")
         for key, value in top_level:
             out.write(f"· {key}: {json_value(value)}\n")
+
+
+def render_tree(document, root, out):
+    render_summary(root, out)
+    out.write("\nNode Details\n")
+    out.write("------------\n")
+    render_details(document, root, out)
 
 
 def quote_ident(value: str) -> str:
@@ -250,12 +379,30 @@ def self_test():
         if actual != expected:
             raise PlanFormatError(f"self-test fixture {idx}: expected {expected} nodes, got {actual}")
 
+    summary_fixture = {
+        "Node Type": "Hash Join",
+        "Hash Cond": "(a.id = b.id)",
+        "Plans": [
+            {"Node Type": "Seq Scan", "Schema": "public", "Relation Name": "a", "Alias": "a", "Filter": "(a.flag = true)"},
+            {"Node Type": "Hash", "Plans": [{"Node Type": "Index Scan", "Index Name": "b_pkey", "Schema": "public", "Relation Name": "b", "Alias": "b", "Index Cond": "(b.id > 0)"}]},
+        ],
+    }
+    rows = tree_rows(summary_fixture)
+    if len(rows) != 4:
+        raise PlanFormatError("self-test: plan summary row count failed")
+    if rows[0]["Hash-Cond"] != "(a.id = b.id)":
+        raise PlanFormatError("self-test: Hash Cond extraction failed")
+    if "using b_pkey on public.b" not in rows[3]["Node-Type"]:
+        raise PlanFormatError("self-test: index/relation display failed")
+    if rows[3]["Index-Cond"] != "(b.id > 0)":
+        raise PlanFormatError("self-test: Index Cond extraction failed")
+
     if relation_reference("public", "orders") != "public.orders":
         raise PlanFormatError("self-test: ordinary relation formatting failed")
     if relation_reference("Mixed Schema", "Order.Table") != '"Mixed Schema"."Order.Table"':
         raise PlanFormatError("self-test: quoted relation formatting failed")
 
-    print(f"plan_tree.py self-test passed: {len(fixtures)} structural fixtures")
+    print(f"plan_tree.py v{RENDERER_VERSION} self-test passed: {len(fixtures)} structural fixtures")
 
 
 def main():
@@ -264,6 +411,12 @@ def main():
 
     p_tree = sub.add_parser("tree")
     p_tree.add_argument("plan_json")
+
+    p_summary = sub.add_parser("summary")
+    p_summary.add_argument("plan_json")
+
+    p_details = sub.add_parser("details")
+    p_details.add_argument("plan_json")
 
     p_meta = sub.add_parser("metadata")
     p_meta.add_argument("plan_json")
@@ -282,6 +435,10 @@ def main():
         _, document, root = load_document(args.plan_json)
         if args.command == "tree":
             render_tree(document, root, sys.stdout)
+        elif args.command == "summary":
+            render_summary(root, sys.stdout)
+        elif args.command == "details":
+            render_details(document, root, sys.stdout)
         elif args.command == "metadata":
             write_metadata(root, args.relations_file, args.dml_file)
         return 0
