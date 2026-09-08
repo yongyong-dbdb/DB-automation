@@ -1,7 +1,7 @@
 #!/bin/sh
 set -u
 
-SCRIPT_VERSION="1.2.2"
+SCRIPT_VERSION="1.2.3"
 SCRIPT_DIR=$(CDPATH='' cd "$(dirname "$0")" && pwd)
 DEFAULT_OUTPUT_DIR="$SCRIPT_DIR/results"
 PSQL_BIN=${PSQL_BIN:-}
@@ -152,7 +152,7 @@ section() { echo; echo "========================================================
 # PostgreSQL 자체 jsonb 함수로 EXPLAIN JSON 분석. Python/jq/외부 패키지 미사용.
 json_sql_prefix() {
     _json_file=$1
-    _tag="PGPLAN_${$}_$(date +%s)"
+    _tag="PGPLAN_$$_$(date +%s)"
     while grep -F "\$${_tag}\$" "$_json_file" >/dev/null 2>&1; do _tag="${_tag}X"; done
     printf 'WITH RECURSIVE plan_source AS (SELECT $%s$\n' "$_tag"
     cat "$_json_file"
