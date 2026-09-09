@@ -1,6 +1,6 @@
-# Validation v1.0.0
+# Validation v1.0.1
 
-Total: 22; passed: 22
+Total: 27; passed: 27
 
 These are shell/mocked SQL regression tests. No live MySQL server was available.
 
@@ -26,3 +26,8 @@ These are shell/mocked SQL regression tests. No live MySQL server was available.
 - PASS: local write failure refences and propagates
 - PASS: local write success removes marker
 - PASS: cleanup disables bootstrap, refences, deletes secrets
+- PASS: partial registration archived before retry
+- PASS: completed registration preserved
+- PASS: migration marker prevents re-registration
+- PASS: legacy node write-fence marker preserved
+- PASS: registration-only failure message

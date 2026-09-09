@@ -1,11 +1,11 @@
 #!/bin/sh
-# mysql_gr_migrate.sh v1.0.0
+# mysql_gr_migrate.sh v1.0.1
 # POSIX sh; OS utilities and MySQL clients only. No external language packages.
 # Supported: Oracle MySQL 8.0.27+, 8.4.x, 9.7.x; homogeneous exact versions.
 # Single-primary or multi-primary / XCom. Never resets GTID or binary logs.
 set -eu
 umask 077
-VERSION=1.0.0
+VERSION=1.0.1
 ROOT=${MYSQL_GR_WORK_ROOT:-"$(pwd)/mysql_gr_work"}
 MYSQL=${MYSQL_GR_MYSQL:-mysql}
 DUMP=${MYSQL_GR_MYSQLDUMP:-mysqldump}
@@ -25,7 +25,7 @@ required() (
 confirm() { [ "$(ask "Type $1 to continue" '')" = "$1" ] || die 'Cancelled.'; }
 uint() { case $1 in ''|*[!0-9]*) return 1;; *) return 0;; esac; }
 port_ok() { uint "$1" && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
-safe_host() { case $1 in ''|*[!a-zA-Z0-9_.-]*) die 'Use an IPv4 address or DNS name (IPv6 is not supported in v1.0.0).';; esac; }
+safe_host() { case $1 in ''|*[!a-zA-Z0-9_.-]*) die 'Use an IPv4 address or DNS name (IPv6 is not supported in v1.0.1).';; esac; }
 q() { printf '%s' "$1" | sed "s/\\\\/\\\\\\\\/g; s/'/''/g"; }
 optq() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 put() { printf '%s\n' "$3" > "$ROOT/$1/$2"; }
@@ -56,7 +56,13 @@ cleanup() {
     [ -z "${TEMP:-}" ] || rm -rf -- "$TEMP"
 
     [ -z "${LOCK:-}" ] || rmdir "$LOCK" 2>/dev/null || :
-    if [ "$rc" -ne 0 ]; then log "Stopped. Preserve state in $ROOT. Inspect status and diagnostics before retrying. Write fences and stopped channels are NOT automatically reversed."; fi
+    if [ "$rc" -ne 0 ]; then
+        if [ "${PHASE:-}" = discover ]; then
+            log "Registration stopped. This discover command did not change databases. Registration state is preserved in $ROOT; rerun discover to retry incomplete registration."
+        else
+            log "Stopped. Preserve state in $ROOT. Inspect status and diagnostics before retrying. Write fences and stopped channels are NOT automatically reversed."
+        fi
+    fi
     exit "$rc"
 }
 help() {
@@ -182,8 +188,39 @@ endpoints_check() (
         fi
     done
 )
+prepare_discovery() (
+    # Only registration metadata may be retried automatically, under the main lock.
+    [ ! -e "$ROOT/meta/complete" ] || die 'Registration already completed. Continue with configure/precheck, or use a different MYSQL_GR_WORK_ROOT.'
+    for marker in mutation_started initialized frozen_gtid bootstrap_attempted joined validated; do
+        [ ! -e "$ROOT/meta/$marker" ] || die "Existing migration progress ($marker) found. Refusing to reset registration; inspect the existing project."
+    done
+    partial=no
+    [ ! -e "$ROOT/meta" ] || partial=yes
+    for node in "$ROOT"/[0-9]*; do
+        [ -e "$node" ] || [ -L "$node" ] || continue
+        [ -d "$node" ] && [ ! -L "$node" ] || die 'Unexpected node state path; inspect manually.'
+        partial=yes
+        for marker in initialized async_stopped before_read_only before_super_read_only before_event_scheduler; do
+            [ ! -e "$node/$marker" ] || die 'Existing node migration progress found; registration must not be reset.'
+        done
+    done
+    [ "$partial" = yes ] || exit 0
+    [ ! -L "$ROOT/meta" ] || die 'Metadata directory must not be a symlink.'
+    backup="$ROOT/discovery_backups/$(date +%Y%m%d_%H%M%S)_$$"
+    mkdir -p "$ROOT/discovery_backups"
+    mkdir "$backup" || die 'Cannot create a unique registration backup.'
+    # Rename the original directories into the backup; no metadata is deleted.
+    [ ! -e "$ROOT/meta" ] || mv "$ROOT/meta" "$backup/meta"
+    for node in "$ROOT"/[0-9]*; do
+        [ -d "$node" ] || continue
+        mv "$node" "$backup/"
+    done
+    log "Incomplete registration backed up: $backup"
+    log 'Starting registration again. Previous inputs must be entered again; no database changes are made by discover.'
+)
 discover() {
-    [ ! -e "$ROOT/meta/count" ] || die 'Existing project found. Use a different MYSQL_GR_WORK_ROOT to rediscover.'
+    PHASE=discover
+    prepare_discovery
     mkdir -p "$ROOT/meta"
     log '1) Existing GTID replication -> GR'; log '2) Standalone -> GR'
     choice=$(required 'Migration mode (1/2)' '')
@@ -284,6 +321,7 @@ discover() {
         put "$i" recovery_ca "$ca"
     done
     put meta complete yes
+    PHASE=registered
     log "Discovery complete: $ROOT"
 }
 no_group() {
@@ -355,6 +393,8 @@ restart_direct() (
     wait_connection "$i"
 )
 configure() {
+    PHASE=configure
+    put meta mutation_started configure
     connected; no_group; endpoints_check
     profile=$(required 'Configuration profile (minimum/production)' minimum)
     case $profile in minimum|production) :;; *) die 'Invalid profile';; esac
@@ -486,6 +526,8 @@ catchup() (
     [ "$(sql "$i" "SELECT GTID_SUBTRACT(@@GLOBAL.gtid_executed,'$(q "$target")');")" = '' ] || die "Node $i contains extra/errant GTIDs; reconcile or externally reprovision"
 )
 initialize() {
+    PHASE=initialize
+    put meta mutation_started initialize
     precheck; fence
     target=$(val 1 gtid_executed)
     put meta frozen_gtid "$target"
@@ -650,6 +692,8 @@ wait_member() (
     die "Node $i did not become ONLINE within 300 seconds"
 )
 cutover() {
+    PHASE=cutover
+    put meta mutation_started cutover
     [ -f "$ROOT/meta/initialized" ] || die 'Run initialize first'
     [ ! -f "$ROOT/meta/bootstrap_attempted" ] || die 'Bootstrap was already attempted. Inspect status; do not automatically rebootstrap.'
     precheck
@@ -800,3 +844,4 @@ main() {
     esac
 }
 if [ "${MYSQL_GR_LIB_ONLY:-0}" != 1 ]; then main; fi
+

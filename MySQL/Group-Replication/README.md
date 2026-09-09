@@ -1,4 +1,4 @@
-# MySQL GR 전환 자동화 v1.0.0
+# MySQL GR 전환 자동화 v1.0.1
 
 작성 기준: 2026-09-09. 전체 실행 코드: `mysql_gr_migrate.sh`.
 
@@ -158,3 +158,15 @@ XCom의 Incremental Recovery 계정에는 `REPLICATION SLAVE`, `CONNECTION_ADMIN
 - [GR TLS](https://dev.mysql.com/doc/refman/8.4/en/group-replication-secure-socket-layer-support-ssl.html)
 - [GR System Variables](https://dev.mysql.com/doc/refman/8.4/en/group-replication-system-variables.html)
 - [Replica Options / skip_replica_start](https://dev.mysql.com/doc/refman/8.4/en/replication-options-replica.html)
+
+
+## v1.0.1 — 미완료 등록 재시도
+
+`discover` 도중 중단되어 `meta/count`만 남은 경우, 등록 정보를 `discovery_backups/시간_PID/`에 보존하고 처음부터 다시 입력받는다. 기존 작업 디렉터리 전체를 삭제하거나 DB를 초기화하지 않는다. 등록 완료 파일이나 설정·초기화·전환 진행 흔적이 있으면 자동 재등록을 차단한다. `discover` 실패 안내는 DB 변경을 수행하지 않았음을 구분해 표시한다.
+
+기존 파일을 v1.0.1 전체 코드로 교체한 뒤 같은 작업 디렉터리에서 재실행한다. 파일명을 `gr_migrate.sh`로 저장한 경우:
+
+```sh
+sh gr_migrate.sh --version
+sh gr_migrate.sh discover
+```

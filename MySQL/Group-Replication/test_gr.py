@@ -78,7 +78,36 @@ exit 9
     r=subprocess.run(['sh','-c',body],capture_output=True,text=True)
     a=Path(d,'actions').read_text();ok=r.returncode==9 and 'bootstrap_group=OFF' in a and '2 SET GLOBAL super_read_only=ON;' in a and not Path(d,'temp').exists()
     results.append(('cleanup disables bootstrap, refences, deletes secrets',ok,r.returncode,a));print('PASS' if ok else 'FAIL',results[-1][0])
-report=['# Validation v1.0.0','',f'Total: {len(results)}; passed: {sum(x[1] for x in results)}','', 'These are shell/mocked SQL regression tests. No live MySQL server was available.','']
+run('partial registration archived before retry', '''
+put meta count 3; put 1 uuid preserved; mkdir -p "$ROOT/runs"; printf keep > "$ROOT/runs/evidence"
+prepare_discovery
+[ ! -e "$ROOT/meta" ]; [ ! -e "$ROOT/1" ]
+[ "$(cat "$ROOT"/discovery_backups/*/meta/count)" = 3 ]
+[ "$(cat "$ROOT"/discovery_backups/*/1/uuid)" = preserved ]
+[ "$(cat "$ROOT/runs/evidence")" = keep ]
+''')
+run('completed registration preserved', '''
+put meta complete yes
+(prepare_discovery) && exit 1
+[ "$(get meta complete)" = yes ]; [ ! -e "$ROOT/discovery_backups" ]
+''')
+run('migration marker prevents re-registration', '''
+put meta initialized yes
+(prepare_discovery) && exit 1
+[ "$(get meta initialized)" = yes ]; [ ! -e "$ROOT/discovery_backups" ]
+''')
+run('legacy node write-fence marker preserved', '''
+put 2 before_read_only 0
+(prepare_discovery) && exit 1
+[ "$(get 2 before_read_only)" = 0 ]; [ ! -e "$ROOT/discovery_backups" ]
+''')
+run('registration-only failure message', '''
+( PHASE=discover; trap cleanup 0; exit 7 ) 2> "$RUN/cleanup.log" && exit 1
+grep -F 'did not change databases' "$RUN/cleanup.log"
+! grep -F 'Write fences' "$RUN/cleanup.log"
+''')
+report=['# Validation v1.0.1','',f'Total: {len(results)}; passed: {sum(x[1] for x in results)}','', 'These are shell/mocked SQL regression tests. No live MySQL server was available.','']
 for name,ok,rc,output in results: report.append(f'- {"PASS" if ok else "FAIL"}: {name}')
 (script.parent / 'VALIDATION.md').write_text('\n'.join(report)+'\n')
 if not all(x[1] for x in results): raise SystemExit(1)
+
