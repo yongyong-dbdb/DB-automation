@@ -3,7 +3,7 @@
 set -u
 
 SCRIPT_NAME=${0##*/}
-SCRIPT_VERSION=1.0.13
+SCRIPT_VERSION=1.0.14
 STEP=${1:-help}
 STATE_FILE=${MYSQL_GTID_STATE_FILE:-"$(pwd)/.mysql_gtid_replication.state"}
 WORK_ROOT=${MYSQL_GTID_WORK_ROOT:-"$(pwd)/mysql_gtid_replication_work"}
@@ -1033,6 +1033,19 @@ format_bytes() {
     }'
 }
 
+compare_source_replica_gtids() {
+    source_gtid=$(mysql_query source "SELECT REPLACE(REPLACE(@@GLOBAL.gtid_executed,CHAR(10),''),CHAR(13),'');") || die "cannot read Source GTID state"
+    replica_gtid=$(mysql_query replica "SELECT REPLACE(REPLACE(@@GLOBAL.gtid_executed,CHAR(10),''),CHAR(13),'');") || die "cannot read Replica GTID state"
+    q_source_gtid=$(sql_quote "$source_gtid")
+    q_replica_gtid=$(sql_quote "$replica_gtid")
+    replica_extra=$(mysql_query replica "SELECT GTID_SUBTRACT('$q_replica_gtid','$q_source_gtid');") || die "cannot compare Replica extra GTIDs"
+    replica_missing=$(mysql_query replica "SELECT GTID_SUBTRACT('$q_source_gtid','$q_replica_gtid');") || die "cannot compare Replica missing GTIDs"
+    GTID_SOURCE=$source_gtid
+    GTID_REPLICA=$replica_gtid
+    GTID_EXTRA=$replica_extra
+    GTID_MISSING=$replica_missing
+}
+
 initialize() {
     load_state
     need_cmd mysql
@@ -1123,34 +1136,29 @@ initialize() {
         warn "$non_innodb selected table(s) are not InnoDB. --single-transaction cannot provide a fully consistent online copy for them."
         confirm_phrase "Convert/exclude those tables, or explicitly accept possible inconsistency." "ACCEPT NON-INNODB RISK"
     fi
-    replica_gtid=$(mysql_query replica "SELECT @@GLOBAL.gtid_executed;") || die "cannot read Replica GTID state"
-    if [ -n "$replica_gtid" ]; then
+    compare_source_replica_gtids
+    if [ -n "$GTID_REPLICA" ]; then
         log ""
         log "============================================================"
-        log "[ACTION REQUIRED] Existing Replica GTID"
+        log "[ACTION REQUIRED] Existing Replica GTID history"
         log "============================================================"
-        warn "Replica gtid_executed: $replica_gtid"
-        log "This is transaction history, not the gtid_mode setting in my.cnf."
-        log "Action  : reset existing channels, binary logs, and Replica GTID history"
-        log "Use only: new/rebuildable Replica with no data or GTID history to preserve"
-        log "Recovery: not automatically reversible"
-        confirm_phrase "Logical restore with SET GTID_PURGED requires a compatible clean GTID state." "RESET REPLICA GTID"
-        replica_ver=$(mysql_query replica "SELECT @@version;")
-        replica_num=$(version_number "$replica_ver")
-        reset_syntax=$(replication_syntax "$replica_ver")
-        if [ "$reset_syntax" = modern ]; then
-            mysql_query replica "STOP REPLICA;" >/dev/null 2>&1 || true
-            mysql_query replica "RESET REPLICA ALL;" >/dev/null 2>&1 || true
-        else
-            mysql_query replica "STOP SLAVE;" >/dev/null 2>&1 || true
-            mysql_query replica "RESET SLAVE ALL;" >/dev/null 2>&1 || true
+        log "Source gtid_executed : ${GTID_SOURCE:-NONE}"
+        log "Replica gtid_executed: ${GTID_REPLICA:-NONE}"
+        log "Extra on Replica     : ${GTID_EXTRA:-NONE}"
+        log "Missing on Replica   : ${GTID_MISSING:-NONE}"
+        log "The script never clears GTID execution history automatically."
+        if [ -n "$GTID_EXTRA" ]; then
+            warn "Replica contains GTIDs that are not present on Source. Online dump restore is blocked."
+            warn "Inspect/reconcile those transactions or rebuild/reprovision Replica from the authoritative Source."
+            next_step initialize "After reviewed rebuild/reprovisioning, rerun initialize; do not reset GTID history in place."
+            die "Replica has extra/errant GTIDs; destructive GTID reset is intentionally disabled"
         fi
-        if [ "$replica_num" -ge 8004000 ]; then
-            mysql_query replica "RESET BINARY LOGS AND GTIDS;" || die "failed to reset Replica GTIDs"
-        else
-            mysql_query replica "RESET MASTER;" || die "failed to reset Replica GTIDs"
-        fi
+        warn "Replica GTIDs are a subset/equal set of Source, but mysqldump --set-gtid-purged=ON requires a clean compatible target GTID state for automated restore."
+        warn "Use 'already' when this Replica is an existing valid copy that should catch up with GTID auto-positioning, or externally rebuild it before using online-dump."
+        next_step initialize "Choose already for a reviewed existing Replica, or externally rebuild to a clean Replica before online-dump."
+        die "online-dump requires an empty Replica GTID history; no automatic reset is performed"
     fi
+    [ "${replica_app_tables:-0}" -eq 0 ] || die "online-dump requires an empty Replica application-data state; use already for a reviewed existing Replica or externally rebuild it"
     dump_file="$RUN_DIR/source_initial_dump.sql"
     dump_object_options="--triggers"
     [ "$include_routines" = yes ] && dump_object_options="$dump_object_options --routines"
