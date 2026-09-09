@@ -1,7 +1,7 @@
 #!/bin/sh
 set -u
 
-SCRIPT_VERSION="1.2.12"
+SCRIPT_VERSION="1.2.13"
 SCRIPT_DIR=$(CDPATH='' cd "$(dirname "$0")" && pwd)
 DEFAULT_OUTPUT_DIR="$SCRIPT_DIR/results"
 PSQL_BIN=${PSQL_BIN:-}
@@ -38,7 +38,7 @@ if [ -z "${PGHOST:-}" ] && [ -n "${PGDATA:-}" ]; then
 fi
 if [ -z "${PGHOST:-}" ]; then printf 'PGHOST [local socket/default]: ' >&2; IFS= read -r _v; [ -z "$_v" ] || PGHOST=$_v; fi
 if [ -z "${PGPORT:-}" ]; then printf 'PGPORT [5432]: ' >&2; IFS= read -r _v; PGPORT=${_v:-5432}; fi
-if [ -z "${PGUSER:-}" ]; then printf 'PGUSER [%s]: ' "${USER:-postgres}" >&2; IFS= read -r _v; PGUSER=${_v:-${USER:-postgres}}; fi
+if [ -z "${PGUSER:-}" ]; then printf 'PGUSER [postgres]: ' >&2; IFS= read -r _v; PGUSER=${_v:-postgres}; fi
 if [ -z "${PGDATABASE:-}" ]; then printf 'PGDATABASE [%s]: ' "$PGUSER" >&2; IFS= read -r _v; PGDATABASE=${_v:-$PGUSER}; fi
 export PGPORT PGUSER PGDATABASE
 [ -n "${PGHOST:-}" ] && export PGHOST
