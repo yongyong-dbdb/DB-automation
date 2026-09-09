@@ -1,7 +1,7 @@
 #!/bin/sh
 set -u
 
-SCRIPT_VERSION="1.2.5"
+SCRIPT_VERSION="1.2.6"
 SCRIPT_DIR=$(CDPATH='' cd "$(dirname "$0")" && pwd)
 DEFAULT_OUTPUT_DIR="$SCRIPT_DIR/results"
 PSQL_BIN=${PSQL_BIN:-}
@@ -189,6 +189,8 @@ SQL
 
 render_plan_summary() {
     _json_file=$1
+    _rows="$work_dir/plan-summary-rows.tsv"
+    _sep=$(printf '\t')
     {
         json_sql_prefix "$_json_file"
         cat <<'SQL'
@@ -207,7 +209,7 @@ nodes(path, node, is_last, depth) AS (
            (node->>'Node Type') ||
            CASE WHEN node ? 'Index Name' THEN ' using ' || node->>'Index Name' ELSE '' END ||
            CASE WHEN node ? 'Relation Name' THEN ' on ' || COALESCE((node->>'Schema') || '.', '') || node->>'Relation Name' ELSE '' END AS node_type,
-           array_to_string(ARRAY(SELECT jsonb_array_elements_text(COALESCE(node->'Sort Key','[]'::jsonb))), ', ') AS sort_key,
+           COALESCE(array_to_string(ARRAY(SELECT jsonb_array_elements_text(COALESCE(node->'Sort Key','[]'::jsonb))), ', '), '') AS sort_key,
            COALESCE(node->>'Index Cond','') AS index_cond,
            COALESCE(node->>'Recheck Cond','') AS recheck_cond,
            COALESCE(node->>'Hash Cond','') AS hash_cond,
@@ -216,11 +218,18 @@ nodes(path, node, is_last, depth) AS (
            COALESCE(node->>'Filter','') AS filter
     FROM nodes
 )
-SELECT node_type || E'\t' || sort_key || E'\t' || index_cond || E'\t' || recheck_cond || E'\t' || hash_cond || E'\t' || merge_cond || E'\t' || join_filter || E'\t' || filter
+SELECT COALESCE(node_type,''), sort_key, index_cond, recheck_cond, hash_cond, merge_cond, join_filter, filter
 FROM formatted
 ORDER BY path;
 SQL
-    } | run_psql -X -qAt -v ON_ERROR_STOP=1 | awk -F '\t' '
+    } | run_psql -X -qAt -F "$_sep" -v ON_ERROR_STOP=1 > "$_rows" || return 1
+
+    [ -s "$_rows" ] || {
+        echo "ERROR: Plan Tree rows were not generated." >&2
+        return 1
+    }
+
+    awk -F '\t' '
 BEGIN {
     printf "%-56s | %-24s | %-38s | %-30s | %-30s | %-30s | %-30s | %-38s\n", "Node-Type","Sort-Key","Index-Cond","Recheck-Cond","Hash-Cond","Merge-Cond","Join-Filter","Filter";
     printf "%-56s-+-%-24s-+-%-38s-+-%-30s-+-%-30s-+-%-30s-+-%-30s-+-%-38s\n", "--------------------------------------------------------","------------------------","--------------------------------------","------------------------------","------------------------------","------------------------------","------------------------------","--------------------------------------";
@@ -228,7 +237,7 @@ BEGIN {
 function clip(s,n) { return length(s)<=n?s:substr(s,1,n-3)"..." }
 {
     printf "%-56s | %-24s | %-38s | %-30s | %-30s | %-30s | %-30s | %-38s\n", clip($1,56),clip($2,24),clip($3,38),clip($4,30),clip($5,30),clip($6,30),clip($7,30),clip($8,38)
-}'
+}' "$_rows"
 }
 
 build_bind_map() {
@@ -441,7 +450,7 @@ fi
 } > "$RESULT_FILE"
 section "Execution Plan" | tee -a "$RESULT_FILE"
 run_psql -X -qAt -P pager=off -v ON_ERROR_STOP=1 -f "$tmp" > "$actual_plan_json" 2>"$plan_error" || { cat "$plan_error" | tee -a "$RESULT_FILE" >&2; exit 1; }
-render_plan_summary "$actual_plan_json" > "$plan_summary" || { echo "ERROR: Plan Tree Summary generation failed." >&2; exit 1; }
+render_plan_summary "$actual_plan_json" > "$plan_summary" 2>"$plan_error" || { cat "$plan_error" >&2; echo "ERROR: Plan Tree Summary generation failed." >&2; exit 1; }
 cat "$plan_summary" | tee -a "$RESULT_FILE"
 
 if [ "$ANALYZE" = yes ] && [ -s "$rel_file" ]; then
