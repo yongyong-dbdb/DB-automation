@@ -1,7 +1,7 @@
 #!/bin/sh
 set -u
 
-SCRIPT_VERSION="1.2.22"
+SCRIPT_VERSION="1.2.23"
 SCRIPT_DIR=$(CDPATH='' cd "$(dirname "$0")" && pwd)
 DEFAULT_OUTPUT_DIR="$SCRIPT_DIR/results"
 PSQL_BIN=${PSQL_BIN:-}
@@ -291,6 +291,7 @@ PGSS_SEARCH_PATH=
 PGSS_RAW_SQL_FILE=
 PGSS_ORIGINAL_BIND_MAX=
 PGSS_NORMALIZED_VALUES_FILE=
+PGSS_NORMALIZED_NULL_USED=no
 detect_pg_stat_statements() {
     PGSS_RELATION=$(run_psql -X -qAt -v ON_ERROR_STOP=1 <<'SQL' 2>/dev/null || true
 SELECT format('%I.pg_stat_statements', n.nspname)
@@ -662,21 +663,45 @@ prepare_pgss_replay_sql() {
     while [ "$_n" -le "$_param_max" ]; do
         if grep -Eq "\\\$${_n}([^0-9]|$)" "$PGSS_RAW_SQL_FILE"; then
             _context=$(pgss_parameter_context "$PGSS_RAW_SQL_FILE" "$_n")
-            if [ -n "$_context" ]; then
-                printf '정규화 상수 $%s 값 (context=%s, \\N=SQL NULL): ' "$_n" "$_context" >&2
-            else
-                printf '정규화 상수 $%s 값 (\\N=SQL NULL): ' "$_n" >&2
-            fi
-            IFS= read -r _value || return 1
-            while [ -z "$_value" ]; do
-                echo "ERROR: pg_stat_statements에는 원래 literal 값이 없으므로 값을 입력해야 합니다." >&2
+            while :; do
                 if [ -n "$_context" ]; then
-                    printf '정규화 상수 $%s 값 (context=%s, \\N=SQL NULL): ' "$_n" "$_context" >&2
+                    printf '정규화 상수 $%s 값 (context=%s, \\N=SQL NULL / 실제 원본 literal이 NULL인 경우만): ' "$_n" "$_context" >&2
                 else
-                    printf '정규화 상수 $%s 값 (\\N=SQL NULL): ' "$_n" >&2
+                    printf '정규화 상수 $%s 값 (\\N=SQL NULL / 실제 원본 literal이 NULL인 경우만): ' "$_n" >&2
                 fi
                 IFS= read -r _value || return 1
+                if [ -z "$_value" ]; then
+                    echo "ERROR: pg_stat_statements에는 원래 literal 값이 없으므로 값을 입력해야 합니다." >&2
+                    continue
+                fi
+
+                if [ "$_value" = '\N' ]; then
+                    echo >&2
+                    echo "주의: \\N은 원본 literal을 실제 SQL NULL로 복원합니다." >&2
+                    echo "      NULL을 =, <>, <, > 등의 일반 비교식에 사용하면 결과가 TRUE가 아니라 UNKNOWN이 되어" >&2
+                    echo "      WHERE 조건에서 제외되고 실행 계획의 해당 branch/relation scan이 제거될 수 있습니다." >&2
+                    echo "      원래 literal이 실제 NULL이었다는 것이 확실한 경우에만 사용하세요." >&2
+                    _null_confirmed=no
+                    while :; do
+                        printf '정규화 상수 $%s를 SQL NULL로 복원하시겠습니까? y/n [n]: ' "$_n" >&2
+                        IFS= read -r _null_ok || return 1
+                        [ -n "$_null_ok" ] || _null_ok=n
+                        _null_ok=$(printf '%s' "$_null_ok" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+                        case $_null_ok in
+                            y) _null_confirmed=yes; break ;;
+                            n) _null_confirmed=no; break ;;
+                            *) echo "ERROR: y 또는 n을 입력하세요." >&2 ;;
+                        esac
+                    done
+                    if [ "$_null_confirmed" != yes ]; then
+                        echo "안내: SQL NULL 복원을 취소했습니다. 값을 다시 입력하세요." >&2
+                        continue
+                    fi
+                    PGSS_NORMALIZED_NULL_USED=yes
+                fi
+                break
             done
+
             _sql_value=$(pgss_render_sql_value "$_value" "$_context")
             printf '%s\t%s\n' "$_n" "$_sql_value" >> "$_map"
             printf '$%s [normalized constant%s] = %s\n' "$_n" "${_context:+ / $_context}" "${_value}" >> "$PGSS_NORMALIZED_VALUES_FILE"
@@ -1684,6 +1709,7 @@ fi
      echo "execute_user=$PGSS_EXECUTE_USER"
      echo "execute_search_path=$PGSS_SEARCH_PATH"
      echo "original_search_path=unavailable"
+     echo "pgss_normalized_null_used=$PGSS_NORMALIZED_NULL_USED"
      [ -z "$PGSS_ORIGINAL_BIND_MAX" ] || echo "pgss_original_bind_max=$PGSS_ORIGINAL_BIND_MAX"
      if [ -n "$PGSS_NORMALIZED_VALUES_FILE" ] && [ -s "$PGSS_NORMALIZED_VALUES_FILE" ]; then
          echo "pgss_normalized_values:"
@@ -1725,6 +1751,9 @@ if [ "$BIND" = yes ] && grep -Eiq 'One-Time Filter:[[:space:]]*false' "$raw_plan
         echo "      입력한 bind 값 조합으로 상수 조건이 FALSE가 되어 하위 relation scan이 제거된 상태입니다."
         echo "      이는 EXPLAIN 오류가 아니라 해당 bind 값에 대한 실제 계획 결과입니다."
         echo "      SQL 상수와 비교되는 bind는 표시된 자동 기본값을 사용했는지 확인하세요."
+        if [ "$SQL_SOURCE_KIND" = pgss ] && [ "$PGSS_NORMALIZED_NULL_USED" = yes ]; then
+            echo "      또한 정규화 상수에 SQL NULL을 복원했습니다. NULL의 일반 비교는 TRUE가 되지 않아 branch가 제거될 수 있습니다."
+        fi
         echo
     } | tee -a "$RESULT_FILE"
 fi
