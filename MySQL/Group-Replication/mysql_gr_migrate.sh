@@ -1,11 +1,11 @@
 #!/bin/sh
-# mysql_gr_migrate.sh v1.0.6
+# mysql_gr_migrate.sh v1.0.7
 # POSIX sh; OS utilities and MySQL clients only. No external language packages.
 # Supported: Oracle MySQL 8.0.27+, 8.4.x, 9.7.x; homogeneous exact versions.
 # Single-primary or multi-primary / XCom. Never resets GTID or binary logs.
 set -eu
 umask 077
-VERSION=1.0.6
+VERSION=1.0.7
 ROOT=${MYSQL_GR_WORK_ROOT:-"$(pwd)/mysql_gr_work"}
 MYSQL=${MYSQL_GR_MYSQL:-mysql}
 DUMP=${MYSQL_GR_MYSQLDUMP:-mysqldump}
@@ -1060,19 +1060,20 @@ write_mysqlbinlog_command() {
         printf 'mysqlbinlog --read-from-remote-server --base64-output=DECODE-ROWS -vv '
         if [ "$(get "$i" mode)" = socket ]; then
             printf '%s ' '--protocol=SOCKET'
-            printf '%s ' "--socket=$(get "$i" socket)"
+            shell_quote "--socket=$(get "$i" socket)"; printf ' '
         else
             printf '%s ' '--protocol=TCP'
-            printf '%s ' "--host=$(get "$i" host)"
-            printf '%s ' "--port=$(get "$i" port)"
-            printf '%s ' "--ssl-mode=$(get "$i" admin_tls)"
+            shell_quote "--host=$(get "$i" host)"; printf ' '
+            shell_quote "--port=$(get "$i" port)"; printf ' '
+            shell_quote "--ssl-mode=$(get "$i" admin_tls)"; printf ' '
             if [ -s "$ROOT/$i/admin_ca" ]; then
-                printf '%s ' "--ssl-ca=$(get "$i" admin_ca)"
+                shell_quote "--ssl-ca=$(get "$i" admin_ca)"; printf ' '
             fi
         fi
-        printf '%s ' "--user=$(get "$i" user)"
+        shell_quote "--user=$(get "$i" user)"; printf ' '
         printf '%s ' '--password'
-        printf '%s ' "--include-gtids=$include_gtids"
+        shell_quote "--include-gtids=$include_gtids"; printf '%s' ' '
+
         tab=$(printf '\t')
         while IFS="$tab" read -r log_name rest; do
             [ -n "$log_name" ] || continue
@@ -1100,6 +1101,7 @@ inspect_extra_gtids() {
     available_extra=$(normalize_gtid "$(sql "$i" "SELECT GTID_SUBTRACT('$(q "$extra")',@@GLOBAL.gtid_purged);")")
     purged_extra=$(normalize_gtid "$(sql "$i" "SELECT GTID_SUBTRACT('$(q "$extra")',GTID_SUBTRACT(@@GLOBAL.gtid_executed,@@GLOBAL.gtid_purged));")")
     log_count=$(awk 'END{print NR+0}' "$logs_file")
+    log_bytes=$(awk -F '\t' '{sum += $2} END{printf "%.0f",sum+0}' "$logs_file")
 
     {
         printf 'FIELD\tVALUE\n'
@@ -1110,12 +1112,14 @@ inspect_extra_gtids() {
         printf 'EXTRA_PURGED_FROM_CURRENT_BINLOGS\t%s\n' "$purged_extra"
         printf 'LOG_BIN_BASENAME\t%s\n' "$binlog_basename"
         printf 'BINARY_LOG_COUNT\t%s\n' "$log_count"
+        printf 'BINARY_LOG_BYTES_TO_SCAN\t%s\n' "$log_bytes"
     } > "$summary_file"
 
     log "Node $i read-only errant-GTID inspection:"
     log "  Available in current binary logs: ${available_extra:-NONE}"
     log "  Already purged from binary logs  : ${purged_extra:-NONE}"
     log "  Binary log list                  : $logs_file"
+    log "  Current binary log bytes to scan : $log_bytes"
     log "  Inspection summary               : $summary_file"
     [ -z "$purged_extra" ] || log '  NOTE: Purged GTIDs cannot be reconstructed from the current binary logs; use retained backups/audit evidence if transaction contents must be reviewed.'
 
@@ -1160,7 +1164,7 @@ divergence_workflow() {
     [ -n "$GTID_EXTRA" ] || return 0
     log "Node $i has divergent GTID history. There is no automatic ignore, skip, GTID rewrite, or reset path."
     while :; do
-        log '  inspect : read current binary logs and decode only the extra GTIDs; no SQL is applied.'
+        log '  inspect : read current binary logs and decode only the extra GTIDs; no SQL is applied (binary-log I/O/network reads may occur).'
         log '  external: stop here for reviewed reconciliation/reprovisioning from the authoritative source.'
         log '  abort   : stop without changing GTID history; existing write fences/state remain preserved.'
         action=$(required "Node $i divergent GTID action (inspect/external/abort)" inspect)
