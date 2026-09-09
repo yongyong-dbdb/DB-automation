@@ -1,5 +1,5 @@
 name: Temporary MySQL GR v1.0.7 update
-# retry: 2
+# retry: 3
 on:
   push:
     paths:
