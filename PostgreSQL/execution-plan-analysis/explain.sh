@@ -1,7 +1,7 @@
 #!/bin/sh
 set -u
 
-SCRIPT_VERSION="1.2.24"
+SCRIPT_VERSION="1.2.25"
 SCRIPT_DIR=$(CDPATH='' cd "$(dirname "$0")" && pwd)
 DEFAULT_OUTPUT_DIR="$SCRIPT_DIR/results"
 PSQL_BIN=${PSQL_BIN:-}
@@ -894,7 +894,7 @@ prepare_pgss_replay_sql() {
             _context=$(pgss_parameter_context "$PGSS_RAW_SQL_FILE" "$_n")
             PGSS_NORMALIZED_DEFAULT_AVAILABLE=no
             PGSS_NORMALIZED_DEFAULT_VALUE=
-            show_pgss_normalized_candidates "$_n" "$_candidate_map" >/dev/stdout 2>/dev/stderr || true
+            show_pgss_normalized_candidates "$_n" "$_candidate_map" || true
 
             while :; do
                 if [ "$PGSS_NORMALIZED_DEFAULT_AVAILABLE" = yes ]; then
@@ -980,7 +980,7 @@ prepare_pgss_replay_sql() {
 
     SQL_FILE=$_replay
     echo
-    echo "안내: 정규화 상수는 선택/입력한 값으로 SQL에 복원했습니다."
+    echo "안내: 정규화 상수는 입력값으로 SQL에 복원했습니다."
     if [ "$PGSS_ORIGINAL_BIND_MAX" -gt 0 ]; then
         printf '      기존 bind로 분류된 $1~$%s는 기존 후보값/기본값 탐색 절차로 처리합니다.\n' "$PGSS_ORIGINAL_BIND_MAX"
     else
