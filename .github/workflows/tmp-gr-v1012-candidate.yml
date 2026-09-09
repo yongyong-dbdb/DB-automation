@@ -154,7 +154,7 @@ jobs:
           grep -q '  source_application.sql$' "$rdir/source_application.sql.sha256"
           (cd "$rdir" && sha256sum -c source_accounts.sql.sha256 source_application.sql.sha256)
           faildir="$RUN/fail_accounts"; mkdir -p "$faildir"
-          if FAIL_GRANTS=yes export_source_accounts "$faildir" >/dev/null 2>&1; then
+          if (FAIL_GRANTS=yes export_source_accounts "$faildir") >/dev/null 2>&1; then
               echo 'SHOW GRANTS failure was incorrectly accepted' >&2
               exit 1
           fi
