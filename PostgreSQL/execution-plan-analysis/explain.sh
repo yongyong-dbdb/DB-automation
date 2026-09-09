@@ -1,7 +1,7 @@
 #!/bin/sh
 set -u
 
-SCRIPT_VERSION="1.2.4"
+SCRIPT_VERSION="1.2.5"
 SCRIPT_DIR=$(CDPATH='' cd "$(dirname "$0")" && pwd)
 DEFAULT_OUTPUT_DIR="$SCRIPT_DIR/results"
 PSQL_BIN=${PSQL_BIN:-}
@@ -149,7 +149,6 @@ ask_bind_plan_mode() {
 }
 section() { echo; echo "============================================================"; echo "$1"; echo "============================================================"; }
 
-# PostgreSQL 자체 jsonb 함수로 EXPLAIN JSON 분석. Python/jq/외부 패키지 미사용.
 json_sql_prefix() {
     _json_file=$1
     _tag="PGPLAN_$$_$(date +%s)"
@@ -380,8 +379,6 @@ else
 fi
 [ "$SERVER_VERSION_NUM" -lt 170000 ] || MEMORY=$(ask 'Use MEMORY? yes/no' no)
 SUMMARY=$(ask 'Use SUMMARY? yes/no' yes)
-printf 'RAW FORMAT (TEXT/JSON/YAML/XML) [TEXT]: ' >&2; IFS= read -r FORMAT; [ -n "$FORMAT" ] || FORMAT=TEXT; FORMAT=$(printf '%s' "$FORMAT" | tr '[:lower:]' '[:upper:]')
-case $FORMAT in TEXT|JSON|YAML|XML) ;; *) echo "ERROR: invalid format" >&2; exit 1 ;; esac
 
 base_plan_opts=""
 add_opt() { [ -z "$base_plan_opts" ] && base_plan_opts="$1" || base_plan_opts="$base_plan_opts, $1"; }
@@ -393,10 +390,8 @@ if [ "$ANALYZE" = yes ]; then [ "$BUFFERS" = yes ] && add_opt 'BUFFERS TRUE' || 
 [ "$GENERIC_PLAN" = yes ] && add_opt 'GENERIC_PLAN TRUE'
 [ "$SUMMARY" = yes ] && add_opt 'SUMMARY TRUE' || add_opt 'SUMMARY FALSE'
 actual_json_opts="$base_plan_opts, FORMAT JSON"
-planned_opts=$(printf '%s' "$base_plan_opts" | sed 's/ANALYZE TRUE, *//; s/BUFFERS TRUE, *//; s/BUFFERS FALSE, *//; s/WAL TRUE, *//; s/WAL FALSE, *//; s/TIMING TRUE, *//; s/TIMING FALSE, *//')
-planned_raw_opts="$planned_opts, FORMAT $FORMAT"
 
-precheck_json="$work_dir/precheck.json"; actual_plan_json="$work_dir/actual.json"; rel_file="$work_dir/relations.txt"; dml_file="$work_dir/dml.txt"; plan_error="$work_dir/plan.err"; plan_summary="$work_dir/summary.txt"; tmp="$work_dir/explain.sql"; raw_tmp="$work_dir/raw.sql"; plan_output="$work_dir/raw.out"
+precheck_json="$work_dir/precheck.json"; actual_plan_json="$work_dir/actual.json"; rel_file="$work_dir/relations.txt"; dml_file="$work_dir/dml.txt"; plan_error="$work_dir/plan.err"; plan_summary="$work_dir/summary.txt"; tmp="$work_dir/explain.sql"
 table_before="$work_dir/table.before"; table_after="$work_dir/table.after"; index_before="$work_dir/index.before"; index_after="$work_dir/index.after"
 RESULT_DIR=${EXPLAIN_RESULT_DIR:-$DEFAULT_OUTPUT_DIR}; mkdir -p "$RESULT_DIR" || exit 1
 result_database=$(printf '%s' "$PGDATABASE" | tr -c '[:alnum:]_.-' '_'); RESULT_FILE="$RESULT_DIR/explain_${result_database}_$(date '+%Y%m%d_%H%M%S').log"
@@ -411,7 +406,6 @@ emit_plan() {
     else
         printf 'EXPLAIN (%s)\n' "$opts"
         cat "$SQL_FILE"
-        # SQL 파일이 세미콜론 없이 끝나더라도 뒤의 ROLLBACK/다음 명령과 결합되지 않도록 강제 종료.
         printf '\n;\n'
     fi
 }
@@ -443,19 +437,13 @@ else
 fi
 
 {
- echo "PostgreSQL execution plan analysis"; echo "script_version=$SCRIPT_VERSION"; echo "database=$PGDATABASE"; echo "sql_file=$SQL_FILE"; echo "json_parser=PostgreSQL jsonb functions"; echo
+ echo "PostgreSQL execution plan analysis"; echo "script_version=$SCRIPT_VERSION"; echo "database=$PGDATABASE"; echo "sql_file=$SQL_FILE"; echo
 } > "$RESULT_FILE"
 section "Execution Plan" | tee -a "$RESULT_FILE"
-echo "Parser      : PostgreSQL jsonb only (no Python/jq/external package)" | tee -a "$RESULT_FILE"
 run_psql -X -qAt -P pager=off -v ON_ERROR_STOP=1 -f "$tmp" > "$actual_plan_json" 2>"$plan_error" || { cat "$plan_error" | tee -a "$RESULT_FILE" >&2; exit 1; }
 render_plan_summary "$actual_plan_json" > "$plan_summary" || { echo "ERROR: Plan Tree Summary generation failed." >&2; exit 1; }
-section "Plan Tree Summary" | tee -a "$RESULT_FILE"; cat "$plan_summary" | tee -a "$RESULT_FILE"
-section "Execution Plan Raw (JSON)" | tee -a "$RESULT_FILE"; cat "$actual_plan_json" | tee -a "$RESULT_FILE"
+cat "$plan_summary" | tee -a "$RESULT_FILE"
 
-if [ "$FORMAT" != JSON ]; then
-    emit_plan "$planned_raw_opts" > "$raw_tmp"
-    if run_psql -X -q -P pager=off -v ON_ERROR_STOP=1 -f "$raw_tmp" > "$plan_output" 2>"$plan_error"; then section "Execution Plan Raw ($FORMAT / Planned Only)" | tee -a "$RESULT_FILE"; cat "$plan_output" | tee -a "$RESULT_FILE"; fi
-fi
 if [ "$ANALYZE" = yes ] && [ -s "$rel_file" ]; then
     snapshot_stats "$table_after" "$index_after"
     section "Table Statistics Delta" | tee -a "$RESULT_FILE"; print_delta "$table_before" "$table_after" 10 | tee -a "$RESULT_FILE"
