@@ -1,7 +1,7 @@
 #!/bin/sh
 set -u
 
-SCRIPT_VERSION="1.2.14"
+SCRIPT_VERSION="1.2.15"
 SCRIPT_DIR=$(CDPATH='' cd "$(dirname "$0")" && pwd)
 DEFAULT_OUTPUT_DIR="$SCRIPT_DIR/results"
 PSQL_BIN=${PSQL_BIN:-}
@@ -192,7 +192,57 @@ SQL
 }
 
 render_plan_summary() {
-    _text_file=$1
+    _json_file=$1
+    _text_file=$2
+    _structure="$work_dir/plan-structure.tsv"
+    _sep=$(printf '\t')
+
+    {
+        json_sql_prefix "$_json_file"
+        cat <<'SQL'
+nodes(path, node, depth, prefix, is_last, child_index, parent_node_type) AS (
+    SELECT ARRAY[]::integer[],
+           doc->0->'Plan',
+           0,
+           ''::text,
+           true,
+           0,
+           ''::text
+    FROM plan_source
+  UNION ALL
+    SELECT n.path || c.ord::integer,
+           c.child,
+           n.depth + 1,
+           n.prefix || CASE
+               WHEN n.depth = 0 THEN ''
+               WHEN n.is_last THEN '    '
+               ELSE '|   '
+           END,
+           c.ord = jsonb_array_length(COALESCE(n.node->'Plans','[]'::jsonb)),
+           c.ord::integer,
+           COALESCE(n.node->>'Node Type','')
+    FROM nodes n
+    CROSS JOIN LATERAL jsonb_array_elements(COALESCE(n.node->'Plans','[]'::jsonb)) WITH ORDINALITY AS c(child,ord)
+)
+SELECT array_to_string(path,'.'),
+       depth,
+       prefix,
+       CASE WHEN is_last THEN '1' ELSE '0' END,
+       CASE
+           WHEN parent_node_type IN ('Nested Loop','Hash Join','Merge Join') AND child_index=1 THEN '[Outer] '
+           WHEN parent_node_type IN ('Nested Loop','Hash Join','Merge Join') AND child_index=2 THEN '[Inner] '
+           ELSE ''
+       END
+FROM nodes
+ORDER BY path;
+SQL
+    } | run_psql -X -qAt -F "$_sep" -v ON_ERROR_STOP=1 > "$_structure" || return 1
+
+    [ -s "$_structure" ] || {
+        echo "ERROR: JSON plan structure was not generated." >&2
+        return 1
+    }
+
     _summary_width=${PLAN_SUMMARY_WIDTH:-}
     case $_summary_width in ''|*[!0-9]*) _summary_width= ;; esac
     if [ -z "$_summary_width" ]; then
@@ -202,28 +252,24 @@ render_plan_summary() {
             *)
                 if [ "$_tty_cols" -gt 142 ]; then
                     _summary_width=140
-                elif [ "$_tty_cols" -ge 72 ]; then
+                elif [ "$_tty_cols" -ge 52 ]; then
                     _summary_width=$((_tty_cols - 2))
                 else
-                    _summary_width=70
+                    _summary_width=$_tty_cols
                 fi
                 ;;
         esac
     fi
-    [ "$_summary_width" -lt 70 ] && _summary_width=70
+    [ "$_summary_width" -lt 40 ] && _summary_width=40
 
-    awk -v width="$_summary_width" '
-function add_node(d,text,    p,k) {
-    node_count++
-    node_depth[node_count]=d
-    node_text[node_count]=text
-    if (d==0) p=0; else p=stack[d-1]
-    node_parent[node_count]=p
-    node_child_index[node_count]=++child_count[p]
-    stack[d]=node_count
-    for (k=d+1; k<=max_depth; k++) delete stack[k]
-    if (d>max_depth) max_depth=d
-    current_node=node_count
+    awk -F '\t' -v width="$_summary_width" '
+NR==FNR {
+    struct_count++
+    struct_depth[struct_count]=$2+0
+    struct_prefix[struct_count]=$3
+    struct_last[struct_count]=$4+0
+    struct_role[struct_count]=$5
+    next
 }
 function add_detail(i,text) {
     if (i<=0) return
@@ -238,21 +284,6 @@ function spaces(n,    s) {
 function trimleft(s) {
     sub(/^[[:space:]]+/,"",s)
     return s
-}
-function tree_base(i,    p,n,j,out,a) {
-    n=0
-    p=node_parent[i]
-    while (p>0) {
-        path[++n]=p
-        p=node_parent[p]
-    }
-    out=""
-    for (j=n; j>=1; j--) {
-        a=path[j]
-        if (node_depth[a]>0) out=out (is_last[a] ? "    " : "|   ")
-        delete path[j]
-    }
-    return out
 }
 function wrap_line(first,cont,text,    avail,cut,j,piece) {
     text=trimleft(text)
@@ -279,24 +310,50 @@ function wrap_line(first,cont,text,    avail,cut,j,piece) {
         first=cont
     }
 }
+function wrap_node(first,cont,text,    p,head,tail) {
+    if (length(first)+length(text)<=width) {
+        print first text
+        return
+    }
+
+    p=index(text," (actual ")
+    if (p>0) {
+        head=substr(text,1,p-1)
+        tail=substr(text,p+1)
+        wrap_line(first,cont,head)
+        wrap_line(cont,cont,tail)
+        return
+    }
+
+    p=index(text," (never executed)")
+    if (p>0) {
+        head=substr(text,1,p-1)
+        tail=substr(text,p+1)
+        wrap_line(first,cont,head)
+        wrap_line(cont,cont,tail)
+        return
+    }
+
+    wrap_line(first,cont,text)
+}
 {
     raw=$0
     t=raw
     sub(/^[[:space:]]+/,"",t)
 
     if (!root_seen && t!="") {
-        add_node(0,t)
+        node_count++
+        node_text[node_count]=t
+        current_node=node_count
         root_seen=1
         next
     }
 
     if (t ~ /^->/) {
-        arrow=index(raw,"->")
-        lead=arrow-1
-        depth=int((lead+4)/6)
-        text=t
-        sub(/^->[[:space:]]*/,"",text)
-        add_node(depth,text)
+        node_count++
+        sub(/^->[[:space:]]*/,"",t)
+        node_text[node_count]=t
+        current_node=node_count
         next
     }
 
@@ -311,49 +368,41 @@ function wrap_line(first,cont,text,    avail,cut,j,piece) {
     }
 }
 END {
-    for (i=1; i<=node_count; i++)
-        is_last[i]=(node_child_index[i]==child_count[node_parent[i]])
-
-    for (i=1; i<=node_count; i++) {
-        base=tree_base(i)
-        role=""
-        p=node_parent[i]
-
-        # PostgreSQL executor join children: first=Outer, second=Inner.
-        if (p>0 && child_count[p]>=2 && (node_text[p] ~ /Join/ || node_text[p] ~ /^Nested Loop/)) {
-            if (node_child_index[i]==1) role="[Outer] "
-            else if (node_child_index[i]==2) role="[Inner] "
-        }
-
-        if (node_depth[i]==0) {
-            first=""
-            cont="    "
-            detail_prefix="    "
-        } else {
-            connector=(is_last[i] ? "`-- " : "|-- ")
-            first=base connector role
-            detail_prefix=base (is_last[i] ? "    " : "|   ")
-            cont=detail_prefix spaces(length(role))
-        }
-
-        wrap_line(first,cont,node_text[i])
-
-        for (j=1; j<=detail_count[i]; j++) {
-            dtext=detail[i,j]
-            colon=index(dtext,":")
-            if (colon>0) {
-                label=substr(dtext,1,colon-1)
-                value=substr(dtext,colon+1)
-                detail_label=sprintf("%-13s : ",label)
-                wrap_line(detail_prefix detail_label,
-                          detail_prefix spaces(length(detail_label)),
-                          value)
+    if (node_count != struct_count) {
+        printf "WARNING: JSON plan node count (%d) and TEXT plan node count (%d) differ; structured summary omitted to avoid an incorrect tree.\n", struct_count, node_count
+    } else {
+        for (i=1; i<=node_count; i++) {
+            role=struct_role[i]
+            if (struct_depth[i]==0) {
+                first=""
+                cont="    "
+                detail_prefix="    "
             } else {
-                wrap_line(detail_prefix,detail_prefix "    ",dtext)
+                connector=(struct_last[i] ? "`-- " : "|-- ")
+                first=struct_prefix[i] connector role
+                detail_prefix=struct_prefix[i] (struct_last[i] ? "    " : "|   ")
+                cont=detail_prefix spaces(length(role))
+            }
+
+            wrap_node(first,cont,node_text[i])
+
+            for (j=1; j<=detail_count[i]; j++) {
+                dtext=detail[i,j]
+                colon=index(dtext,":")
+                if (colon>0) {
+                    label=substr(dtext,1,colon-1)
+                    value=substr(dtext,colon+1)
+                    detail_label=sprintf("%-13s : ",label)
+                    wrap_line(detail_prefix detail_label,
+                              detail_prefix spaces(length(detail_label)),
+                              value)
+                } else {
+                    wrap_line(detail_prefix,detail_prefix "    ",dtext)
+                }
             }
         }
     }
-}' "$_text_file"
+}' "$_structure" "$_text_file"
 }
 
 build_bind_map() {
@@ -638,7 +687,7 @@ if ! run_psql -X -qAt -P pager=off -v ON_ERROR_STOP=1 -f "$tmp" > "$raw_plan_out
     exit 1
 fi
 
-render_plan_summary "$raw_plan_output" > "$plan_summary" || { echo "ERROR: Plan Summary generation failed." >&2; exit 1; }
+render_plan_summary "$tree_plan_json" "$raw_plan_output" > "$plan_summary" || { echo "ERROR: Plan Summary generation failed." >&2; exit 1; }
 
 section "Execution Plan Summary" | tee -a "$RESULT_FILE"
 cat "$plan_summary" | tee -a "$RESULT_FILE"
