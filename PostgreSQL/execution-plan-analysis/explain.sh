@@ -1,7 +1,7 @@
 #!/bin/sh
 set -u
 
-SCRIPT_VERSION="1.2.19"
+SCRIPT_VERSION="1.2.20"
 SCRIPT_DIR=$(CDPATH='' cd "$(dirname "$0")" && pwd)
 DEFAULT_OUTPUT_DIR="$SCRIPT_DIR/results"
 PSQL_BIN=${PSQL_BIN:-}
@@ -125,7 +125,6 @@ switch_user() {
     _new_user=$1
     [ -n "$_new_user" ] || return 1
     [ "$_new_user" = "$PGUSER" ] && return 0
-
     _old_user=$PGUSER
     reset_script_pgpass
     PGUSER=$_new_user
@@ -134,7 +133,6 @@ switch_user() {
         echo "Analysis user switched: $_old_user -> $PGUSER"
         return 0
     fi
-
     echo "ERROR: could not connect as user $_new_user." >&2
     PGUSER=$_old_user
     export PGUSER
@@ -147,7 +145,6 @@ switch_database() {
     _new_database=$1
     [ -n "$_new_database" ] || return 1
     [ "$_new_database" = "$PGDATABASE" ] && return 0
-
     _old_database=$PGDATABASE
     reset_script_pgpass
     PGDATABASE=$_new_database
@@ -156,7 +153,6 @@ switch_database() {
         echo "Analysis database switched: $_old_database -> $PGDATABASE"
         return 0
     fi
-
     echo "ERROR: could not connect to source database $_new_database." >&2
     PGDATABASE=$_old_database
     export PGDATABASE
@@ -194,10 +190,7 @@ prepare_pgss_execution_user() {
         _ans=$(printf '%s' "$_ans" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
         case $_ans in
             y) switch_user postgres || return 1; return 0 ;;
-            n)
-                echo "주의: $PGUSER 사용자로 계속 진행합니다. 다른 사용자의 query text 또는 참조 객체에 접근하지 못할 수 있습니다."
-                return 0
-                ;;
+            n) echo "주의: $PGUSER 사용자로 계속 진행합니다. 다른 사용자의 query text 또는 참조 객체에 접근하지 못할 수 있습니다."; return 0 ;;
             *) echo "ERROR: enter y or n." >&2 ;;
         esac
     done
@@ -214,6 +207,7 @@ PGSS_SEARCH_PATH=
 PGSS_RAW_SQL_FILE=
 PGSS_ORIGINAL_BIND_MAX=
 PGSS_NORMALIZED_VALUES_FILE=
+
 detect_pg_stat_statements() {
     PGSS_RELATION=$(run_psql -X -qAt -v ON_ERROR_STOP=1 <<'SQL' 2>/dev/null || true
 SELECT format('%I.pg_stat_statements', n.nspname)
@@ -225,9 +219,7 @@ SQL
     )
     [ -n "$PGSS_RELATION" ] || return 0
     PGSS_QUERY_COUNT=$(run_psql -X -qAt -v ON_ERROR_STOP=1 <<SQL 2>/dev/null || true
-SELECT count(*)
-FROM $PGSS_RELATION
-WHERE query IS NOT NULL;
+SELECT count(*) FROM $PGSS_RELATION WHERE query IS NOT NULL;
 SQL
     )
     case $PGSS_QUERY_COUNT in ''|*[!0-9]*) PGSS_QUERY_COUNT=0 ;; esac
@@ -243,18 +235,13 @@ load_pg_stat_statements_query() {
             echo "ERROR: queryid must be a signed integer." >&2
             continue
         fi
-
         _pgss_source_file="$work_dir/pgss-sources.txt"
         : > "$_pgss_source_file"
         if ! run_psql -X -qAt -F '|' -v ON_ERROR_STOP=1 -v queryid="$QUERYID" <<SQL > "$_pgss_source_file" 2>"$work_dir/pgss.err"
-SELECT s.dbid,
-       COALESCE(d.datname, ''),
-       s.userid,
-       COALESCE(pg_get_userbyid(s.userid), '')
+SELECT s.dbid, COALESCE(d.datname, ''), s.userid, COALESCE(pg_get_userbyid(s.userid), '')
 FROM $PGSS_RELATION s
 LEFT JOIN pg_database d ON d.oid=s.dbid
-WHERE s.queryid=:'queryid'::bigint
-  AND s.query IS NOT NULL
+WHERE s.queryid=:'queryid'::bigint AND s.query IS NOT NULL
 GROUP BY s.dbid,d.datname,s.userid
 ORDER BY d.datname NULLS LAST, pg_get_userbyid(s.userid), s.dbid, s.userid;
 SQL
@@ -263,13 +250,8 @@ SQL
             echo "ERROR: invalid queryid or pg_stat_statements query failed." >&2
             continue
         fi
-
         _source_count=$(awk 'END{print NR+0}' "$_pgss_source_file")
-        if [ "$_source_count" -eq 0 ]; then
-            echo "ERROR: Query ID not found in pg_stat_statements." >&2
-            continue
-        fi
-
+        [ "$_source_count" -gt 0 ] || { echo "ERROR: Query ID not found in pg_stat_statements." >&2; continue; }
         if [ "$_source_count" -eq 1 ]; then
             _source_line=$(sed -n '1p' "$_pgss_source_file")
         else
@@ -291,75 +273,32 @@ SQL
                 break
             done
         fi
-
         IFS='|' read -r _source_dbid _source_database _source_userid _source_user <<EOF
 $_source_line
 EOF
-        if [ -z "$_source_database" ]; then
-            echo "ERROR: pg_stat_statements entry refers to database oid $_source_dbid, but that database no longer exists." >&2
-            continue
-        fi
+        [ -n "$_source_database" ] || { echo "ERROR: source database no longer exists." >&2; continue; }
         [ -n "$_source_user" ] || _source_user="<user oid $_source_userid no longer exists>"
-
         _count=$(run_psql -X -qAt -v ON_ERROR_STOP=1 -v queryid="$QUERYID" -v dbid="$_source_dbid" -v userid="$_source_userid" <<SQL 2>"$work_dir/pgss.err" || true
-SELECT count(*)
-FROM (
-    SELECT DISTINCT query
-    FROM $PGSS_RELATION
-    WHERE dbid=:'dbid'::oid
-      AND userid=:'userid'::oid
-      AND queryid=:'queryid'::bigint
-      AND query IS NOT NULL
+SELECT count(*) FROM (
+ SELECT DISTINCT query FROM $PGSS_RELATION
+ WHERE dbid=:'dbid'::oid AND userid=:'userid'::oid AND queryid=:'queryid'::bigint AND query IS NOT NULL
 ) q;
 SQL
         )
-        if [ -s "$work_dir/pgss.err" ]; then
-            cat "$work_dir/pgss.err" >&2
-            echo "ERROR: pg_stat_statements query lookup failed." >&2
-            continue
-        fi
+        if [ -s "$work_dir/pgss.err" ]; then cat "$work_dir/pgss.err" >&2; echo "ERROR: pg_stat_statements query lookup failed." >&2; continue; fi
         case $_count in ''|*[!0-9]*) echo "ERROR: could not validate queryid." >&2; continue ;; esac
-        if [ "$_count" -eq 0 ]; then
-            echo "ERROR: Query ID disappeared from pg_stat_statements during lookup." >&2
-            continue
-        fi
-        if [ "$_count" -gt 1 ]; then
-            echo "ERROR: multiple different query texts share this queryid for database $_source_database / user $_source_user; use a SQL file to avoid ambiguity." >&2
-            continue
-        fi
-
+        [ "$_count" -eq 1 ] || { echo "ERROR: queryid is ambiguous or disappeared; use a SQL file." >&2; continue; }
         _pgss_sql="$work_dir/pgss-query.sql"
         if ! run_psql -X -qAt -v ON_ERROR_STOP=1 -v queryid="$QUERYID" -v dbid="$_source_dbid" -v userid="$_source_userid" <<SQL > "$_pgss_sql" 2>"$work_dir/pgss.err"
-SELECT DISTINCT query
-FROM $PGSS_RELATION
-WHERE dbid=:'dbid'::oid
-  AND userid=:'userid'::oid
-  AND queryid=:'queryid'::bigint
-  AND query IS NOT NULL
-LIMIT 1;
+SELECT DISTINCT query FROM $PGSS_RELATION
+WHERE dbid=:'dbid'::oid AND userid=:'userid'::oid AND queryid=:'queryid'::bigint AND query IS NOT NULL LIMIT 1;
 SQL
-        then
-            cat "$work_dir/pgss.err" >&2
-            continue
-        fi
+        then cat "$work_dir/pgss.err" >&2; continue; fi
         [ -s "$_pgss_sql" ] || { echo "ERROR: pg_stat_statements query text is empty." >&2; continue; }
-        if grep -Fx '<insufficient privilege>' "$_pgss_sql" >/dev/null 2>&1; then
-            echo "ERROR: insufficient privilege to read this pg_stat_statements query text." >&2
-            if [ "$PGUSER" != postgres ]; then
-                echo "       Re-run this source as postgres or use a SQL file." >&2
-            fi
-            continue
-        fi
-
+        if grep -Fx '<insufficient privilege>' "$_pgss_sql" >/dev/null 2>&1; then echo "ERROR: insufficient privilege to read query text." >&2; continue; fi
         if [ "$_source_database" != "$PGDATABASE" ]; then
-            if confirm_database_switch "$PGDATABASE" "$_source_database"; then
-                switch_database "$_source_database" || return 1
-            else
-                echo "Cancelled: EXPLAIN should run in the query's source database." >&2
-                return 1
-            fi
+            if confirm_database_switch "$PGDATABASE" "$_source_database"; then switch_database "$_source_database" || return 1; else echo "Cancelled: EXPLAIN should run in the query's source database." >&2; return 1; fi
         fi
-
         ORIGINAL_QUERY_USER=$_source_user
         ORIGINAL_QUERY_USERID=$_source_userid
         PGSS_EXECUTE_USER=$(run_psql -X -qAt -v ON_ERROR_STOP=1 -c 'SELECT current_user;' 2>/dev/null || printf '%s' "$PGUSER")
@@ -368,7 +307,6 @@ SQL
         SQL_FILE=$_pgss_sql
         SQL_SOURCE_KIND=pgss
         SQL_SOURCE_DESC="pg_stat_statements queryid=$QUERYID"
-
         echo
         echo "pg_stat_statements Query Information"
         printf '  queryid              : %s\n' "$QUERYID"
@@ -388,53 +326,30 @@ SQL
 }
 
 pgss_parameter_context() {
-    _file=$1
-    _n=$2
-    if grep -Eiq "[Tt][Ii][Mm][Ee][Ss][Tt][Aa][Mm][Pp][[:space:]]+[Ww][Ii][Tt][Hh][[:space:]]+[Tt][Ii][Mm][Ee][[:space:]]+[Zz][Oo][Nn][Ee][[:space:]]+\\\$${_n}([^0-9]|$)" "$_file"; then printf 'timestamptz'; return 0; fi
-    if grep -Eiq "[Tt][Ii][Mm][Ee][Ss][Tt][Aa][Mm][Pp][[:space:]]+[Ww][Ii][Tt][Hh][Oo][Uu][Tt][[:space:]]+[Tt][Ii][Mm][Ee][[:space:]]+[Zz][Oo][Nn][Ee][[:space:]]+\\\$${_n}([^0-9]|$)" "$_file"; then printf 'timestamp'; return 0; fi
-    if grep -Eiq "[Tt][Ii][Mm][Ee][[:space:]]+[Ww][Ii][Tt][Hh][[:space:]]+[Tt][Ii][Mm][Ee][[:space:]]+[Zz][Oo][Nn][Ee][[:space:]]+\\\$${_n}([^0-9]|$)" "$_file"; then printf 'timetz'; return 0; fi
-    if grep -Eiq "[Tt][Ii][Mm][Ee][[:space:]]+[Ww][Ii][Tt][Hh][Oo][Uu][Tt][[:space:]]+[Tt][Ii][Mm][Ee][[:space:]]+[Zz][Oo][Nn][Ee][[:space:]]+\\\$${_n}([^0-9]|$)" "$_file"; then printf 'time'; return 0; fi
+    _file=$1; _n=$2
     if grep -Eiq "[Ii][Nn][Tt][Ee][Rr][Vv][Aa][Ll][[:space:]]+\\\$${_n}([^0-9]|$)" "$_file"; then printf 'interval'; return 0; fi
-    if grep -Eiq "[Tt][Ii][Mm][Ee][Ss][Tt][Aa][Mm][Pp][[:space:]]+\\\$${_n}([^0-9]|$)" "$_file"; then printf 'timestamp'; return 0; fi
     if grep -Eiq "[Dd][Aa][Tt][Ee][[:space:]]+\\\$${_n}([^0-9]|$)" "$_file"; then printf 'date'; return 0; fi
+    if grep -Eiq "[Tt][Ii][Mm][Ee][Ss][Tt][Aa][Mm][Pp][[:space:]]+\\\$${_n}([^0-9]|$)" "$_file"; then printf 'timestamp'; return 0; fi
     if grep -Eiq "[Tt][Ii][Mm][Ee][[:space:]]+\\\$${_n}([^0-9]|$)" "$_file"; then printf 'time'; return 0; fi
     printf ''
 }
 
 pgss_render_sql_value() {
-    _value=$1
-    _context=$2
-    if [ "$_value" = '\N' ]; then
-        printf 'NULL'
-        return 0
-    fi
+    _value=$1; _context=$2
+    if [ "$_value" = '\N' ]; then printf 'NULL'; return 0; fi
     _escaped=$(printf '%s' "$_value" | sed "s/'/''/g")
-    if [ -n "$_context" ]; then
-        printf "'%s'" "$_escaped"
-        return 0
-    fi
-    if printf '%s\n' "$_value" | grep -Eq '^[+-]?(([0-9]+([.][0-9]*)?)|([.][0-9]+))([eE][+-]?[0-9]+)?$'; then
-        printf '%s' "$_value"
-        return 0
-    fi
-    case $(printf '%s' "$_value" | tr '[:upper:]' '[:lower:]') in
-        true) printf 'TRUE'; return 0 ;;
-        false) printf 'FALSE'; return 0 ;;
-    esac
+    if [ -n "$_context" ]; then printf "'%s'" "$_escaped"; return 0; fi
+    if printf '%s\n' "$_value" | grep -Eq '^[+-]?(([0-9]+([.][0-9]*)?)|([.][0-9]+))([eE][+-]?[0-9]+)?$'; then printf '%s' "$_value"; return 0; fi
+    case $(printf '%s' "$_value" | tr '[:upper:]' '[:lower:]') in true) printf 'TRUE'; return 0 ;; false) printf 'FALSE'; return 0 ;; esac
     printf "'%s'" "$_escaped"
 }
 
 pgss_rewrite_typed_literals() {
-    _src=$1
-    _dst=$2
+    _src=$1; _dst=$2
     sed -E \
-        -e 's/[Tt][Ii][Mm][Ee][Ss][Tt][Aa][Mm][Pp][[:space:]]+[Ww][Ii][Tt][Hh][[:space:]]+[Tt][Ii][Mm][Ee][[:space:]]+[Zz][Oo][Nn][Ee][[:space:]]+(\$[1-9][0-9]*)/(\1)::timestamptz/g' \
-        -e 's/[Tt][Ii][Mm][Ee][Ss][Tt][Aa][Mm][Pp][[:space:]]+[Ww][Ii][Tt][Hh][Oo][Uu][Tt][[:space:]]+[Tt][Ii][Mm][Ee][[:space:]]+[Zz][Oo][Nn][Ee][[:space:]]+(\$[1-9][0-9]*)/(\1)::timestamp/g' \
-        -e 's/[Tt][Ii][Mm][Ee][[:space:]]+[Ww][Ii][Tt][Hh][[:space:]]+[Tt][Ii][Mm][Ee][[:space:]]+[Zz][Oo][Nn][Ee][[:space:]]+(\$[1-9][0-9]*)/(\1)::timetz/g' \
-        -e 's/[Tt][Ii][Mm][Ee][[:space:]]+[Ww][Ii][Tt][Hh][Oo][Uu][Tt][[:space:]]+[Tt][Ii][Mm][Ee][[:space:]]+[Zz][Oo][Nn][Ee][[:space:]]+(\$[1-9][0-9]*)/(\1)::time/g' \
         -e 's/[Ii][Nn][Tt][Ee][Rr][Vv][Aa][Ll][[:space:]]+(\$[1-9][0-9]*)/(\1)::interval/g' \
-        -e 's/[Tt][Ii][Mm][Ee][Ss][Tt][Aa][Mm][Pp][[:space:]]+(\$[1-9][0-9]*)/(\1)::timestamp/g' \
         -e 's/[Dd][Aa][Tt][Ee][[:space:]]+(\$[1-9][0-9]*)/(\1)::date/g' \
+        -e 's/[Tt][Ii][Mm][Ee][Ss][Tt][Aa][Mm][Pp][[:space:]]+(\$[1-9][0-9]*)/(\1)::timestamp/g' \
         -e 's/[Tt][Ii][Mm][Ee][[:space:]]+(\$[1-9][0-9]*)/(\1)::time/g' \
         "$_src" > "$_dst"
 }
@@ -443,136 +358,98 @@ prepare_pgss_replay_sql() {
     [ "$SQL_SOURCE_KIND" = pgss ] || return 0
     [ -n "$PGSS_RAW_SQL_FILE" ] || return 0
     grep -Eq '\$[1-9][0-9]*' "$PGSS_RAW_SQL_FILE" || return 0
-
-    _scan=$(awk '
-    {
-        s=$0
-        while (match(s,/\$[1-9][0-9]*/)) {
-            n=substr(s,RSTART+1,RLENGTH-1)+0
-            pos++
-            count[n]++
-            if (!(n in first)) first[n]=pos
-            if (n>maxn) maxn=n
-            s=substr(s,RSTART+RLENGTH)
-        }
-    }
-    END {
-        guess=0
-        for (n=1;n<=maxn;n++) {
-            evidence=(count[n]>1)
-            for (m=n+1;m<=maxn;m++)
-                if ((m in first) && first[n]>first[m]) evidence=1
-            if (evidence && n>guess) guess=n
-        }
-        printf "%d|%d\n",maxn,guess
-    }' "$PGSS_RAW_SQL_FILE")
-    _param_max=${_scan%%|*}
-    _guess=${_scan#*|}
+    _scan=$(awk '{ s=$0; while(match(s,/\$[1-9][0-9]*/)){ n=substr(s,RSTART+1,RLENGTH-1)+0; pos++; count[n]++; if(!(n in first)) first[n]=pos; if(n>maxn) maxn=n; s=substr(s,RSTART+RLENGTH) } } END { guess=0; for(n=1;n<=maxn;n++){ evidence=(count[n]>1); for(m=n+1;m<=maxn;m++) if((m in first)&&first[n]>first[m]) evidence=1; if(evidence&&n>guess) guess=n } printf "%d|%d\n",maxn,guess }' "$PGSS_RAW_SQL_FILE")
+    _param_max=${_scan%%|*}; _guess=${_scan#*|}
     case $_param_max in ''|*[!0-9]*) return 0 ;; esac
     [ "$_param_max" -gt 0 ] || return 0
-
     echo
     echo "pg_stat_statements 정규화 파라미터 처리"
     printf '  SQL 내 최대 파라미터 번호 : $%s\n' "$_param_max"
-    printf '  원본 bind 최대 번호 추정 : %s\n' "$_guess"
+    if [ "$_guess" -gt 0 ]; then printf '  자동 분류 - 기존 bind 변수 : $1 ~ $%s\n' "$_guess"; else echo '  자동 분류 - 기존 bind 변수 : 없음'; fi
+    if [ "$_guess" -lt "$_param_max" ]; then printf '  자동 분류 - 정규화 상수 후보 : $%s ~ $%s\n' "$((_guess+1))" "$_param_max"; else echo '  자동 분류 - 정규화 상수 후보 : 없음'; fi
     echo
     echo "안내: pg_stat_statements는 원래 literal을 추가 \$n 파라미터로 정규화할 수 있습니다."
-    echo "      원래 literal 값은 저장되지 않으므로 EXPLAIN 재현을 위해 값을 다시 입력해야 합니다."
-    echo "      자동 추정값보다 원본 bind 번호를 정확히 알고 있다면 직접 입력할 수 있습니다."
+    echo "      원래 literal 값은 pg_stat_statements에 남지 않으므로 정규화 상수는 직접 입력해야 합니다."
+    echo "      기존 bind 값 후보 조회는 아래 분류가 끝난 뒤 예전 버전과 동일하게 테이블/컬럼에서 수행합니다."
 
-    _default_bind_max=${PGSS_ORIGINAL_BIND_MAX:-$_guess}
-    while :; do
-        printf '원본 SQL의 가장 큰 bind 번호 (원본 bind가 없으면 0) [%s]: ' "$_default_bind_max" >&2
-        IFS= read -r _bind_max || return 1
-        [ -n "$_bind_max" ] || _bind_max=$_default_bind_max
-        case $_bind_max in ''|*[!0-9]*) echo "ERROR: 0부터 $_param_max 사이의 숫자를 입력하세요." >&2; continue ;; esac
-        [ "$_bind_max" -ge 0 ] && [ "$_bind_max" -le "$_param_max" ] || { echo "ERROR: 0부터 $_param_max 사이의 숫자를 입력하세요." >&2; continue; }
-
-        _invalid=no
-        _n=1
-        while [ "$_n" -le "$_bind_max" ]; do
-            _context=$(pgss_parameter_context "$PGSS_RAW_SQL_FILE" "$_n")
-            if [ -n "$_context" ]; then
-                echo "ERROR: \$$_n 은 $_context literal 위치에 있어 원본 bind로 사용할 수 없습니다." >&2
-                echo "       원본 bind 최대 번호를 \$$_n 보다 작게 지정하세요." >&2
-                _invalid=yes
-                break
-            fi
-            _n=$((_n+1))
+    if [ -n "${PGSS_ORIGINAL_BIND_MAX:-}" ]; then
+        _bind_max=$PGSS_ORIGINAL_BIND_MAX
+    else
+        while :; do
+            printf '자동 분류 결과가 맞습니까? y/n [y]: ' >&2
+            IFS= read -r _ans || return 1
+            [ -n "$_ans" ] || _ans=y
+            _ans=$(printf '%s' "$_ans" | tr '[:upper:]' '[:lower:]')
+            case $_ans in
+                y) _bind_max=$_guess; break ;;
+                n)
+                    while :; do
+                        printf '기존 bind 변수의 마지막 번호 (예: $1~$6이면 6, 기존 bind가 없으면 0): ' >&2
+                        IFS= read -r _bind_max || return 1
+                        case $_bind_max in ''|*[!0-9]*) echo "ERROR: 0부터 $_param_max 사이의 숫자를 입력하세요." >&2; continue ;; esac
+                        [ "$_bind_max" -ge 0 ] && [ "$_bind_max" -le "$_param_max" ] && break
+                        echo "ERROR: 0부터 $_param_max 사이의 숫자를 입력하세요." >&2
+                    done
+                    if [ "$_bind_max" -eq 0 ] && [ "$_param_max" -gt 0 ]; then
+                        printf '주의: 0을 선택하면 $1~$%s를 모두 정규화 상수로 처리합니다. 계속하시겠습니까? y/n [n]: ' "$_param_max" >&2
+                        IFS= read -r _zero_ok || return 1
+                        [ -n "$_zero_ok" ] || _zero_ok=n
+                        _zero_ok=$(printf '%s' "$_zero_ok" | tr '[:upper:]' '[:lower:]')
+                        [ "$_zero_ok" = y ] || continue
+                    fi
+                    break ;;
+                *) echo "ERROR: y 또는 n을 입력하세요." >&2 ;;
+            esac
         done
-        [ "$_invalid" = no ] && break
+    fi
+
+    _invalid=no
+    _n=1
+    while [ "$_n" -le "$_bind_max" ]; do
+        _context=$(pgss_parameter_context "$PGSS_RAW_SQL_FILE" "$_n")
+        if [ -n "$_context" ]; then
+            echo "ERROR: \$$_n 은 $_context literal 위치에 있어 기존 bind로 분류할 수 없습니다." >&2
+            _invalid=yes
+            break
+        fi
+        _n=$((_n+1))
     done
+    [ "$_invalid" = no ] || return 1
     PGSS_ORIGINAL_BIND_MAX=$_bind_max
 
-    PGSS_NORMALIZED_VALUES_FILE="$work_dir/pgss-normalized-values-used.txt"
-    _map="$work_dir/pgss-normalized-map.tsv"
-    _typed="$work_dir/pgss-typed-rewrite.sql"
-    _replay="$work_dir/pgss-replay.sql"
-    : > "$PGSS_NORMALIZED_VALUES_FILE"
-    : > "$_map"
+    echo
+    echo "최종 파라미터 분류"
+    if [ "$PGSS_ORIGINAL_BIND_MAX" -gt 0 ]; then printf '  기존 bind 변수       : $1 ~ $%s\n' "$PGSS_ORIGINAL_BIND_MAX"; else echo '  기존 bind 변수       : 없음'; fi
+    if [ "$PGSS_ORIGINAL_BIND_MAX" -lt "$_param_max" ]; then printf '  정규화 상수          : $%s ~ $%s\n' "$((PGSS_ORIGINAL_BIND_MAX+1))" "$_param_max"; else echo '  정규화 상수          : 없음'; fi
+    echo
 
+    PGSS_NORMALIZED_VALUES_FILE="$work_dir/pgss-normalized-values-used.txt"
+    _map="$work_dir/pgss-normalized-map.tsv"; _typed="$work_dir/pgss-typed-rewrite.sql"; _replay="$work_dir/pgss-replay.sql"
+    : > "$PGSS_NORMALIZED_VALUES_FILE"; : > "$_map"
     _n=$((PGSS_ORIGINAL_BIND_MAX + 1))
     while [ "$_n" -le "$_param_max" ]; do
         if grep -Eq "\\\$${_n}([^0-9]|$)" "$PGSS_RAW_SQL_FILE"; then
             _context=$(pgss_parameter_context "$PGSS_RAW_SQL_FILE" "$_n")
-            if [ -n "$_context" ]; then
-                printf '정규화 상수 $%s 값 (context=%s, \\N=SQL NULL): ' "$_n" "$_context" >&2
-            else
-                printf '정규화 상수 $%s 값 (\\N=SQL NULL): ' "$_n" >&2
-            fi
+            if [ -n "$_context" ]; then printf '정규화 상수 $%s 값 (context=%s, \\N=SQL NULL): ' "$_n" "$_context" >&2; else printf '정규화 상수 $%s 값 (\\N=SQL NULL): ' "$_n" >&2; fi
             IFS= read -r _value || return 1
             while [ -z "$_value" ]; do
                 echo "ERROR: pg_stat_statements에는 원래 literal 값이 없으므로 값을 입력해야 합니다." >&2
-                if [ -n "$_context" ]; then
-                    printf '정규화 상수 $%s 값 (context=%s, \\N=SQL NULL): ' "$_n" "$_context" >&2
-                else
-                    printf '정규화 상수 $%s 값 (\\N=SQL NULL): ' "$_n" >&2
-                fi
+                if [ -n "$_context" ]; then printf '정규화 상수 $%s 값 (context=%s, \\N=SQL NULL): ' "$_n" "$_context" >&2; else printf '정규화 상수 $%s 값 (\\N=SQL NULL): ' "$_n" >&2; fi
                 IFS= read -r _value || return 1
             done
             _sql_value=$(pgss_render_sql_value "$_value" "$_context")
             printf '%s\t%s\n' "$_n" "$_sql_value" >> "$_map"
-            printf '$%s [normalized constant%s] = %s\n' "$_n" "${_context:+ / $_context}" "${_value}" >> "$PGSS_NORMALIZED_VALUES_FILE"
+            printf '$%s [normalized constant%s] = %s\n' "$_n" "${_context:+ / $_context}" "$_value" >> "$PGSS_NORMALIZED_VALUES_FILE"
         fi
         _n=$((_n+1))
     done
-
-    if [ ! -s "$_map" ]; then
-        echo "안내: 정규화 상수로 분류된 파라미터가 없습니다. 원본 SQL을 그대로 사용합니다."
-        return 0
-    fi
-
+    if [ ! -s "$_map" ]; then echo "안내: 정규화 상수로 분류된 파라미터가 없습니다. 원본 SQL을 그대로 사용합니다."; return 0; fi
     pgss_rewrite_typed_literals "$PGSS_RAW_SQL_FILE" "$_typed" || return 1
-    awk -F '\t' '
-    NR==FNR {
-        p=index($0,"\t")
-        if (p>0) {
-            n=substr($0,1,p-1)
-            repl[n]=substr($0,p+1)
-        }
-        next
-    }
-    {
-        s=$0
-        out=""
-        while (match(s,/\$[1-9][0-9]*/)) {
-            n=substr(s,RSTART+1,RLENGTH-1)
-            out=out substr(s,1,RSTART-1)
-            if (n in repl) out=out repl[n]
-            else out=out substr(s,RSTART,RLENGTH)
-            s=substr(s,RSTART+RLENGTH)
-        }
-        print out s
-    }' "$_map" "$_typed" > "$_replay" || return 1
-
+    awk -F '\t' 'NR==FNR {p=index($0,"\t"); if(p>0){n=substr($0,1,p-1); repl[n]=substr($0,p+1)}; next} {s=$0;out="";while(match(s,/\$[1-9][0-9]*/)){n=substr(s,RSTART+1,RLENGTH-1);out=out substr(s,1,RSTART-1);if(n in repl)out=out repl[n];else out=out substr(s,RSTART,RLENGTH);s=substr(s,RSTART+RLENGTH)};print out s}' "$_map" "$_typed" > "$_replay" || return 1
     SQL_FILE=$_replay
     echo
     echo "안내: 정규화 상수는 입력값으로 SQL에 복원했습니다."
-    if [ "$PGSS_ORIGINAL_BIND_MAX" -gt 0 ]; then
-        printf '      원본 bind로 분류된 $1~$%s 만 PREPARE/EXECUTE 대상으로 처리합니다.\n' "$PGSS_ORIGINAL_BIND_MAX"
-    else
-        echo "      원본 bind로 분류된 파라미터가 없어 모든 \$n 값을 literal로 복원했습니다."
-    fi
+    echo "      남은 기존 bind는 예전 버전과 동일한 후보값/기본값 탐색 절차로 처리합니다."
     echo
 }
 
@@ -586,27 +463,14 @@ if [ -z "$SQL_FILE" ] && [ "$PGSS_AVAILABLE" = yes ]; then
     printf 'Select [1]: ' >&2
     IFS= read -r _source_choice || exit 1
     [ -n "$_source_choice" ] || _source_choice=1
-    case $_source_choice in
-        1) ;;
-        2) prepare_pgss_execution_user || exit 1; load_pg_stat_statements_query || exit 1 ;;
-        *) echo "ERROR: enter 1 or 2." >&2; exit 1 ;;
-    esac
+    case $_source_choice in 1) ;; 2) prepare_pgss_execution_user || exit 1; load_pg_stat_statements_query || exit 1 ;; *) echo "ERROR: enter 1 or 2." >&2; exit 1 ;; esac
 fi
 while :; do
-    if [ -z "$SQL_FILE" ]; then
-        printf 'Target SQL file path (empty to cancel): ' >&2
-        IFS= read -r SQL_FILE || exit 1
-        [ -n "$SQL_FILE" ] || { echo "Cancelled."; exit 1; }
-        SQL_SOURCE_DESC="SQL file"
-    fi
+    if [ -z "$SQL_FILE" ]; then printf 'Target SQL file path (empty to cancel): ' >&2; IFS= read -r SQL_FILE || exit 1; [ -n "$SQL_FILE" ] || { echo "Cancelled."; exit 1; }; SQL_SOURCE_DESC="SQL file"; fi
     [ -f "$SQL_FILE" ] && [ -r "$SQL_FILE" ] && break
-    printf 'ERROR: cannot read SQL file: %s\n' "$SQL_FILE" >&2
-    SQL_FILE=
+    printf 'ERROR: cannot read SQL file: %s\n' "$SQL_FILE" >&2; SQL_FILE=
 done
-
-if [ "$SQL_SOURCE_KIND" = pgss ]; then
-    prepare_pgss_replay_sql || { echo "ERROR: pg_stat_statements SQL replay preparation failed." >&2; exit 1; }
-fi
+if [ "$SQL_SOURCE_KIND" = pgss ]; then prepare_pgss_replay_sql || { echo "ERROR: pg_stat_statements SQL replay preparation failed." >&2; exit 1; }; fi
 
 SERVER_VERSION_NUM=$(run_psql -X -Atqc 'SHOW server_version_num') || exit 1
 case $SERVER_VERSION_NUM in ''|*[!0-9]*) echo "ERROR: invalid server_version_num" >&2; exit 1 ;; esac
@@ -618,11 +482,7 @@ ask() {
         IFS= read -r ans || return 1
         [ -n "$ans" ] || ans=$default
         ans=$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
-        case $ans in
-            y) printf 'yes'; return 0 ;;
-            n) printf 'no'; return 0 ;;
-            *) echo "ERROR: enter y or n." >&2 ;;
-        esac
+        case $ans in y) printf 'yes'; return 0 ;; n) printf 'no'; return 0 ;; *) echo "ERROR: enter y or n." >&2 ;; esac
     done
 }
 ask_bind_plan_mode() {
@@ -640,33 +500,24 @@ json_sql_prefix() {
     _json_file=$1
     _tag="PGPLAN_$$_$(date +%s)"
     while grep -F "\$${_tag}\$" "$_json_file" >/dev/null 2>&1; do _tag="${_tag}X"; done
-    printf 'WITH RECURSIVE plan_source AS (SELECT $%s$\n' "$_tag"
-    cat "$_json_file"
-    printf '\n$%s$::jsonb AS doc),\n' "$_tag"
+    printf 'WITH RECURSIVE plan_source AS (SELECT $%s$\n' "$_tag"; cat "$_json_file"; printf '\n$%s$::jsonb AS doc),\n' "$_tag"
 }
 
 extract_plan_metadata() {
-    _json_file=$1; _rel_file=$2; _rel_oid_file=$3; _dml_file=$4
-    _meta="$work_dir/meta.out"
+    _json_file=$1; _rel_file=$2; _rel_oid_file=$3; _dml_file=$4; _meta="$work_dir/meta.out"
     {
         json_sql_prefix "$_json_file"
         cat <<'SQL'
 nodes(node) AS (
     SELECT doc->0->'Plan' FROM plan_source
   UNION ALL
-    SELECT child
-    FROM nodes n
-    CROSS JOIN LATERAL jsonb_array_elements(COALESCE(n.node->'Plans','[]'::jsonb)) AS c(child)
+    SELECT child FROM nodes n CROSS JOIN LATERAL jsonb_array_elements(COALESCE(n.node->'Plans','[]'::jsonb)) AS c(child)
 ), rows AS (
-    SELECT DISTINCT 'R' AS kind,
-           to_regclass(format('%I.%I', node->>'Schema', node->>'Relation Name'))::oid::text AS objid,
+    SELECT DISTINCT 'R' AS kind, to_regclass(format('%I.%I', node->>'Schema', node->>'Relation Name'))::oid::text AS objid,
            format('%I.%I', node->>'Schema', node->>'Relation Name') AS value
-    FROM nodes
-    WHERE node ? 'Schema' AND node ? 'Relation Name'
+    FROM nodes WHERE node ? 'Schema' AND node ? 'Relation Name'
     UNION ALL
-    SELECT DISTINCT 'D', '', node->>'Operation'
-    FROM nodes
-    WHERE node->>'Operation' IN ('Insert','Update','Delete','Merge')
+    SELECT DISTINCT 'D', '', node->>'Operation' FROM nodes WHERE node->>'Operation' IN ('Insert','Update','Delete','Merge')
 )
 SELECT kind || '|' || objid || '|' || value FROM rows ORDER BY kind, value;
 SQL
@@ -677,129 +528,44 @@ SQL
 }
 
 render_plan_summary() {
-    _json_file=$1
-    _text_file=$2
-    _structure="$work_dir/plan-structure.tsv"
-    _sep=$(printf '\t')
-
+    _json_file=$1; _text_file=$2; _structure="$work_dir/plan-structure.tsv"; _sep=$(printf '\t')
     {
         json_sql_prefix "$_json_file"
         cat <<'SQL'
 nodes(path, node, depth, prefix, is_last, child_index, parent_node_type) AS (
-    SELECT ARRAY[]::integer[], doc->0->'Plan', 0, ''::text, true, 0, ''::text
-    FROM plan_source
+    SELECT ARRAY[]::integer[], doc->0->'Plan', 0, ''::text, true, 0, ''::text FROM plan_source
   UNION ALL
-    SELECT n.path || c.ord::integer,
-           c.child,
-           n.depth + 1,
+    SELECT n.path || c.ord::integer, c.child, n.depth + 1,
            n.prefix || CASE WHEN n.depth=0 THEN '' WHEN n.is_last THEN '    ' ELSE '|   ' END,
-           c.ord = jsonb_array_length(COALESCE(n.node->'Plans','[]'::jsonb)),
-           c.ord::integer,
-           COALESCE(n.node->>'Node Type','')
-    FROM nodes n
-    CROSS JOIN LATERAL jsonb_array_elements(COALESCE(n.node->'Plans','[]'::jsonb)) WITH ORDINALITY AS c(child,ord)
+           c.ord = jsonb_array_length(COALESCE(n.node->'Plans','[]'::jsonb)), c.ord::integer, COALESCE(n.node->>'Node Type','')
+    FROM nodes n CROSS JOIN LATERAL jsonb_array_elements(COALESCE(n.node->'Plans','[]'::jsonb)) WITH ORDINALITY AS c(child,ord)
 )
-SELECT array_to_string(path,'.'), depth, prefix,
-       CASE WHEN is_last THEN '1' ELSE '0' END,
-       CASE
-           WHEN parent_node_type IN ('Nested Loop','Hash Join','Merge Join') AND child_index=1 THEN '[Outer] '
-           WHEN parent_node_type IN ('Nested Loop','Hash Join','Merge Join') AND child_index=2 THEN '[Inner] '
-           ELSE ''
-       END
-FROM nodes
-ORDER BY path;
+SELECT array_to_string(path,'.'), depth, prefix, CASE WHEN is_last THEN '1' ELSE '0' END,
+       CASE WHEN parent_node_type IN ('Nested Loop','Hash Join','Merge Join') AND child_index=1 THEN '[Outer] '
+            WHEN parent_node_type IN ('Nested Loop','Hash Join','Merge Join') AND child_index=2 THEN '[Inner] ' ELSE '' END
+FROM nodes ORDER BY path;
 SQL
     } | run_psql -X -qAt -F "$_sep" -v ON_ERROR_STOP=1 > "$_structure" || return 1
-
     [ -s "$_structure" ] || { echo "ERROR: JSON plan structure was not generated." >&2; return 1; }
-
-    _summary_width=${PLAN_SUMMARY_WIDTH:-}
-    case $_summary_width in ''|*[!0-9]*) _summary_width= ;; esac
-    if [ -z "$_summary_width" ]; then
-        _tty_cols=$(stty size </dev/tty 2>/dev/null | awk '{print $2}')
-        case $_tty_cols in
-            ''|*[!0-9]*) _summary_width=120 ;;
-            *)
-                if [ "$_tty_cols" -gt 142 ]; then _summary_width=140
-                elif [ "$_tty_cols" -ge 52 ]; then _summary_width=$((_tty_cols - 2))
-                else _summary_width=$_tty_cols
-                fi
-                ;;
-        esac
-    fi
+    _summary_width=${PLAN_SUMMARY_WIDTH:-}; case $_summary_width in ''|*[!0-9]*) _summary_width= ;; esac
+    if [ -z "$_summary_width" ]; then _tty_cols=$(stty size </dev/tty 2>/dev/null | awk '{print $2}'); case $_tty_cols in ''|*[!0-9]*) _summary_width=120 ;; *) if [ "$_tty_cols" -gt 142 ]; then _summary_width=140; elif [ "$_tty_cols" -ge 52 ]; then _summary_width=$((_tty_cols - 2)); else _summary_width=$_tty_cols; fi ;; esac; fi
     [ "$_summary_width" -lt 40 ] && _summary_width=40
-
     awk -F '\t' -v width="$_summary_width" '
-NR==FNR {
-    struct_count++
-    struct_depth[struct_count]=$2+0
-    struct_prefix[struct_count]=$3
-    struct_last[struct_count]=$4+0
-    struct_role[struct_count]=$5
-    next
-}
-function add_detail(i,text) { if (i>0) { detail_count[i]++; detail[i,detail_count[i]]=text } }
-function spaces(n,    s) { s=""; while (n-->0) s=s " "; return s }
-function trimleft(s) { sub(/^[[:space:]]+/,"",s); return s }
-function wrap_line(first,cont,text,    avail,cut,j,piece) {
-    text=trimleft(text)
-    while (text!="") {
-        avail=width-length(first); if (avail<20) avail=20
-        if (length(text)<=avail) { print first text; return }
-        cut=0
-        for (j=avail; j>=1; j--) if (substr(text,j,1)==" ") { cut=j; break }
-        if (cut==0) cut=avail
-        piece=substr(text,1,cut); sub(/[[:space:]]+$/,"",piece); print first piece
-        text=substr(text,cut+1); text=trimleft(text); first=cont
-    }
-}
-function wrap_node(first,cont,text,    p,head,tail) {
-    if (length(first)+length(text)<=width) { print first text; return }
-    p=index(text," (actual ")
-    if (p>0) { head=substr(text,1,p-1); tail=substr(text,p+1); wrap_line(first,cont,head); wrap_line(cont,cont,tail); return }
-    p=index(text," (never executed)")
-    if (p>0) { head=substr(text,1,p-1); tail=substr(text,p+1); wrap_line(first,cont,head); wrap_line(cont,cont,tail); return }
-    wrap_line(first,cont,text)
-}
-{
-    raw=$0; t=raw; sub(/^[[:space:]]+/,"",t)
-    if (!root_seen && t!="") { node_count++; node_text[node_count]=t; current_node=node_count; root_seen=1; next }
-    if (t ~ /^->/) { node_count++; sub(/^->[[:space:]]*/,"",t); node_text[node_count]=t; current_node=node_count; next }
-    if (t ~ /^(Sort Key|Index Cond|Recheck Cond|Hash Cond|Merge Cond|Join Filter|Filter):/) { add_detail(current_node,t); next }
-    if (t ~ /^(CTE|InitPlan|SubPlan)([[:space:]]|$)/) { add_detail(current_node,t); next }
-}
-END {
-    if (node_count != struct_count) {
-        printf "WARNING: JSON plan node count (%d) and TEXT plan node count (%d) differ; structured summary omitted to avoid an incorrect tree.\n", struct_count, node_count
-    } else {
-        for (i=1; i<=node_count; i++) {
-            role=struct_role[i]
-            if (struct_depth[i]==0) { first=""; cont="    "; detail_prefix="    " }
-            else {
-                connector=(struct_last[i] ? "`-- " : "|-- ")
-                first=struct_prefix[i] connector role
-                detail_prefix=struct_prefix[i] (struct_last[i] ? "    " : "|   ")
-                cont=detail_prefix spaces(length(role))
-            }
-            wrap_node(first,cont,node_text[i])
-            for (j=1; j<=detail_count[i]; j++) {
-                dtext=detail[i,j]; colon=index(dtext,":")
-                if (colon>0) {
-                    label=substr(dtext,1,colon-1); value=substr(dtext,colon+1)
-                    detail_label=sprintf("%-13s : ",label)
-                    wrap_line(detail_prefix detail_label, detail_prefix spaces(length(detail_label)), value)
-                } else wrap_line(detail_prefix,detail_prefix "    ",dtext)
-            }
-        }
-    }
-}' "$_structure" "$_text_file"
+NR==FNR {struct_count++;struct_depth[struct_count]=$2+0;struct_prefix[struct_count]=$3;struct_last[struct_count]=$4+0;struct_role[struct_count]=$5;next}
+function add_detail(i,text){if(i>0){detail_count[i]++;detail[i,detail_count[i]]=text}}
+function spaces(n, s){s="";while(n-->0)s=s" ";return s}
+function trimleft(s){sub(/^[[:space:]]+/,"",s);return s}
+function wrap_line(first,cont,text, avail,cut,j,piece){text=trimleft(text);while(text!=""){avail=width-length(first);if(avail<20)avail=20;if(length(text)<=avail){print first text;return}cut=0;for(j=avail;j>=1;j--)if(substr(text,j,1)==" "){cut=j;break}if(cut==0)cut=avail;piece=substr(text,1,cut);sub(/[[:space:]]+$/,"",piece);print first piece;text=substr(text,cut+1);text=trimleft(text);first=cont}}
+function wrap_node(first,cont,text,p,head,tail){if(length(first)+length(text)<=width){print first text;return}p=index(text," (actual ");if(p>0){head=substr(text,1,p-1);tail=substr(text,p+1);wrap_line(first,cont,head);wrap_line(cont,cont,tail);return}p=index(text," (never executed)");if(p>0){head=substr(text,1,p-1);tail=substr(text,p+1);wrap_line(first,cont,head);wrap_line(cont,cont,tail);return}wrap_line(first,cont,text)}
+{raw=$0;t=raw;sub(/^[[:space:]]+/,"",t);if(!root_seen&&t!=""){node_count++;node_text[node_count]=t;current_node=node_count;root_seen=1;next}if(t~/^->/){node_count++;sub(/^->[[:space:]]*/,"",t);node_text[node_count]=t;current_node=node_count;next}if(t~/^(Sort Key|Index Cond|Recheck Cond|Hash Cond|Merge Cond|Join Filter|Filter):/){add_detail(current_node,t);next}if(t~/^(CTE|InitPlan|SubPlan)([[:space:]]|$)/){add_detail(current_node,t);next}}
+END{if(node_count!=struct_count){printf "WARNING: JSON plan node count (%d) and TEXT plan node count (%d) differ; structured summary omitted to avoid an incorrect tree.\n",struct_count,node_count}else{for(i=1;i<=node_count;i++){role=struct_role[i];if(struct_depth[i]==0){first="";cont="    ";detail_prefix="    "}else{connector=(struct_last[i]?"`-- ":"|-- ");first=struct_prefix[i] connector role;detail_prefix=struct_prefix[i](struct_last[i]?"    ":"|   ");cont=detail_prefix spaces(length(role))}wrap_node(first,cont,node_text[i]);for(j=1;j<=detail_count[i];j++){dtext=detail[i,j];colon=index(dtext,":");if(colon>0){label=substr(dtext,1,colon-1);value=substr(dtext,colon+1);detail_label=sprintf("%-13s : ",label);wrap_line(detail_prefix detail_label,detail_prefix spaces(length(detail_label)),value)}else wrap_line(detail_prefix,detail_prefix"    ",dtext)}}}}' "$_structure" "$_text_file"
 }
 
 build_bind_map() {
     bind_map="$work_dir/bind-map.txt"
     if ! {
         cat "$prepare_file"
-        cat <<'SQL'
+        cat <<'BIND_MAP_SQL'
 BEGIN;
 SELECT set_config('statement_timeout', :'sample_timeout', true) AS map_timeout \gset
 SET plan_cache_mode = force_generic_plan;
@@ -807,48 +573,107 @@ CREATE TEMP TABLE explain_bind_plan (plan jsonb) ON COMMIT DROP;
 DO $map$
 DECLARE args text; result json;
 BEGIN
-  SELECT string_agg('NULL', ', ' ORDER BY n) INTO args
-  FROM pg_prepared_statements p, generate_series(1, cardinality(p.parameter_types)) n
-  WHERE p.name='pg_explain_target';
-  EXECUTE 'EXPLAIN (VERBOSE, COSTS FALSE, FORMAT JSON) EXECUTE pg_explain_target' || CASE WHEN args IS NULL THEN '' ELSE '('||args||')' END INTO result;
-  INSERT INTO explain_bind_plan VALUES (result::jsonb);
+ SELECT string_agg('NULL', ', ' ORDER BY n) INTO args
+ FROM pg_prepared_statements p, generate_series(1, cardinality(p.parameter_types)) n WHERE p.name='pg_explain_target';
+ EXECUTE 'EXPLAIN (VERBOSE, COSTS FALSE, FORMAT JSON) EXECUTE pg_explain_target' || CASE WHEN args IS NULL THEN '' ELSE '('||args||')' END INTO result;
+ INSERT INTO explain_bind_plan VALUES (result::jsonb);
 END $map$;
 WITH RECURSIVE nodes(node) AS (
  SELECT plan->0->'Plan' FROM explain_bind_plan
  UNION ALL SELECT child FROM nodes, LATERAL jsonb_array_elements(COALESCE(node->'Plans','[]'::jsonb)) child
-), rels AS (
+), relations AS (
  SELECT DISTINCT node->>'Alias' alias, format('%I.%I',node->>'Schema',node->>'Relation Name') relation,
         to_regclass(format('%I.%I',node->>'Schema',node->>'Relation Name')) relid
  FROM nodes WHERE node ? 'Schema' AND node ? 'Relation Name' AND node ? 'Alias'
-), expr AS (
- SELECT DISTINCT e.value txt FROM nodes, LATERAL jsonb_each_text(node) e
+), expressions AS (
+ SELECT DISTINCT term FROM nodes, LATERAL jsonb_each_text(node) e,
+ LATERAL regexp_split_to_table(e.value,'\s+(?:AND|OR)\s+') term
  WHERE e.key IN ('Filter','Index Cond','Recheck Cond','Hash Cond','Merge Cond','Join Filter')
-), refs AS (
- SELECT (regexp_matches(txt,'([a-zA-Z_][a-zA-Z0-9_$]*)\.([a-zA-Z_][a-zA-Z0-9_$]*)[^$]*\$([1-9][0-9]*)','g')) m FROM expr
-), cand AS (
- SELECT m[3] parameter, r.relid, m[2] column_name
- FROM refs JOIN rels r ON r.alias=m[1]
- JOIN pg_attribute a ON a.attrelid=r.relid AND a.attname=m[2] AND a.attnum>0 AND NOT a.attisdropped
-)
-SELECT parameter, format('%I.%I',n.nspname,c.relname), column_name
-FROM cand x JOIN pg_class c ON c.oid=x.relid JOIN pg_namespace n ON n.oid=c.relnamespace
-ORDER BY parameter::int,2,3;
+), patterns AS (
+ SELECT '(?:[a-z_][a-z_0-9$]*|"(?:[^"]|"")+")' ident,
+        '(?:::(?:text|integer|bigint|smallint|numeric|boolean|date|uuid|character varying|double precision))?' cast_pattern
+), qualified_matches AS (
+ SELECT regexp_match(term,'^\s*\(*\s*('||ident||'\.'||ident||')\)*'||cast_pattern||'\)*\s*(?:=|<>|!=|<=|>=|<|>|~~\*?|!~~\*?)\s*\(*\$([1-9][0-9]*)\)*'||cast_pattern||'\)*\s*$') m,false reversed FROM expressions,patterns
+ UNION ALL
+ SELECT regexp_match(term,'^\s*\(*\$([1-9][0-9]*)\)*'||cast_pattern||'\)*\s*(?:=|<>|!=|<=|>=|<|>)\s*\(*('||ident||'\.'||ident||')\)*'||cast_pattern||'\)*\s*$'),true FROM expressions,patterns
+), qualified_refs AS (
+ SELECT CASE WHEN reversed THEN m[1] ELSE m[2] END parameter, parse_ident(CASE WHEN reversed THEN m[2] ELSE m[1] END) names FROM qualified_matches WHERE m IS NOT NULL
+), unqualified_matches AS (
+ SELECT regexp_match(term,'^\s*\(*\s*('||ident||')\)*'||cast_pattern||'\)*\s*(?:=|<>|!=|<=|>=|<|>|~~\*?|!~~\*?)\s*\(*\$([1-9][0-9]*)\)*'||cast_pattern||'\)*\s*$') m,false reversed FROM expressions,patterns
+ UNION ALL
+ SELECT regexp_match(term,'^\s*\(*\$([1-9][0-9]*)\)*'||cast_pattern||'\)*\s*(?:=|<>|!=|<=|>=|<|>)\s*\(*('||ident||')\)*'||cast_pattern||'\)*\s*$'),true FROM expressions,patterns
+), unqualified_refs AS (
+ SELECT CASE WHEN reversed THEN m[1] ELSE m[2] END parameter, (parse_ident(CASE WHEN reversed THEN m[2] ELSE m[1] END))[1] column_name FROM unqualified_matches WHERE m IS NOT NULL
+), direct_candidates AS (
+ SELECT DISTINCT q.parameter,r.relid,q.names[2] column_name,1 priority FROM qualified_refs q JOIN relations r ON r.alias=q.names[1]
+ JOIN pg_attribute a ON a.attrelid=r.relid AND a.attname=q.names[2] AND a.attnum>0 AND NOT a.attisdropped
+), unqualified_candidates AS (
+ SELECT DISTINCT u.parameter,r.relid,u.column_name,2 priority FROM unqualified_refs u CROSS JOIN relations r
+ JOIN pg_attribute a ON a.attrelid=r.relid AND a.attname=u.column_name AND a.attnum>0 AND NOT a.attisdropped
+), all_candidates AS (SELECT * FROM direct_candidates UNION ALL SELECT * FROM unqualified_candidates),
+normalized AS (
+ SELECT DISTINCT c.parameter,CASE WHEN pc.relispartition THEN pg_partition_root(c.relid) ELSE c.relid END normalized_relid,c.column_name,c.priority
+ FROM all_candidates c JOIN pg_class pc ON pc.oid=c.relid
+), best_priority AS (SELECT parameter,min(priority) priority FROM normalized GROUP BY parameter)
+SELECT n.parameter,format('%I.%I',ns.nspname,cls.relname),n.column_name,n.priority
+FROM normalized n JOIN best_priority b USING(parameter,priority) JOIN pg_class cls ON cls.oid=n.normalized_relid JOIN pg_namespace ns ON ns.oid=cls.relnamespace
+WHERE format('%I.%I',ns.nspname,cls.relname) !~ E'[|\n\r]' AND n.column_name !~ E'[|\n\r]'
+ORDER BY n.parameter::integer,n.priority,2,3;
 ROLLBACK;
-SQL
-    } | run_psql -X -qAt -F '|' -v ON_ERROR_STOP=1 -v sample_timeout="$BIND_SAMPLE_TIMEOUT" > "$bind_map" 2>/dev/null; then : > "$bind_map"; fi
+BIND_MAP_SQL
+    } | run_psql -X -qAt -F '|' -v ON_ERROR_STOP=1 -v sample_timeout="$BIND_SAMPLE_TIMEOUT" > "$bind_map" 2>"$work_dir/bind-map.err"; then
+        : > "$bind_map"; echo 'Automatic bind-column mapping unavailable; manual selection will be offered.' >&2
+    fi
+}
+
+build_bind_constant_map() {
+    bind_constant_map="$work_dir/bind-constant-map.txt"
+    if ! {
+        cat "$prepare_file"
+        cat <<'BIND_CONSTANT_SQL'
+BEGIN;
+SELECT set_config('statement_timeout', :'sample_timeout', true) AS map_timeout \gset
+SET plan_cache_mode = force_generic_plan;
+CREATE TEMP TABLE explain_bind_constant_plan (plan jsonb) ON COMMIT DROP;
+DO $map$
+DECLARE args text; result json;
+BEGIN
+ SELECT string_agg('NULL', ', ' ORDER BY n) INTO args FROM pg_prepared_statements p,generate_series(1,cardinality(p.parameter_types)) n WHERE p.name='pg_explain_target';
+ EXECUTE 'EXPLAIN (VERBOSE, COSTS FALSE, FORMAT JSON) EXECUTE pg_explain_target' || CASE WHEN args IS NULL THEN '' ELSE '('||args||')' END INTO result;
+ INSERT INTO explain_bind_constant_plan VALUES (result::jsonb);
+END $map$;
+WITH RECURSIVE nodes(node) AS (
+ SELECT plan->0->'Plan' FROM explain_bind_constant_plan
+ UNION ALL SELECT child FROM nodes,LATERAL jsonb_array_elements(COALESCE(node->'Plans','[]'::jsonb)) child
+), expressions AS (
+ SELECT DISTINCT term FROM nodes,LATERAL jsonb_each_text(node) e,LATERAL regexp_split_to_table(e.value,'\s+(?:AND|OR)\s+') term
+ WHERE e.key IN ('Filter','Index Cond','Recheck Cond','Hash Cond','Merge Cond','Join Filter','One-Time Filter')
+), patterns AS (
+ SELECT '(?:NULL|true|false|[-+]?[0-9]+(?:\.[0-9]+)?|''(?:[^'']|'''')*'')' literal,
+        '(?:::(?:text|integer|bigint|smallint|numeric|boolean|date|uuid|character varying|double precision))?' cast_pattern
+), matches AS (
+ SELECT regexp_match(term,'^\s*\(*\s*('||literal||')\)*'||cast_pattern||'\)*\s*(?:=|<>|!=|<=|>=|<|>)\s*\(*\$([1-9][0-9]*)\)*'||cast_pattern||'\)*\s*$') m,false reversed FROM expressions,patterns
+ UNION ALL
+ SELECT regexp_match(term,'^\s*\(*\$([1-9][0-9]*)\)*'||cast_pattern||'\)*\s*(?:=|<>|!=|<=|>=|<|>)\s*\(*('||literal||')\)*'||cast_pattern||'\)*\s*$'),true FROM expressions,patterns
+), normalized AS (
+ SELECT CASE WHEN reversed THEN m[1] ELSE m[2] END parameter, CASE WHEN reversed THEN m[2] ELSE m[1] END literal FROM matches WHERE m IS NOT NULL
+), literal_values AS (
+ SELECT parameter,CASE WHEN literal='NULL' THEN '\N' WHEN literal LIKE '''%''' THEN replace(substr(literal,2,length(literal)-2),'''''','''') ELSE literal END default_value FROM normalized
+), unique_value AS (
+ SELECT parameter,min(default_value) default_value FROM literal_values GROUP BY parameter HAVING count(DISTINCT default_value)=1
+)
+SELECT parameter,default_value FROM unique_value WHERE default_value !~ E'[|\n\r]' ORDER BY parameter::integer;
+ROLLBACK;
+BIND_CONSTANT_SQL
+    } | run_psql -X -qAt -F '|' -v ON_ERROR_STOP=1 -v sample_timeout="$BIND_SAMPLE_TIMEOUT" > "$bind_constant_map" 2>"$work_dir/bind-constant-map.err"; then : > "$bind_constant_map"; fi
 }
 
 build_bind_type_map() {
     bind_type_map="$work_dir/bind-type-map.txt"
-    {
-        cat "$prepare_file"
-        cat <<'SQL'
-SELECT n, p.parameter_types[n]::text,
-       CASE WHEN COALESCE(bt.typcategory,pt.typcategory)='S' THEN 'yes' ELSE 'no' END
-FROM pg_prepared_statements p
-CROSS JOIN LATERAL generate_subscripts(p.parameter_types,1) n
-JOIN pg_type pt ON pt.oid=p.parameter_types[n]::oid
-LEFT JOIN pg_type bt ON bt.oid=NULLIF(pt.typbasetype,0)
+    { cat "$prepare_file"; cat <<'SQL'
+SELECT n,p.parameter_types[n]::text,CASE WHEN COALESCE(bt.typcategory,pt.typcategory)='S' THEN 'yes' ELSE 'no' END
+FROM pg_prepared_statements p CROSS JOIN LATERAL generate_subscripts(p.parameter_types,1) n
+JOIN pg_type pt ON pt.oid=p.parameter_types[n]::oid LEFT JOIN pg_type bt ON bt.oid=NULLIF(pt.typbasetype,0)
 WHERE p.name='pg_explain_target' ORDER BY n;
 SQL
     } | run_psql -X -qAt -F '|' -v ON_ERROR_STOP=1 > "$bind_type_map" || return 1
@@ -858,41 +683,62 @@ show_bind_candidates() {
     bind_default_available=no; bind_default_value=
     bind_type=$(awk -F'|' -v n="$bind_index" '$1==n{print $2;exit}' "$bind_type_map")
     bind_empty_string_allowed=$(awk -F'|' -v n="$bind_index" '$1==n{print $3;exit}' "$bind_type_map")
-    [ -n "$bind_type" ] || bind_type=unknown
-    [ -n "$bind_empty_string_allowed" ] || bind_empty_string_allowed=no
+    [ -n "$bind_type" ] || bind_type=unknown; [ -n "$bind_empty_string_allowed" ] || bind_empty_string_allowed=no
     printf 'Parameter $%s type: %s\n' "$bind_index" "$bind_type"
+    constant_line=$(awk -F'|' -v n="$bind_index" '$1==n{print;exit}' "$bind_constant_map")
+    if [ -n "$constant_line" ]; then
+        bind_default_value=${constant_line#*|}; bind_default_available=yes
+        printf 'Auto-detected $%s -> SQL constant default: %s\n' "$bind_index" "$bind_default_value"
+        return 0
+    fi
     bind_candidate_file="$work_dir/bind-candidates-$bind_index.txt"
     awk -F'|' -v n="$bind_index" '$1==n{print $2"|"$3}' "$bind_map" | sort -u > "$bind_candidate_file"
-    count=$(awk 'END{print NR+0}' "$bind_candidate_file")
+    bind_candidate_count=$(awk 'END{print NR+0}' "$bind_candidate_file")
     sample_relation=; sample_column=
-    if [ "$count" -eq 1 ]; then
-        line=$(sed -n '1p' "$bind_candidate_file"); sample_relation=${line%%|*}; sample_column=${line#*|}
+    if [ "$bind_candidate_count" -eq 1 ]; then
+        candidate_line=$(sed -n '1p' "$bind_candidate_file"); sample_relation=${candidate_line%%|*}; sample_column=${candidate_line#*|}
         printf 'Auto-detected $%s -> %s / %s\n' "$bind_index" "$sample_relation" "$sample_column"
-    elif [ "$count" -gt 1 ]; then
+    elif [ "$bind_candidate_count" -gt 1 ]; then
         echo "Multiple candidate relations found for parameter \$$bind_index:"
-        n=1; while IFS='|' read -r r c; do printf '  %s) %s / %s\n' "$n" "$r" "$c"; n=$((n+1)); done < "$bind_candidate_file"
-        printf 'Select candidate for $%s [1]: ' "$bind_index" >&2; IFS= read -r choice; [ -n "$choice" ] || choice=1
-        line=$(sed -n "${choice}p" "$bind_candidate_file"); sample_relation=${line%%|*}; sample_column=${line#*|}
+        candidate_no=1
+        while IFS='|' read -r candidate_relation candidate_column; do printf '  %s) %s / %s\n' "$candidate_no" "$candidate_relation" "$candidate_column"; candidate_no=$((candidate_no+1)); done < "$bind_candidate_file"
+        while :; do
+            printf 'Select candidate for $%s [1]: ' "$bind_index" >&2; IFS= read -r candidate_choice || return 1; [ -n "$candidate_choice" ] || candidate_choice=1
+            case $candidate_choice in *[!0-9]*|'') echo "ERROR: enter a candidate number." >&2; continue ;; esac
+            [ "$candidate_choice" -ge 1 ] && [ "$candidate_choice" -le "$bind_candidate_count" ] || { printf 'ERROR: choose 1-%s.\n' "$bind_candidate_count" >&2; continue; }
+            candidate_line=$(sed -n "${candidate_choice}p" "$bind_candidate_file"); sample_relation=${candidate_line%%|*}; sample_column=${candidate_line#*|}; break
+        done
     else
         echo "No automatic relation candidate found for this parameter." >&2
+        echo "The table/column below is only used to look up example values; press Enter to skip." >&2
     fi
-    if [ -z "$sample_relation" ]; then
-        printf 'Candidate source table for $%s (schema.table, empty to skip): ' "$bind_index" >&2; IFS= read -r sample_relation
-        [ -n "$sample_relation" ] || return 0
-        printf 'Candidate source column (exact name, empty to skip): ' >&2; IFS= read -r sample_column
-        [ -n "$sample_column" ] || return 0
-    fi
-    echo
-    printf 'Table value candidates for $%s (up to %s distinct values; not historical bind values)\n' "$bind_index" "$BIND_SAMPLE_LIMIT"
-    run_psql -X -q -P pager=off -v ON_ERROR_STOP=1 -v sample_relation="$sample_relation" -v sample_column="$sample_column" -v sample_limit="$BIND_SAMPLE_LIMIT" <<'SQL' || return 0
+    while :; do
+        if [ -z "$sample_relation" ] || [ -z "$sample_column" ]; then
+            printf 'Candidate source table for $%s (schema.table, empty to skip): ' "$bind_index" >&2; IFS= read -r sample_relation || return 1; [ -n "$sample_relation" ] || return 0
+            printf 'Candidate source column (exact name, empty to skip): ' >&2; IFS= read -r sample_column || return 1; [ -n "$sample_column" ] || return 0
+        fi
+        printf '\nTable value candidates for $%s (up to %s distinct values; not historical bind values)\n' "$bind_index" "$BIND_SAMPLE_LIMIT"
+        if run_psql -X -q -P pager=off -v ON_ERROR_STOP=1 -v sample_relation="$sample_relation" -v sample_column="$sample_column" -v sample_limit="$BIND_SAMPLE_LIMIT" -v sample_timeout="$BIND_SAMPLE_TIMEOUT" <<'SQL'
+BEGIN READ ONLY;
+SELECT set_config('statement_timeout', :'sample_timeout', true) AS sample_timeout \gset
 SELECT format('SELECT DISTINCT %1$I AS candidate_value FROM %2$s WHERE %1$I IS NOT NULL LIMIT %3$s', :'sample_column', :'sample_relation'::regclass, :'sample_limit'::integer) \gexec
+COMMIT;
 SQL
-    bind_default_value=$(run_psql -X -qAt -v ON_ERROR_STOP=1 -v sample_relation="$sample_relation" -v sample_column="$sample_column" <<'SQL'
-SELECT format('SELECT DISTINCT %1$I::text FROM %2$s WHERE %1$I IS NOT NULL LIMIT 1', :'sample_column', :'sample_relation'::regclass) \gexec
+        then
+            bind_default_value=$(run_psql -X -qAt -v ON_ERROR_STOP=1 -v sample_relation="$sample_relation" -v sample_column="$sample_column" -v sample_timeout="$BIND_SAMPLE_TIMEOUT" <<'SQL'
+BEGIN READ ONLY;
+SELECT set_config('statement_timeout', :'sample_timeout', true) AS sample_timeout \gset
+SELECT format('SELECT DISTINCT %1$I::text FROM %2$s WHERE %1$I IS NOT NULL AND %1$I::text !~ E''[\n\r]'' LIMIT 1', :'sample_column', :'sample_relation'::regclass) \gexec
+COMMIT;
 SQL
-    ) || bind_default_value=
-    if [ -n "$bind_default_value" ]; then bind_default_available=yes; printf 'Default for $%s: %s\n' "$bind_index" "$bind_default_value"; fi
-    echo 'Candidates are distinct current table values and do not apply the original SQL filters.'
+            ) || bind_default_value=
+            if [ -n "$bind_default_value" ]; then bind_default_available=yes; printf 'Default for $%s: %s\n' "$bind_index" "$bind_default_value"; fi
+            echo 'Candidates are distinct current table values and do not apply the original SQL filters.'
+            return 0
+        fi
+        echo 'Could not read candidates. Check table/column/permissions or retry; empty table skips candidates.' >&2
+        sample_relation=; sample_column=
+    done
 }
 
 _bind_default=n
@@ -908,24 +754,25 @@ if [ "$BIND" = yes ]; then
             echo "      정규화 상수는 복원했지만 남은 bind의 타입을 문맥만으로 추론할 수 없는 SQL일 수 있습니다." >&2
             echo "      필요한 경우 Parameter types에 원본 bind 타입을 쉼표로 직접 지정하세요." >&2
         fi
-        echo "ERROR: Could not prepare SQL." >&2
-        exit 1
+        echo "ERROR: Could not prepare SQL." >&2; exit 1
     fi
     case $BIND_COUNT in ''|*[!0-9]*) echo "ERROR: invalid parameter count" >&2; exit 1 ;; esac
     BIND_SAMPLE_LIMIT=${BIND_SAMPLE_LIMIT:-3}; BIND_SAMPLE_TIMEOUT=${BIND_SAMPLE_TIMEOUT:-5s}
-    build_bind_map; build_bind_type_map || exit 1
+    if ! printf '%s\n' "$BIND_SAMPLE_LIMIT" | grep -Eq '^[0-9]*[1-9][0-9]*$'; then echo "ERROR: BIND_SAMPLE_LIMIT must be a positive integer." >&2; exit 1; fi
+    build_bind_map; build_bind_constant_map; build_bind_type_map || exit 1
     echo "Bind parameter count: $BIND_COUNT"
     echo 'Enter each value as plain text (no SQL quotes). \N means SQL NULL. If a default is shown, Enter accepts it.'
-    printf 'EXECUTE pg_explain_target' > "$execute_file"
-    [ "$BIND_COUNT" -eq 0 ] || printf '(' >> "$execute_file"
+    printf 'EXECUTE pg_explain_target' > "$execute_file"; [ "$BIND_COUNT" -eq 0 ] || printf '(' >> "$execute_file"
     bind_index=1
     while [ "$bind_index" -le "$BIND_COUNT" ]; do
-        show_bind_candidates
+        show_bind_candidates || exit 1
         while :; do
-            if [ "$bind_default_available" = yes ]; then printf 'Value for $%s [%s]: ' "$bind_index" "$bind_default_value" >&2; else printf 'Value for $%s (\\N for NULL): ' "$bind_index" >&2; fi
-            IFS= read -r bind_value
-            if [ -z "$bind_value" ] && [ "$bind_default_available" = yes ]; then bind_value=$bind_default_value; fi
-            if [ -z "$bind_value" ] && [ "$bind_empty_string_allowed" != yes ]; then echo "ERROR: value required for $bind_type." >&2; continue; fi
+            if [ "$bind_default_available" = yes ]; then printf 'Value for $%s [%s]: ' "$bind_index" "$bind_default_value" >&2
+            elif [ "$bind_empty_string_allowed" = yes ]; then printf 'Value for $%s (empty string allowed, \\N for NULL): ' "$bind_index" >&2
+            else printf 'Value for $%s (required, \\N for NULL): ' "$bind_index" >&2; fi
+            IFS= read -r bind_value || exit 1
+            if [ -z "$bind_value" ] && [ "$bind_default_available" = yes ]; then bind_value=$bind_default_value; break; fi
+            if [ -z "$bind_value" ] && [ "$bind_empty_string_allowed" != yes ]; then printf 'ERROR: $%s type %s requires a value or \\N.\n' "$bind_index" "$bind_type" >&2; continue; fi
             break
         done
         [ "$bind_index" -eq 1 ] || printf ', ' >> "$execute_file"
@@ -939,297 +786,62 @@ if [ "$BIND" = yes ]; then
 fi
 
 ANALYZE=$(ask 'Use ANALYZE? y/n' n)
-if [ "$ANALYZE" = yes ]; then
-    echo
-    echo "WARNING: EXPLAIN ANALYZE executes the target SQL."
-    echo "         DML is executed inside BEGIN -> EXPLAIN ANALYZE -> ROLLBACK."
-    echo "         DML data changes are rolled back after plan collection."
-    echo
-fi
-VERBOSE=$(ask 'Use VERBOSE? y/n' n)
-COSTS=$(ask 'Use COSTS? y/n' y)
-SETTINGS=$(ask 'Use SETTINGS? y/n' y)
+if [ "$ANALYZE" = yes ]; then echo; echo "WARNING: EXPLAIN ANALYZE executes the target SQL."; echo "         DML is executed inside BEGIN -> EXPLAIN ANALYZE -> ROLLBACK."; echo "         DML data changes are rolled back after plan collection."; echo; fi
+VERBOSE=$(ask 'Use VERBOSE? y/n' n); COSTS=$(ask 'Use COSTS? y/n' y); SETTINGS=$(ask 'Use SETTINGS? y/n' y)
 BUFFERS=no; WAL=no; TIMING=no; GENERIC_PLAN=no; SERIALIZE=no; MEMORY=no
-if [ "$ANALYZE" = yes ]; then
-    BUFFERS=$(ask 'Use BUFFERS? y/n' y)
-    [ "$SERVER_VERSION_NUM" -lt 130000 ] || WAL=$(ask 'Use WAL? y/n' n)
-    TIMING=$(ask 'Use TIMING? y/n' y)
-    [ "$SERVER_VERSION_NUM" -lt 170000 ] || SERIALIZE=$(ask 'Use SERIALIZE TEXT? y/n' n)
-else
-    if [ "$BIND" = no ] && [ "$SERVER_VERSION_NUM" -ge 160000 ]; then GENERIC_PLAN=$(ask 'Use GENERIC_PLAN? y/n' n); fi
-fi
+if [ "$ANALYZE" = yes ]; then BUFFERS=$(ask 'Use BUFFERS? y/n' y); [ "$SERVER_VERSION_NUM" -lt 130000 ] || WAL=$(ask 'Use WAL? y/n' n); TIMING=$(ask 'Use TIMING? y/n' y); [ "$SERVER_VERSION_NUM" -lt 170000 ] || SERIALIZE=$(ask 'Use SERIALIZE TEXT? y/n' n); else if [ "$BIND" = no ] && [ "$SERVER_VERSION_NUM" -ge 160000 ]; then GENERIC_PLAN=$(ask 'Use GENERIC_PLAN? y/n' n); fi; fi
 [ "$SERVER_VERSION_NUM" -lt 170000 ] || MEMORY=$(ask 'Use MEMORY? y/n' n)
 SUMMARY=$(ask 'Use SUMMARY? y/n' y)
+base_plan_opts=""; add_opt(){ [ -z "$base_plan_opts" ] && base_plan_opts="$1" || base_plan_opts="$base_plan_opts, $1"; }
+[ "$ANALYZE" = yes ] && add_opt 'ANALYZE TRUE'; [ "$VERBOSE" = yes ] && add_opt 'VERBOSE TRUE' || add_opt 'VERBOSE FALSE'; [ "$COSTS" = yes ] && add_opt 'COSTS TRUE' || add_opt 'COSTS FALSE'; [ "$SETTINGS" = yes ] && add_opt 'SETTINGS TRUE' || add_opt 'SETTINGS FALSE'
+if [ "$ANALYZE" = yes ]; then [ "$BUFFERS" = yes ] && add_opt 'BUFFERS TRUE' || add_opt 'BUFFERS FALSE'; [ "$SERVER_VERSION_NUM" -lt 130000 ] || { [ "$WAL" = yes ] && add_opt 'WAL TRUE' || add_opt 'WAL FALSE'; }; [ "$TIMING" = yes ] && add_opt 'TIMING TRUE' || add_opt 'TIMING FALSE'; if [ "$SERVER_VERSION_NUM" -ge 170000 ]; then [ "$SERIALIZE" = yes ] && add_opt 'SERIALIZE TEXT' || add_opt 'SERIALIZE NONE'; fi; fi
+[ "$GENERIC_PLAN" = yes ] && add_opt 'GENERIC_PLAN TRUE'; if [ "$SERVER_VERSION_NUM" -ge 170000 ]; then [ "$MEMORY" = yes ] && add_opt 'MEMORY TRUE' || add_opt 'MEMORY FALSE'; fi; [ "$SUMMARY" = yes ] && add_opt 'SUMMARY TRUE' || add_opt 'SUMMARY FALSE'; raw_text_opts="$base_plan_opts, FORMAT TEXT"
+option_tf(){ [ "$1" = yes ] && printf 'TRUE' || printf 'FALSE'; }
+write_option_summary(){ echo "Selected EXPLAIN Options"; printf '  %-12s : %s\n' ANALYZE "$(option_tf "$ANALYZE")"; printf '  %-12s : %s\n' VERBOSE "$(option_tf "$VERBOSE")"; printf '  %-12s : %s\n' COSTS "$(option_tf "$COSTS")"; printf '  %-12s : %s\n' SETTINGS "$(option_tf "$SETTINGS")"; if [ "$ANALYZE" = yes ]; then printf '  %-12s : %s\n' BUFFERS "$(option_tf "$BUFFERS")"; [ "$SERVER_VERSION_NUM" -lt 130000 ] || printf '  %-12s : %s\n' WAL "$(option_tf "$WAL")"; printf '  %-12s : %s\n' TIMING "$(option_tf "$TIMING")"; fi; printf '  %-12s : %s\n' SUMMARY "$(option_tf "$SUMMARY")"; printf '  %-12s : TEXT\n' FORMAT; [ "$BIND" = yes ] && printf '  %-12s : %s\n' PLAN_MODE "$BIND_PLAN_MODE"; }
+options_summary="$work_dir/explain-options.txt"; write_option_summary > "$options_summary"; echo; cat "$options_summary"; echo
 
-base_plan_opts=""
-add_opt() { [ -z "$base_plan_opts" ] && base_plan_opts="$1" || base_plan_opts="$base_plan_opts, $1"; }
-[ "$ANALYZE" = yes ] && add_opt 'ANALYZE TRUE'
-[ "$VERBOSE" = yes ] && add_opt 'VERBOSE TRUE' || add_opt 'VERBOSE FALSE'
-[ "$COSTS" = yes ] && add_opt 'COSTS TRUE' || add_opt 'COSTS FALSE'
-[ "$SETTINGS" = yes ] && add_opt 'SETTINGS TRUE' || add_opt 'SETTINGS FALSE'
-if [ "$ANALYZE" = yes ]; then
-    [ "$BUFFERS" = yes ] && add_opt 'BUFFERS TRUE' || add_opt 'BUFFERS FALSE'
-    [ "$SERVER_VERSION_NUM" -lt 130000 ] || { [ "$WAL" = yes ] && add_opt 'WAL TRUE' || add_opt 'WAL FALSE'; }
-    [ "$TIMING" = yes ] && add_opt 'TIMING TRUE' || add_opt 'TIMING FALSE'
-    if [ "$SERVER_VERSION_NUM" -ge 170000 ]; then [ "$SERIALIZE" = yes ] && add_opt 'SERIALIZE TEXT' || add_opt 'SERIALIZE NONE'; fi
-fi
-[ "$GENERIC_PLAN" = yes ] && add_opt 'GENERIC_PLAN TRUE'
-if [ "$SERVER_VERSION_NUM" -ge 170000 ]; then [ "$MEMORY" = yes ] && add_opt 'MEMORY TRUE' || add_opt 'MEMORY FALSE'; fi
-[ "$SUMMARY" = yes ] && add_opt 'SUMMARY TRUE' || add_opt 'SUMMARY FALSE'
-raw_text_opts="$base_plan_opts, FORMAT TEXT"
+tree_plan_opts=""; add_tree_opt(){ [ -z "$tree_plan_opts" ] && tree_plan_opts="$1" || tree_plan_opts="$tree_plan_opts, $1"; }
+[ "$VERBOSE" = yes ] && add_tree_opt 'VERBOSE TRUE' || add_tree_opt 'VERBOSE FALSE'; [ "$COSTS" = yes ] && add_tree_opt 'COSTS TRUE' || add_tree_opt 'COSTS FALSE'; [ "$SETTINGS" = yes ] && add_tree_opt 'SETTINGS TRUE' || add_tree_opt 'SETTINGS FALSE'; [ "$GENERIC_PLAN" = yes ] && add_tree_opt 'GENERIC_PLAN TRUE'; [ "$SUMMARY" = yes ] && add_tree_opt 'SUMMARY TRUE' || add_tree_opt 'SUMMARY FALSE'; tree_json_opts="$tree_plan_opts, FORMAT JSON"
 
-option_tf() { [ "$1" = yes ] && printf 'TRUE' || printf 'FALSE'; }
-write_option_summary() {
-    echo "Selected EXPLAIN Options"
-    printf '  %-12s : %s\n' ANALYZE "$(option_tf "$ANALYZE")"
-    printf '  %-12s : %s\n' VERBOSE "$(option_tf "$VERBOSE")"
-    printf '  %-12s : %s\n' COSTS "$(option_tf "$COSTS")"
-    printf '  %-12s : %s\n' SETTINGS "$(option_tf "$SETTINGS")"
-    if [ "$ANALYZE" = yes ]; then
-        printf '  %-12s : %s\n' BUFFERS "$(option_tf "$BUFFERS")"
-        if [ "$SERVER_VERSION_NUM" -ge 130000 ]; then printf '  %-12s : %s\n' WAL "$(option_tf "$WAL")"; fi
-        printf '  %-12s : %s\n' TIMING "$(option_tf "$TIMING")"
-        if [ "$SERVER_VERSION_NUM" -ge 170000 ]; then
-            if [ "$SERIALIZE" = yes ]; then printf '  %-12s : TEXT\n' SERIALIZE; else printf '  %-12s : NONE\n' SERIALIZE; fi
-        fi
-    elif [ "$BIND" = no ] && [ "$SERVER_VERSION_NUM" -ge 160000 ]; then
-        printf '  %-12s : %s\n' GENERIC_PLAN "$(option_tf "$GENERIC_PLAN")"
-    fi
-    if [ "$SERVER_VERSION_NUM" -ge 170000 ]; then printf '  %-12s : %s\n' MEMORY "$(option_tf "$MEMORY")"; fi
-    printf '  %-12s : %s\n' SUMMARY "$(option_tf "$SUMMARY")"
-    printf '  %-12s : TEXT\n' FORMAT
-    if [ "$BIND" = yes ]; then printf '  %-12s : %s\n' PLAN_MODE "$BIND_PLAN_MODE"; fi
-}
-options_summary="$work_dir/explain-options.txt"
-write_option_summary > "$options_summary"
-echo
-cat "$options_summary"
-echo
-
-tree_plan_opts=""
-add_tree_opt() { [ -z "$tree_plan_opts" ] && tree_plan_opts="$1" || tree_plan_opts="$tree_plan_opts, $1"; }
-[ "$VERBOSE" = yes ] && add_tree_opt 'VERBOSE TRUE' || add_tree_opt 'VERBOSE FALSE'
-[ "$COSTS" = yes ] && add_tree_opt 'COSTS TRUE' || add_tree_opt 'COSTS FALSE'
-[ "$SETTINGS" = yes ] && add_tree_opt 'SETTINGS TRUE' || add_tree_opt 'SETTINGS FALSE'
-[ "$GENERIC_PLAN" = yes ] && add_tree_opt 'GENERIC_PLAN TRUE'
-if [ "$SERVER_VERSION_NUM" -ge 170000 ]; then [ "$MEMORY" = yes ] && add_tree_opt 'MEMORY TRUE' || add_tree_opt 'MEMORY FALSE'; fi
-[ "$SUMMARY" = yes ] && add_tree_opt 'SUMMARY TRUE' || add_tree_opt 'SUMMARY FALSE'
-tree_json_opts="$tree_plan_opts, FORMAT JSON"
-
-tree_plan_json="$work_dir/tree-plan.json"; rel_file="$work_dir/relations.txt"; rel_oid_file="$work_dir/relation-oids.txt"; dml_file="$work_dir/dml.txt"; plan_error="$work_dir/plan.err"; plan_summary="$work_dir/summary.txt"; raw_plan_output="$work_dir/raw-plan.txt"; tmp="$work_dir/explain.sql"
-table_before="$work_dir/table.before"; table_after="$work_dir/table.after"; index_before="$work_dir/index.before"; index_after="$work_dir/index.after"; stat_index_file="$work_dir/stat-indexes.txt"
-RESULT_DIR=${EXPLAIN_RESULT_DIR:-$DEFAULT_OUTPUT_DIR}; mkdir -p "$RESULT_DIR" || exit 1
-result_database=$(printf '%s' "$PGDATABASE" | tr -c '[:alnum:]_.-' '_'); RESULT_FILE="$RESULT_DIR/explain_${result_database}_$(date '+%Y%m%d_%H%M%S').log"
-
-emit_bind_prelude() {
-    [ "$BIND" = yes ] || return 0
-    cat "$prepare_file"
-    printf 'SET plan_cache_mode = %s;\n' "$BIND_PLAN_MODE"
-}
-emit_plan_body() {
-    opts=$1
-    if [ "$BIND" = yes ]; then
-        printf 'EXPLAIN (%s)\n' "$opts"
-        cat "$execute_file"
-        printf '\n'
-    else
-        printf 'EXPLAIN (%s)\n' "$opts"
-        cat "$SQL_FILE"
-        printf '\n;\n'
-    fi
-}
-emit_plan() {
-    opts=$1
-    emit_bind_prelude
-    emit_plan_body "$opts"
-}
-
+tree_plan_json="$work_dir/tree-plan.json"; rel_file="$work_dir/relations.txt"; rel_oid_file="$work_dir/relation-oids.txt"; dml_file="$work_dir/dml.txt"; plan_error="$work_dir/plan.err"; plan_summary="$work_dir/summary.txt"; raw_plan_output="$work_dir/raw-plan.txt"; tmp="$work_dir/explain.sql"; table_before="$work_dir/table.before"; table_after="$work_dir/table.after"; index_before="$work_dir/index.before"; index_after="$work_dir/index.after"; stat_index_file="$work_dir/stat-indexes.txt"
+RESULT_DIR=${EXPLAIN_RESULT_DIR:-$DEFAULT_OUTPUT_DIR}; mkdir -p "$RESULT_DIR" || exit 1; result_database=$(printf '%s' "$PGDATABASE" | tr -c '[:alnum:]_.-' '_'); RESULT_FILE="$RESULT_DIR/explain_${result_database}_$(date '+%Y%m%d_%H%M%S').log"
+emit_bind_prelude(){ [ "$BIND" = yes ] || return 0; cat "$prepare_file"; printf 'SET plan_cache_mode = %s;\n' "$BIND_PLAN_MODE"; }
+emit_plan_body(){ opts=$1; if [ "$BIND" = yes ]; then printf 'EXPLAIN (%s)\n' "$opts"; cat "$execute_file"; printf '\n'; else printf 'EXPLAIN (%s)\n' "$opts"; cat "$SQL_FILE"; printf '\n;\n'; fi; }
+emit_plan(){ opts=$1; emit_bind_prelude; emit_plan_body "$opts"; }
 emit_plan "$tree_json_opts" | run_psql -X -qAt -v ON_ERROR_STOP=1 > "$tree_plan_json" 2>"$plan_error" || { cat "$plan_error" >&2; exit 1; }
-extract_plan_metadata "$tree_plan_json" "$rel_file" "$rel_oid_file" "$dml_file" || { echo "ERROR: PostgreSQL JSON metadata parsing failed." >&2; exit 1; }
-DML_OPERATION=$(sed -n '1p' "$dml_file")
+extract_plan_metadata "$tree_plan_json" "$rel_file" "$rel_oid_file" "$dml_file" || { echo "ERROR: PostgreSQL JSON metadata parsing failed." >&2; exit 1; }; DML_OPERATION=$(sed -n '1p' "$dml_file")
 
-build_stat_index_map() {
-    : > "$stat_index_file"
-    [ -s "$rel_oid_file" ] || return 0
-    {
-        echo 'WITH rels(relid) AS (VALUES'
-        awk -F'|' 'BEGIN{first=1} {if(!first) printf ",\n"; printf "(%s::oid)",$1; first=0} END{print ""}' "$rel_oid_file"
-        cat <<'SQL'
+build_stat_index_map(){ : > "$stat_index_file"; [ -s "$rel_oid_file" ] || return 0; { echo 'WITH rels(relid) AS (VALUES'; awk -F'|' 'BEGIN{first=1}{if(!first)printf ",\n";printf "(%s::oid)",$1;first=0}END{print ""}' "$rel_oid_file"; cat <<'SQL'
 )
-SELECT i.indexrelid,
-       format('%I.%I', n.nspname, c.relname),
-       i.indrelid
-FROM pg_index i
-JOIN rels r ON r.relid=i.indrelid
-JOIN pg_class c ON c.oid=i.indexrelid
-JOIN pg_namespace n ON n.oid=c.relnamespace
-ORDER BY i.indrelid,i.indexrelid;
+SELECT i.indexrelid,format('%I.%I',n.nspname,c.relname),i.indrelid FROM pg_index i JOIN rels r ON r.relid=i.indrelid JOIN pg_class c ON c.oid=i.indexrelid JOIN pg_namespace n ON n.oid=c.relnamespace ORDER BY i.indrelid,i.indexrelid;
 SQL
-    } | run_psql -X -qAt -F '|' -v ON_ERROR_STOP=1 > "$stat_index_file" || return 1
-}
+} | run_psql -X -qAt -F '|' -v ON_ERROR_STOP=1 > "$stat_index_file" || return 1; }
+sql_literal(){ printf '%s' "$1" | sed "s/'/''/g"; }
+emit_table_snapshot_sql(){ while IFS='|' read -r oid name; do [ -n "$oid" ] || continue; qname=$(sql_literal "$name"); idx_expr="0"; while IFS='|' read -r idxoid idxname relid; do [ "$relid" = "$oid" ] || continue; idx_expr="$idx_expr + COALESCE(pg_stat_get_numscans($idxoid::oid),0)"; done < "$stat_index_file"; printf "SELECT %s::oid, '%s', COALESCE(pg_stat_get_numscans(%s::oid),0), COALESCE(pg_stat_get_tuples_returned(%s::oid),0), (%s), COALESCE(pg_stat_get_tuples_fetched(%s::oid),0), COALESCE(pg_stat_get_tuples_inserted(%s::oid),0), COALESCE(pg_stat_get_tuples_updated(%s::oid),0), COALESCE(pg_stat_get_tuples_deleted(%s::oid),0), COALESCE(pg_stat_get_tuples_hot_updated(%s::oid),0);\n" "$oid" "$qname" "$oid" "$oid" "$idx_expr" "$oid" "$oid" "$oid" "$oid" "$oid"; done < "$rel_oid_file"; }
+emit_index_snapshot_sql(){ while IFS='|' read -r idxoid idxname relid; do [ -n "$idxoid" ] || continue; qname=$(sql_literal "$idxname"); printf "SELECT %s::oid, '%s', COALESCE(pg_stat_get_numscans(%s::oid),0), COALESCE(pg_stat_get_tuples_returned(%s::oid),0), COALESCE(pg_stat_get_tuples_fetched(%s::oid),0), GREATEST(COALESCE(pg_stat_get_blocks_fetched(%s::oid),0)-COALESCE(pg_stat_get_blocks_hit(%s::oid),0),0), COALESCE(pg_stat_get_blocks_hit(%s::oid),0);\n" "$idxoid" "$qname" "$idxoid" "$idxoid" "$idxoid" "$idxoid" "$idxoid" "$idxoid"; done < "$stat_index_file"; }
+emit_stats_sync_sql(){ if [ "$SERVER_VERSION_NUM" -ge 150000 ]; then printf 'SELECT pg_stat_force_next_flush();\nSELECT pg_stat_clear_snapshot();\n'; else printf 'SELECT pg_sleep(1);\nSELECT pg_stat_clear_snapshot();\n'; fi; }
+build_measurement_sql(){ { printf '\\pset tuples_only on\n\\pset format unaligned\n\\pset fieldsep |\n'; emit_bind_prelude; printf '\\o /dev/null\n'; emit_stats_sync_sql; printf '\\o %s\n' "$table_before"; emit_table_snapshot_sql; printf '\\o %s\n' "$index_before"; emit_index_snapshot_sql; printf '\\o %s\n' "$raw_plan_output"; [ -z "$DML_OPERATION" ] || printf 'BEGIN;\n'; emit_plan_body "$raw_text_opts"; [ -z "$DML_OPERATION" ] || printf 'ROLLBACK;\n'; printf '\\o /dev/null\n'; emit_stats_sync_sql; printf '\\o %s\n' "$table_after"; emit_table_snapshot_sql; printf '\\o %s\n' "$index_after"; emit_index_snapshot_sql; printf '\\o\n'; } > "$tmp"; }
+print_table_delta(){ [ -s "$table_before" ] && [ -s "$table_after" ] || return 0; awk -F'|' 'NR==FNR{for(i=3;i<=10;i++)b[$1,i]=$i;name[$1]=$2;next}{id=$1;printf "\n%s\n",name[id];printf "%-24s %15s %15s %15s\n","metric","before","after","delta";printf "%-24s %15s %15s %15s\n","------------------------","---------------","---------------","---------------";label[3]="seq_scan";label[4]="seq_tup_read";label[5]="idx_scan";label[6]="idx_tup_fetch";label[7]="n_tup_ins";label[8]="n_tup_upd";label[9]="n_tup_del";label[10]="n_tup_hot_upd";for(i=3;i<=10;i++){before=(b[id,i]==""?0:b[id,i]);after=$i;delta=after-before;printf "%-24s %15s %15s %+15d\n",label[i],before,after,delta}}' "$table_before" "$table_after"; }
+print_index_delta(){ [ -s "$index_before" ] && [ -s "$index_after" ] || return 0; awk -F'|' 'NR==FNR{for(i=3;i<=7;i++)b[$1,i]=$i;name[$1]=$2;next}{id=$1;printf "\n%s\n",name[id];printf "%-24s %15s %15s %15s\n","metric","before","after","delta";printf "%-24s %15s %15s %15s\n","------------------------","---------------","---------------","---------------";label[3]="idx_scan";label[4]="idx_tup_read";label[5]="idx_tup_fetch";label[6]="idx_blks_read";label[7]="idx_blks_hit";for(i=3;i<=7;i++){before=(b[id,i]==""?0:b[id,i]);after=$i;delta=after-before;printf "%-24s %15s %15s %+15d\n",label[i],before,after,delta}}' "$index_before" "$index_after"; }
 
-sql_literal() { printf '%s' "$1" | sed "s/'/''/g"; }
-
-emit_table_snapshot_sql() {
-    while IFS='|' read -r oid name; do
-        [ -n "$oid" ] || continue
-        qname=$(sql_literal "$name")
-        idx_expr="0"
-        while IFS='|' read -r idxoid idxname relid; do
-            [ "$relid" = "$oid" ] || continue
-            idx_expr="$idx_expr + COALESCE(pg_stat_get_numscans($idxoid::oid),0)"
-        done < "$stat_index_file"
-        printf "SELECT %s::oid, '%s', COALESCE(pg_stat_get_numscans(%s::oid),0), COALESCE(pg_stat_get_tuples_returned(%s::oid),0), (%s), COALESCE(pg_stat_get_tuples_fetched(%s::oid),0), COALESCE(pg_stat_get_tuples_inserted(%s::oid),0), COALESCE(pg_stat_get_tuples_updated(%s::oid),0), COALESCE(pg_stat_get_tuples_deleted(%s::oid),0), COALESCE(pg_stat_get_tuples_hot_updated(%s::oid),0);\n" "$oid" "$qname" "$oid" "$oid" "$idx_expr" "$oid" "$oid" "$oid" "$oid" "$oid"
-    done < "$rel_oid_file"
-}
-
-emit_index_snapshot_sql() {
-    while IFS='|' read -r idxoid idxname relid; do
-        [ -n "$idxoid" ] || continue
-        qname=$(sql_literal "$idxname")
-        printf "SELECT %s::oid, '%s', COALESCE(pg_stat_get_numscans(%s::oid),0), COALESCE(pg_stat_get_tuples_returned(%s::oid),0), COALESCE(pg_stat_get_tuples_fetched(%s::oid),0), GREATEST(COALESCE(pg_stat_get_blocks_fetched(%s::oid),0)-COALESCE(pg_stat_get_blocks_hit(%s::oid),0),0), COALESCE(pg_stat_get_blocks_hit(%s::oid),0);\n" "$idxoid" "$qname" "$idxoid" "$idxoid" "$idxoid" "$idxoid" "$idxoid" "$idxoid"
-    done < "$stat_index_file"
-}
-
-emit_stats_sync_sql() {
-    if [ "$SERVER_VERSION_NUM" -ge 150000 ]; then
-        printf 'SELECT pg_stat_force_next_flush();\nSELECT pg_stat_clear_snapshot();\n'
-    else
-        _settle=${PG_STAT_SETTLE_SECONDS:-1}
-        case $_settle in ''|*[!0-9.]*) _settle=1 ;; esac
-        printf 'SELECT pg_sleep(%s);\nSELECT pg_stat_clear_snapshot();\n' "$_settle"
-    fi
-}
-
-build_measurement_sql() {
-    {
-        printf '\\pset tuples_only on\n\\pset format unaligned\n\\pset fieldsep |\n'
-        emit_bind_prelude
-        printf '\\o /dev/null\n'
-        emit_stats_sync_sql
-        printf '\\o %s\n' "$table_before"
-        emit_table_snapshot_sql
-        printf '\\o %s\n' "$index_before"
-        emit_index_snapshot_sql
-        printf '\\o %s\n' "$raw_plan_output"
-        if [ -n "$DML_OPERATION" ]; then printf 'BEGIN;\n'; fi
-        emit_plan_body "$raw_text_opts"
-        if [ -n "$DML_OPERATION" ]; then printf 'ROLLBACK;\n'; fi
-        printf '\\o /dev/null\n'
-        emit_stats_sync_sql
-        printf '\\o %s\n' "$table_after"
-        emit_table_snapshot_sql
-        printf '\\o %s\n' "$index_after"
-        emit_index_snapshot_sql
-        printf '\\o\n'
-    } > "$tmp"
-}
-
-print_table_delta() {
-    [ -s "$table_before" ] && [ -s "$table_after" ] || return 0
-    awk -F'|' 'NR==FNR {for(i=3;i<=10;i++) b[$1,i]=$i; name[$1]=$2; next} {id=$1; printf "\n%s\n",name[id]; printf "%-24s %15s %15s %15s\n","metric","before","after","delta"; printf "%-24s %15s %15s %15s\n","------------------------","---------------","---------------","---------------"; label[3]="seq_scan";label[4]="seq_tup_read";label[5]="idx_scan";label[6]="idx_tup_fetch";label[7]="n_tup_ins";label[8]="n_tup_upd";label[9]="n_tup_del";label[10]="n_tup_hot_upd"; for(i=3;i<=10;i++){before=(b[id,i]==""?0:b[id,i]);after=$i;delta=after-before;printf "%-24s %15s %15s %+15d\n",label[i],before,after,delta}}' "$table_before" "$table_after"
-}
-
-print_index_delta() {
-    [ -s "$index_before" ] && [ -s "$index_after" ] || return 0
-    awk -F'|' 'NR==FNR {for(i=3;i<=7;i++) b[$1,i]=$i; name[$1]=$2; next} {id=$1; printf "\n%s\n",name[id]; printf "%-24s %15s %15s %15s\n","metric","before","after","delta"; printf "%-24s %15s %15s %15s\n","------------------------","---------------","---------------","---------------"; label[3]="idx_scan";label[4]="idx_tup_read";label[5]="idx_tup_fetch";label[6]="idx_blks_read";label[7]="idx_blks_hit"; for(i=3;i<=7;i++){before=(b[id,i]==""?0:b[id,i]);after=$i;delta=after-before;printf "%-24s %15s %15s %+15d\n",label[i],before,after,delta}}' "$index_before" "$index_after"
-}
-
-if [ "$ANALYZE" = yes ]; then
-    echo
-    if [ -n "$DML_OPERATION" ]; then
-        echo "DML detected: $DML_OPERATION"
-        echo "Safety     : BEGIN -> EXPLAIN ANALYZE -> ROLLBACK"
-    fi
-    printf 'Type EXECUTE to continue: ' >&2; IFS= read -r confirm; [ "$confirm" = EXECUTE ] || { echo "Cancelled."; exit 1; }
-fi
-
+if [ "$ANALYZE" = yes ]; then echo; if [ -n "$DML_OPERATION" ]; then echo "DML detected: $DML_OPERATION"; echo "Safety     : BEGIN -> EXPLAIN ANALYZE -> ROLLBACK"; fi; printf 'Type EXECUTE to continue: ' >&2; IFS= read -r confirm; [ "$confirm" = EXECUTE ] || { echo "Cancelled."; exit 1; }; fi
 {
- echo "PostgreSQL execution plan analysis"
- echo "script_version=$SCRIPT_VERSION"
- echo "database=$PGDATABASE"
- echo "sql_source=$SQL_SOURCE_DESC"
- echo "sql_file=$SQL_FILE"
- if [ "$SQL_SOURCE_KIND" = pgss ]; then
-     echo "original_query_user=$ORIGINAL_QUERY_USER"
-     echo "original_query_userid=$ORIGINAL_QUERY_USERID"
-     echo "execute_user=$PGSS_EXECUTE_USER"
-     echo "execute_search_path=$PGSS_SEARCH_PATH"
-     echo "original_search_path=unavailable"
-     [ -z "$PGSS_ORIGINAL_BIND_MAX" ] || echo "pgss_original_bind_max=$PGSS_ORIGINAL_BIND_MAX"
-     if [ -n "$PGSS_NORMALIZED_VALUES_FILE" ] && [ -s "$PGSS_NORMALIZED_VALUES_FILE" ]; then
-         echo "pgss_normalized_values:"
-         sed 's/^/  /' "$PGSS_NORMALIZED_VALUES_FILE"
-     fi
- fi
- echo
- cat "$options_summary"
- echo
+ echo "PostgreSQL execution plan analysis"; echo "script_version=$SCRIPT_VERSION"; echo "database=$PGDATABASE"; echo "sql_source=$SQL_SOURCE_DESC"; echo "sql_file=$SQL_FILE"
+ if [ "$SQL_SOURCE_KIND" = pgss ]; then echo "original_query_user=$ORIGINAL_QUERY_USER"; echo "original_query_userid=$ORIGINAL_QUERY_USERID"; echo "execute_user=$PGSS_EXECUTE_USER"; echo "execute_search_path=$PGSS_SEARCH_PATH"; echo "original_search_path=unavailable"; [ -z "$PGSS_ORIGINAL_BIND_MAX" ] || echo "pgss_original_bind_max=$PGSS_ORIGINAL_BIND_MAX"; if [ -n "$PGSS_NORMALIZED_VALUES_FILE" ] && [ -s "$PGSS_NORMALIZED_VALUES_FILE" ]; then echo "pgss_normalized_values:"; sed 's/^/  /' "$PGSS_NORMALIZED_VALUES_FILE"; fi; fi
+ echo; cat "$options_summary"; echo
 } > "$RESULT_FILE"
 
 stats_measured=no
-if [ "$ANALYZE" = yes ] && [ -s "$rel_oid_file" ]; then
-    build_stat_index_map || { echo "ERROR: statistics object discovery failed." >&2; exit 1; }
-    build_measurement_sql
-    if ! run_psql -X -q -v ON_ERROR_STOP=1 -f "$tmp" >/dev/null 2>"$plan_error"; then
-        cat "$plan_error" | tee -a "$RESULT_FILE" >&2
-        echo "ERROR: execution plan/statistics measurement failed." | tee -a "$RESULT_FILE" >&2
-        exit 1
-    fi
-    stats_measured=yes
-else
-    if [ "$ANALYZE" = yes ] && [ -n "$DML_OPERATION" ]; then
-        { printf 'BEGIN;\n'; emit_plan "$raw_text_opts"; printf 'ROLLBACK;\n'; } > "$tmp"
-    else
-        emit_plan "$raw_text_opts" > "$tmp"
-    fi
-    if ! run_psql -X -qAt -P pager=off -v ON_ERROR_STOP=1 -f "$tmp" > "$raw_plan_output" 2>"$plan_error"; then
-        cat "$plan_error" | tee -a "$RESULT_FILE" >&2
-        echo "ERROR: Raw execution plan generation failed." | tee -a "$RESULT_FILE" >&2
-        exit 1
-    fi
-fi
-
+if [ "$ANALYZE" = yes ] && [ -s "$rel_oid_file" ]; then build_stat_index_map || { echo "ERROR: statistics object discovery failed." >&2; exit 1; }; build_measurement_sql; if ! run_psql -X -q -v ON_ERROR_STOP=1 -f "$tmp" >/dev/null 2>"$plan_error"; then cat "$plan_error" | tee -a "$RESULT_FILE" >&2; echo "ERROR: execution plan/statistics measurement failed." | tee -a "$RESULT_FILE" >&2; exit 1; fi; stats_measured=yes; else if [ "$ANALYZE" = yes ] && [ -n "$DML_OPERATION" ]; then { printf 'BEGIN;\n'; emit_plan "$raw_text_opts"; printf 'ROLLBACK;\n'; } > "$tmp"; else emit_plan "$raw_text_opts" > "$tmp"; fi; if ! run_psql -X -qAt -P pager=off -v ON_ERROR_STOP=1 -f "$tmp" > "$raw_plan_output" 2>"$plan_error"; then cat "$plan_error" | tee -a "$RESULT_FILE" >&2; echo "ERROR: Raw execution plan generation failed." | tee -a "$RESULT_FILE" >&2; exit 1; fi; fi
 render_plan_summary "$tree_plan_json" "$raw_plan_output" > "$plan_summary" || { echo "ERROR: Plan Summary generation failed." >&2; exit 1; }
-
-section "Execution Plan Summary" | tee -a "$RESULT_FILE"
-cat "$plan_summary" | tee -a "$RESULT_FILE"
-
-if [ "$ANALYZE" = yes ]; then
-    section "Execution Plan Raw (TEXT / Actual)" | tee -a "$RESULT_FILE"
-else
-    section "Execution Plan Raw (TEXT / Planned)" | tee -a "$RESULT_FILE"
-fi
-cat "$raw_plan_output" | tee -a "$RESULT_FILE"
-
-if [ "$stats_measured" = yes ]; then
-    section "Statistics Delta Scope" | tee -a "$RESULT_FILE"
-    echo "Before/target/after were collected in one PostgreSQL session using direct pg_stat_get_* counters." | tee -a "$RESULT_FILE"
-    if [ "$SERVER_VERSION_NUM" -ge 150000 ]; then
-        echo "Pending local statistics were forced to flush before each snapshot." | tee -a "$RESULT_FILE"
-    else
-        echo "PostgreSQL < 15: a settle delay was used because pg_stat_force_next_flush() is unavailable." | tee -a "$RESULT_FILE"
-    fi
-    echo "Concurrent activity from other sessions can still contribute to cumulative-statistics deltas." | tee -a "$RESULT_FILE"
-    section "Table Statistics Delta" | tee -a "$RESULT_FILE"
-    print_table_delta | tee -a "$RESULT_FILE"
-    section "Index Statistics / I/O Delta" | tee -a "$RESULT_FILE"
-    print_index_delta | tee -a "$RESULT_FILE"
-fi
-
+section "Execution Plan Summary" | tee -a "$RESULT_FILE"; cat "$plan_summary" | tee -a "$RESULT_FILE"
+if [ "$ANALYZE" = yes ]; then section "Execution Plan Raw (TEXT / Actual)" | tee -a "$RESULT_FILE"; else section "Execution Plan Raw (TEXT / Planned)" | tee -a "$RESULT_FILE"; fi; cat "$raw_plan_output" | tee -a "$RESULT_FILE"
+if [ "$stats_measured" = yes ]; then section "Statistics Delta Scope" | tee -a "$RESULT_FILE"; echo "Before/target/after were collected in one PostgreSQL session using direct pg_stat_get_* counters." | tee -a "$RESULT_FILE"; [ "$SERVER_VERSION_NUM" -lt 150000 ] || echo "Pending local statistics were forced to flush before each snapshot." | tee -a "$RESULT_FILE"; echo "Concurrent activity from other sessions can still contribute to cumulative-statistics deltas." | tee -a "$RESULT_FILE"; section "Table Statistics Delta" | tee -a "$RESULT_FILE"; print_table_delta | tee -a "$RESULT_FILE"; section "Index Statistics / I/O Delta" | tee -a "$RESULT_FILE"; print_index_delta | tee -a "$RESULT_FILE"; fi
 echo "Current result saved: $RESULT_FILE"
 DIAG=$(ask 'Show additional Plan diagnostics? y/n' y)
-if [ "$DIAG" = yes ] && [ -s "$rel_file" ]; then
-    section "Referenced Relations" | tee -a "$RESULT_FILE"; cat "$rel_file" | tee -a "$RESULT_FILE"
-    while IFS= read -r rel; do [ -n "$rel" ] || continue
-        section "Table / Index Diagnostic : $rel" | tee -a "$RESULT_FILE"
-        run_psql -X -P pager=off -P format=wrapped -P columns=160 -v ON_ERROR_STOP=1 -v rel="$rel" <<'SQL' | tee -a "$RESULT_FILE"
-SELECT c.oid::regclass relation, c.reltuples, c.relpages, pg_size_pretty(pg_total_relation_size(c.oid)) total_size
-FROM pg_class c WHERE c.oid=:'rel'::regclass;
-SELECT indexrelid::regclass index_name, idx_scan, idx_tup_read, idx_tup_fetch
-FROM pg_stat_all_indexes WHERE relid=:'rel'::regclass ORDER BY idx_scan DESC NULLS LAST;
+if [ "$DIAG" = yes ] && [ -s "$rel_file" ]; then section "Referenced Relations" | tee -a "$RESULT_FILE"; cat "$rel_file" | tee -a "$RESULT_FILE"; while IFS= read -r rel; do [ -n "$rel" ] || continue; section "Table / Index Diagnostic : $rel" | tee -a "$RESULT_FILE"; run_psql -X -P pager=off -P format=wrapped -P columns=160 -v ON_ERROR_STOP=1 -v rel="$rel" <<'SQL' | tee -a "$RESULT_FILE"
+SELECT c.oid::regclass relation,c.reltuples,c.relpages,pg_size_pretty(pg_total_relation_size(c.oid)) total_size FROM pg_class c WHERE c.oid=:'rel'::regclass;
+SELECT indexrelid::regclass index_name,idx_scan,idx_tup_read,idx_tup_fetch FROM pg_stat_all_indexes WHERE relid=:'rel'::regclass ORDER BY idx_scan DESC NULLS LAST;
 SQL
-    done < "$rel_file"
-fi
-
+    done < "$rel_file"; fi
 echo "Final result file: $RESULT_FILE" | tee -a "$RESULT_FILE"
