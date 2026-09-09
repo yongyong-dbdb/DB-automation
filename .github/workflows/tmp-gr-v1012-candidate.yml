@@ -19,7 +19,7 @@ jobs:
       - name: Apply candidate patch only when needed
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
           f='MySQL/Group-Replication/mysql_gr_migrate.sh'
           if grep -q '^VERSION=1.0.12$' "$f"; then
             echo 'candidate already patched'
@@ -33,12 +33,21 @@ jobs:
           f='MySQL/Group-Replication/mysql_gr_migrate.sh'
           /bin/sh -n "$f"
           test "$(/bin/sh "$f" --version)" = '1.0.12'
-          ! grep -Eq 'RESET[[:space:]]+(MASTER|BINARY[[:space:]]+LOGS[[:space:]]+AND[[:space:]]+GTIDS)' "$f"
-          ! grep -Eq 'mysqlbinlog[^|]*\|[[:space:]]*mysql([[:space:]]|$)' "$f"
+          reset_hits=$(grep -En 'RESET[[:space:]]+(MASTER|BINARY[[:space:]]+LOGS[[:space:]]+AND[[:space:]]+GTIDS)' "$f" | grep -v 'Do NOT run' || true)
+          if [ -n "$reset_hits" ]; then
+            printf '%s\n' 'Forbidden GTID/binlog reset occurrence:' "$reset_hits" >&2
+            exit 1
+          fi
+          pipe_hits=$(grep -En 'mysqlbinlog[^|]*\|[[:space:]]*mysql([[:space:]]|$)' "$f" || true)
+          if [ -n "$pipe_hits" ]; then
+            printf '%s\n' 'Forbidden mysqlbinlog-to-mysql pipe:' "$pipe_hits" >&2
+            exit 1
+          fi
           grep -qF 'SERVER_UUID' "$f"
           grep -qiF 'reprovision package' "$f"
           grep -qF 'before_gr_reprovision' "$f"
           grep -qF 'gr_reprovision_stage' "$f"
+          echo syntax_and_safety_PASS
       - name: Platform preflight
         shell: bash
         run: |
