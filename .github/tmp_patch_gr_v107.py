@@ -44,7 +44,8 @@ new_cmd = r'''        printf 'mysqlbinlog --read-from-remote-server --base64-out
         fi
         shell_quote "--user=$(get "$i" user)"; printf ' '
         printf '%s ' '--password'
-        shell_quote "--include-gtids=$include_gtids"; printf ' '''
+        shell_quote "--include-gtids=$include_gtids"; printf '%s' ' '
+'''
 replace_once(old_cmd, new_cmd, 'fallback command quoting')
 
 replace_once(
