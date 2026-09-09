@@ -25,7 +25,8 @@ jobs:
           grep -F 'platform_preflight()' 'MySQL/Group-Replication/mysql_gr_migrate.sh'
           awk 'BEGIN { n=1; print (n > 0 ? n - 1 : 0) }' | grep -Fx 0
           ! grep -F 'END{print NR>0?NR-1:0}' 'MySQL/Group-Replication/mysql_gr_migrate.sh'
-          ! grep -E 'RESET (MASTER|BINARY LOGS AND GTIDS)|mysqlbinlog.*\|.*mysql' 'MySQL/Group-Replication/mysql_gr_migrate.sh'
+          ! grep -E 'RESET (MASTER|BINARY LOGS AND GTIDS)' 'MySQL/Group-Replication/mysql_gr_migrate.sh'
+          ! grep -E 'mysqlbinlog[^#]*[|][^#]*mysql([[:space:]]|$)' 'MySQL/Group-Replication/mysql_gr_migrate.sh'
       - name: Commit target and cleanup staging files
         run: |
           git config user.name 'github-actions[bot]'
