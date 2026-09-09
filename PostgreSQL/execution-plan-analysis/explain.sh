@@ -1,7 +1,7 @@
 #!/bin/sh
 set -u
 
-SCRIPT_VERSION="1.2.11"
+SCRIPT_VERSION="1.2.12"
 SCRIPT_DIR=$(CDPATH='' cd "$(dirname "$0")" && pwd)
 DEFAULT_OUTPUT_DIR="$SCRIPT_DIR/results"
 PSQL_BIN=${PSQL_BIN:-}
@@ -135,7 +135,11 @@ ask() {
         IFS= read -r ans || return 1
         [ -n "$ans" ] || ans=$default
         ans=$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
-        case $ans in yes|no) printf '%s' "$ans"; return 0 ;; *) echo "ERROR: enter yes or no." >&2 ;; esac
+        case $ans in
+            y) printf 'yes'; return 0 ;;
+            n) printf 'no'; return 0 ;;
+            *) echo "ERROR: enter y or n." >&2 ;;
+        esac
     done
 }
 ask_bind_plan_mode() {
@@ -321,7 +325,7 @@ SQL
     echo 'Candidates are distinct current table values and do not apply the original SQL filters.'
 }
 
-BIND=$(ask 'Use bind parameters ($1, $2, ...)? yes/no' no) || exit 1
+BIND=$(ask 'Use bind parameters ($1, $2, ...)? y/n' n) || exit 1
 prepare_file="$work_dir/prepare.sql"; execute_file="$work_dir/execute.sql"; bind_values_file="$work_dir/bind-values-used.txt"; : > "$bind_values_file"; BIND_PLAN_MODE=auto
 if [ "$BIND" = yes ]; then
     printf 'Parameter types, comma-separated [auto infer]: ' >&2; IFS= read -r bind_types
@@ -354,7 +358,7 @@ if [ "$BIND" = yes ]; then
     BIND_PLAN_MODE=$(ask_bind_plan_mode) || exit 1
 fi
 
-ANALYZE=$(ask 'Use ANALYZE? yes/no' no)
+ANALYZE=$(ask 'Use ANALYZE? y/n' n)
 if [ "$ANALYZE" = yes ]; then
     echo
     echo "WARNING: EXPLAIN ANALYZE executes the target SQL."
@@ -362,20 +366,20 @@ if [ "$ANALYZE" = yes ]; then
     echo "         DML data changes are rolled back after plan collection."
     echo
 fi
-VERBOSE=$(ask 'Use VERBOSE? yes/no' no)
-COSTS=$(ask 'Use COSTS? yes/no' yes)
-SETTINGS=$(ask 'Use SETTINGS? yes/no' yes)
+VERBOSE=$(ask 'Use VERBOSE? y/n' n)
+COSTS=$(ask 'Use COSTS? y/n' y)
+SETTINGS=$(ask 'Use SETTINGS? y/n' y)
 BUFFERS=no; WAL=no; TIMING=no; GENERIC_PLAN=no; SERIALIZE=no; MEMORY=no
 if [ "$ANALYZE" = yes ]; then
-    BUFFERS=$(ask 'Use BUFFERS? yes/no' yes)
-    [ "$SERVER_VERSION_NUM" -lt 130000 ] || WAL=$(ask 'Use WAL? yes/no' no)
-    TIMING=$(ask 'Use TIMING? yes/no' yes)
-    [ "$SERVER_VERSION_NUM" -lt 170000 ] || SERIALIZE=$(ask 'Use SERIALIZE TEXT? yes/no' no)
+    BUFFERS=$(ask 'Use BUFFERS? y/n' y)
+    [ "$SERVER_VERSION_NUM" -lt 130000 ] || WAL=$(ask 'Use WAL? y/n' n)
+    TIMING=$(ask 'Use TIMING? y/n' y)
+    [ "$SERVER_VERSION_NUM" -lt 170000 ] || SERIALIZE=$(ask 'Use SERIALIZE TEXT? y/n' n)
 else
-    if [ "$BIND" = no ] && [ "$SERVER_VERSION_NUM" -ge 160000 ]; then GENERIC_PLAN=$(ask 'Use GENERIC_PLAN? yes/no' no); fi
+    if [ "$BIND" = no ] && [ "$SERVER_VERSION_NUM" -ge 160000 ]; then GENERIC_PLAN=$(ask 'Use GENERIC_PLAN? y/n' n); fi
 fi
-[ "$SERVER_VERSION_NUM" -lt 170000 ] || MEMORY=$(ask 'Use MEMORY? yes/no' no)
-SUMMARY=$(ask 'Use SUMMARY? yes/no' yes)
+[ "$SERVER_VERSION_NUM" -lt 170000 ] || MEMORY=$(ask 'Use MEMORY? y/n' n)
+SUMMARY=$(ask 'Use SUMMARY? y/n' y)
 
 base_plan_opts=""
 add_opt() { [ -z "$base_plan_opts" ] && base_plan_opts="$1" || base_plan_opts="$base_plan_opts, $1"; }
@@ -524,7 +528,7 @@ if [ "$ANALYZE" = yes ] && [ -s "$rel_file" ]; then
 fi
 
 echo "Current result saved: $RESULT_FILE"
-DIAG=$(ask 'Show additional Plan diagnostics? yes/no' yes)
+DIAG=$(ask 'Show additional Plan diagnostics? y/n' y)
 if [ "$DIAG" = yes ] && [ -s "$rel_file" ]; then
     section "Referenced Relations" | tee -a "$RESULT_FILE"; cat "$rel_file" | tee -a "$RESULT_FILE"
     while IFS= read -r rel; do [ -n "$rel" ] || continue
