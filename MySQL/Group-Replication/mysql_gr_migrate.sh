@@ -1,11 +1,11 @@
 #!/bin/sh
-# mysql_gr_migrate.sh v1.0.9
+# mysql_gr_migrate.sh v1.0.10
 # POSIX sh; OS utilities and MySQL clients only. No external language packages.
 # Supported: Oracle MySQL 8.0.27+, 8.4.x, 9.7.x; homogeneous exact versions.
 # Single-primary or multi-primary / XCom. Never resets GTID or binary logs.
 set -eu
 umask 077
-VERSION=1.0.9
+VERSION=1.0.10
 ROOT=${MYSQL_GR_WORK_ROOT:-"$(pwd)/mysql_gr_work"}
 MYSQL=${MYSQL_GR_MYSQL:-mysql}
 DUMP=${MYSQL_GR_MYSQLDUMP:-mysqldump}
@@ -1323,7 +1323,7 @@ summarize_mysqlbinlog_evidence() {
 
     dml_count=$(awk -F '\t' 'NR>1 && $2=="DML" {n++} END{print n+0}' "$summary")
     ddl_count=$(awk -F '\t' 'NR>1 && $2=="DDL" {n++} END{print n+0}' "$summary")
-    total=$(awk 'END{print NR>0?NR-1:0}' "$summary")
+    total=$(awk 'END{print (NR > 0 ? NR - 1 : 0)}' "$summary")
     log '[ Extra GTID Summary ]'
     if [ "$total" -eq 0 ]; then
         log '  No DML/DDL operation could be summarized automatically. Review the raw mysqlbinlog evidence.'
@@ -1955,8 +1955,23 @@ status() {
         sql "$i" 'SELECT @@server_uuid,@@read_only,@@super_read_only,@@event_scheduler,@@gtid_executed; SELECT * FROM performance_schema.replication_group_members; SELECT CHANNEL_NAME,SERVICE_STATE,LAST_ERROR_NUMBER,LAST_ERROR_MESSAGE FROM performance_schema.replication_connection_status; SELECT CHANNEL_NAME,SERVICE_STATE,LAST_ERROR_NUMBER,LAST_ERROR_MESSAGE FROM performance_schema.replication_applier_status_by_worker;' | tee "$RUN/node_$i.status.tsv"
     done
 }
+platform_preflight() {
+    # Fail before any database/config mutation when the controller shell
+    # environment cannot support the portable code paths used by this script.
+    for c in awk sed grep sort cut tr head tail dirname basename mktemp cmp diff date cp mv rm mkdir cat chmod; do
+        command -v "$c" >/dev/null 2>&1 || die "Required controller utility not found: $c"
+    done
+    # Keep awk checks POSIX-compatible. The parentheses around a relational
+    # expression used by ?: are intentional; without them some awk parsers
+    # interpret '>' as output redirection.
+    awk_result=$(awk 'BEGIN { n=1; print (n > 0 ? n - 1 : 0) }' 2>/dev/null) || die 'Controller awk failed the required conditional-expression compatibility check'
+    [ "$awk_result" = 0 ] || die 'Controller awk returned an unexpected result in compatibility preflight'
+    awk -F '\t' 'BEGIN { line="a\tb"; n=split(line,x,FS); if (n != 2 || x[1] != "a" || x[2] != "b") exit 1 }' >/dev/null 2>&1 || die 'Controller awk failed tab-field compatibility preflight'
+}
+
 main() {
     case $STEP in help|--help|-h) help; return;; --version) printf '%s\n' "$VERSION"; return;; discover|configure|precheck|initialize|cutover|join|release|validate|status|all) :;; *) help; exit 2;; esac
+    platform_preflight
     command -v "$MYSQL" >/dev/null 2>&1 || die 'mysql client not found; set MYSQL_GR_MYSQL'
     case $ROOT in /*) :;; *) ROOT="$(pwd)/$ROOT";; esac
     [ ! -L "$ROOT" ] || die 'Project root must not be a symlink'
@@ -1977,6 +1992,7 @@ main() {
 # v1.0.5: state-based member initialization, GTID diagnostics, safer prompts and concise option guidance.
 # v1.0.8: client option-group compatibility, preflight checks, local-first binlog inspection and abort guidance.
 # v1.0.9: generic per-GTID DML/DDL summaries and safe current-metadata comparison for divergent members.
+# v1.0.10: POSIX-awk conditional fix and controller utility/awk compatibility preflight before mutation.
 safe_host() { case $1 in ''|*[!a-zA-Z0-9_.-]*) die "Use an IPv4 address or DNS name (IPv6 is not supported in v$VERSION).";; esac; }
 
 host_is_local() (
