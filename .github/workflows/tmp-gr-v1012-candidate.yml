@@ -8,7 +8,7 @@ permissions:
   contents: write
 
 jobs:
-  patch-and-validate:
+  validate:
     if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
@@ -16,8 +16,16 @@ jobs:
         with:
           ref: gr-v1.0.12-reprovision
           fetch-depth: 0
-      - name: Apply candidate patch
-        run: python3 tools/tmp_patch_gr_v1012.py
+      - name: Apply candidate patch only when needed
+        shell: bash
+        run: |
+          set -e
+          f='MySQL/Group-Replication/mysql_gr_migrate.sh'
+          if grep -q '^VERSION=1.0.12$' "$f"; then
+            echo 'candidate already patched'
+          else
+            python3 tools/tmp_patch_gr_v1012.py
+          fi
       - name: Syntax and safety checks
         shell: bash
         run: |
@@ -31,20 +39,84 @@ jobs:
           grep -qiF 'reprovision package' "$f"
           grep -qF 'before_gr_reprovision' "$f"
           grep -qF 'gr_reprovision_stage' "$f"
-          echo syntax_and_safety_PASS
-      - name: Source functions and smoke-test pure helpers
+      - name: Platform preflight
         shell: bash
         run: |
           set -euo pipefail
           f='MySQL/Group-Replication/mysql_gr_migrate.sh'
-          t=/tmp/gr.nom.sh
-          cp "$f" "$t"
-          sed -i '${/^main$/d;}' "$t"
+          cp "$f" /tmp/gr.nom.sh
+          sed -i '${/^main$/d;}' /tmp/gr.nom.sh
           /bin/sh -c '. /tmp/gr.nom.sh; platform_preflight; echo platform_preflight_PASS'
-      - name: Commit candidate script
+      - name: Synthetic reprovision function tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/test_reprovision.sh <<'TEST'
+          #!/bin/sh
+          set -eu
+          . /tmp/gr.nom.sh
+          ROOT=$(mktemp -d)
+          RUN="$ROOT/run"; TEMP="$ROOT/temp"
+          mkdir -p "$RUN" "$TEMP" "$ROOT/meta" "$ROOT/1" "$ROOT/2"
+          printf '2\n' > "$ROOT/meta/count"
+          printf 'uuid-source\n' > "$ROOT/1/uuid"
+          printf 'uuid-node2\n' > "$ROOT/2/uuid"
+          printf 'remote\n' > "$ROOT/2/location"
+          printf '/etc/fake2.cnf\n' > "$ROOT/2/cnf"
+          printf 'root\n' > "$ROOT/2/user"
+          printf '[client]\n' > "$TEMP/1.cnf"
+          FAKE_DATA="$ROOT/data2"; mkdir "$FAKE_DATA"
+          FAKE_CNF="$ROOT/my2.cnf"; printf '[mysqld]\ndatadir=%s\n' "$FAKE_DATA" > "$FAKE_CNF"
+          printf '%s\n' "$FAKE_CNF" > "$ROOT/2/cnf"
+          target='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:1-7'
+          sql() {
+              node=$1; stmt=$2
+              case $stmt in
+                  *"schema_name FROM information_schema.schemata"*) printf 'app1\napp2\n';;
+                  *"SELECT @@server_uuid,@@read_only"*) printf 'uuid-%s\t1\t1\tOFF\t%s\n' "$node" "$target";;
+                  *"SELECT @@server_uuid,@@hostname"*) printf 'uuid-%s\thost\t3307\t/fake.sock\t%s\t/fake.pid\t2\t%s\t\t1\t1\tOFF\n' "$node" "$FAKE_DATA" "$target";;
+                  *) printf 'stub\n';;
+              esac
+          }
+          val() {
+              node=$1; key=$2
+              case $key in
+                  datadir) printf '%s\n' "$FAKE_DATA";;
+                  pid_file) printf '%s\n' "$ROOT/fake.pid";;
+                  socket) printf '%s\n' "$ROOT/fake.sock";;
+                  gtid_executed) printf '%s\n' "$target";;
+                  *) printf 'stub\n';;
+              esac
+          }
+          write_mysql_readonly_command() { printf '#!/bin/sh\n' > "$3"; chmod 700 "$3"; }
+          local_pid() { printf '%s\n' "$$"; }
+          divergence_abort_snapshot 2 >/dev/null 2>&1
+          test "$(head -n1 "$RUN/divergence_abort_state.tsv")" = 'NODE\tSERVER_UUID\tREAD_ONLY\tSUPER_READ_ONLY\tEVENT_SCHEDULER\tGTID_EXECUTED'
+          test "$(wc -l < "$RUN/divergence_abort_state.tsv")" -eq 3
+          printf '#!/bin/sh\nprintf %s\\n fake-dump\n' "'-- fake dump'" > "$ROOT/fake_mysqldump"
+          chmod 700 "$ROOT/fake_mysqldump"; DUMP="$ROOT/fake_mysqldump"
+          rdir="$RUN/node_2.reprovision"; mkdir -p "$rdir"
+          dump=$(prepare_reprovision_dump 2 "$target" "$rdir")
+          test -s "$dump"; test -s "$dump.sha256"
+          plan=$(write_reprovision_plan 2 "$target" "$rdir" "$dump")
+          grep -q 'Remote-node handling' "$plan"
+          grep -q 'auto.cnf' "$plan"
+          printf 'local\n' > "$ROOT/2/location"
+          evidence=$(capture_reprovision_evidence 2 "$target")
+          test -s "$evidence/runtime_before.tsv"
+          test -s "$evidence/cnf.sha256"
+          plan=$(write_reprovision_plan 2 "$target" "$evidence" "$dump")
+          grep -q 'Local runtime evidence' "$plan"
+          grep -q 'Rollback sequence' "$plan"
+          grep -q 'before_gr_reprovision' "$plan"
+          echo synthetic_reprovision_PASS
+          TEST
+          /bin/sh /tmp/test_reprovision.sh
+      - name: Commit candidate script if changed
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add 'MySQL/Group-Replication/mysql_gr_migrate.sh'
-          git commit -m 'MySQL GR v1.0.12 candidate: prepare reversible reprovisioning' || exit 0
+          git diff --cached --quiet && exit 0
+          git commit -m 'MySQL GR v1.0.12 candidate: prepare reversible reprovisioning'
           git push origin HEAD:gr-v1.0.12-reprovision
