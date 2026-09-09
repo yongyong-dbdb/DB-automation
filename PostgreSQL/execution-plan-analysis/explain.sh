@@ -1,7 +1,7 @@
 #!/bin/sh
 set -u
 
-SCRIPT_VERSION="1.2.6"
+SCRIPT_VERSION="1.2.7"
 SCRIPT_DIR=$(CDPATH='' cd "$(dirname "$0")" && pwd)
 DEFAULT_OUTPUT_DIR="$SCRIPT_DIR/results"
 PSQL_BIN=${PSQL_BIN:-}
@@ -395,12 +395,28 @@ add_opt() { [ -z "$base_plan_opts" ] && base_plan_opts="$1" || base_plan_opts="$
 [ "$VERBOSE" = yes ] && add_opt 'VERBOSE TRUE' || add_opt 'VERBOSE FALSE'
 [ "$COSTS" = yes ] && add_opt 'COSTS TRUE' || add_opt 'COSTS FALSE'
 [ "$SETTINGS" = yes ] && add_opt 'SETTINGS TRUE' || add_opt 'SETTINGS FALSE'
-if [ "$ANALYZE" = yes ]; then [ "$BUFFERS" = yes ] && add_opt 'BUFFERS TRUE' || add_opt 'BUFFERS FALSE'; [ "$SERVER_VERSION_NUM" -lt 130000 ] || { [ "$WAL" = yes ] && add_opt 'WAL TRUE' || add_opt 'WAL FALSE'; }; [ "$TIMING" = yes ] && add_opt 'TIMING TRUE' || add_opt 'TIMING FALSE'; fi
+if [ "$ANALYZE" = yes ]; then
+    [ "$BUFFERS" = yes ] && add_opt 'BUFFERS TRUE' || add_opt 'BUFFERS FALSE'
+    [ "$SERVER_VERSION_NUM" -lt 130000 ] || { [ "$WAL" = yes ] && add_opt 'WAL TRUE' || add_opt 'WAL FALSE'; }
+    [ "$TIMING" = yes ] && add_opt 'TIMING TRUE' || add_opt 'TIMING FALSE'
+    if [ "$SERVER_VERSION_NUM" -ge 170000 ]; then [ "$SERIALIZE" = yes ] && add_opt 'SERIALIZE TEXT' || add_opt 'SERIALIZE NONE'; fi
+fi
 [ "$GENERIC_PLAN" = yes ] && add_opt 'GENERIC_PLAN TRUE'
+if [ "$SERVER_VERSION_NUM" -ge 170000 ]; then [ "$MEMORY" = yes ] && add_opt 'MEMORY TRUE' || add_opt 'MEMORY FALSE'; fi
 [ "$SUMMARY" = yes ] && add_opt 'SUMMARY TRUE' || add_opt 'SUMMARY FALSE'
-actual_json_opts="$base_plan_opts, FORMAT JSON"
+raw_text_opts="$base_plan_opts, FORMAT TEXT"
 
-precheck_json="$work_dir/precheck.json"; actual_plan_json="$work_dir/actual.json"; rel_file="$work_dir/relations.txt"; dml_file="$work_dir/dml.txt"; plan_error="$work_dir/plan.err"; plan_summary="$work_dir/summary.txt"; tmp="$work_dir/explain.sql"
+tree_plan_opts=""
+add_tree_opt() { [ -z "$tree_plan_opts" ] && tree_plan_opts="$1" || tree_plan_opts="$tree_plan_opts, $1"; }
+[ "$VERBOSE" = yes ] && add_tree_opt 'VERBOSE TRUE' || add_tree_opt 'VERBOSE FALSE'
+[ "$COSTS" = yes ] && add_tree_opt 'COSTS TRUE' || add_tree_opt 'COSTS FALSE'
+[ "$SETTINGS" = yes ] && add_tree_opt 'SETTINGS TRUE' || add_tree_opt 'SETTINGS FALSE'
+[ "$GENERIC_PLAN" = yes ] && add_tree_opt 'GENERIC_PLAN TRUE'
+if [ "$SERVER_VERSION_NUM" -ge 170000 ]; then [ "$MEMORY" = yes ] && add_tree_opt 'MEMORY TRUE' || add_tree_opt 'MEMORY FALSE'; fi
+[ "$SUMMARY" = yes ] && add_tree_opt 'SUMMARY TRUE' || add_tree_opt 'SUMMARY FALSE'
+tree_json_opts="$tree_plan_opts, FORMAT JSON"
+
+tree_plan_json="$work_dir/tree-plan.json"; rel_file="$work_dir/relations.txt"; dml_file="$work_dir/dml.txt"; plan_error="$work_dir/plan.err"; plan_summary="$work_dir/summary.txt"; raw_plan_output="$work_dir/raw-plan.txt"; tmp="$work_dir/explain.sql"
 table_before="$work_dir/table.before"; table_after="$work_dir/table.after"; index_before="$work_dir/index.before"; index_after="$work_dir/index.after"
 RESULT_DIR=${EXPLAIN_RESULT_DIR:-$DEFAULT_OUTPUT_DIR}; mkdir -p "$RESULT_DIR" || exit 1
 result_database=$(printf '%s' "$PGDATABASE" | tr -c '[:alnum:]_.-' '_'); RESULT_FILE="$RESULT_DIR/explain_${result_database}_$(date '+%Y%m%d_%H%M%S').log"
@@ -419,9 +435,10 @@ emit_plan() {
     fi
 }
 
-emit_plan 'VERBOSE TRUE, COSTS FALSE, FORMAT JSON' | run_psql -X -qAt -v ON_ERROR_STOP=1 > "$precheck_json" 2>"$plan_error" || { cat "$plan_error" >&2; exit 1; }
-extract_plan_metadata "$precheck_json" "$rel_file" "$dml_file" || { echo "ERROR: PostgreSQL JSON metadata parsing failed." >&2; exit 1; }
+emit_plan "$tree_json_opts" | run_psql -X -qAt -v ON_ERROR_STOP=1 > "$tree_plan_json" 2>"$plan_error" || { cat "$plan_error" >&2; exit 1; }
+extract_plan_metadata "$tree_plan_json" "$rel_file" "$dml_file" || { echo "ERROR: PostgreSQL JSON metadata parsing failed." >&2; exit 1; }
 DML_OPERATION=$(sed -n '1p' "$dml_file")
+render_plan_summary "$tree_plan_json" > "$plan_summary" 2>"$plan_error" || { cat "$plan_error" >&2; echo "ERROR: Plan Tree Summary generation failed." >&2; exit 1; }
 
 snapshot_stats() {
     tf=$1; inf=$2; : > "$tf"; : > "$inf"
@@ -430,33 +447,52 @@ snapshot_stats() {
         printf "SELECT s.indexrelid,s.indexrelid::regclass::text,COALESCE(s.idx_scan,0),COALESCE(s.idx_tup_read,0),COALESCE(s.idx_tup_fetch,0),COALESCE(io.idx_blks_read,0),COALESCE(io.idx_blks_hit,0) FROM pg_stat_all_indexes s LEFT JOIN pg_statio_all_indexes io ON io.indexrelid=s.indexrelid WHERE s.relid=:'rel'::regclass ORDER BY s.indexrelid;\n" | run_psql -X -qAt -F '|' -v ON_ERROR_STOP=1 -v rel="$rel" >> "$inf"
     done < "$rel_file"
 }
-print_delta() {
-    before=$1; after=$2; max=$3
-    [ -s "$before" ] && [ -s "$after" ] || return 0
-    awk -F'|' -v max="$max" 'NR==FNR{for(i=3;i<=max;i++)b[$1,i]=$i;name[$1]=$2;next}{id=$1;printf "\n%s\n",name[id];printf "%-24s %15s %15s %15s\n","metric","before","after","delta";for(i=3;i<=max;i++){before=(b[id,i]==""?0:b[id,i]);after=$i;printf "%-24s %15s %15s %+15d\n","metric_"i,before,after,after-before}}' "$before" "$after"
+
+print_table_delta() {
+    [ -s "$table_before" ] && [ -s "$table_after" ] || return 0
+    awk -F'|' 'NR==FNR {for(i=3;i<=10;i++) b[$1,i]=$i; name[$1]=$2; next} {id=$1; printf "\n%s\n",name[id]; printf "%-24s %15s %15s %15s\n","metric","before","after","delta"; printf "%-24s %15s %15s %15s\n","------------------------","---------------","---------------","---------------"; label[3]="seq_scan";label[4]="seq_tup_read";label[5]="idx_scan";label[6]="idx_tup_fetch";label[7]="n_tup_ins";label[8]="n_tup_upd";label[9]="n_tup_del";label[10]="n_tup_hot_upd"; for(i=3;i<=10;i++){before=(b[id,i]==""?0:b[id,i]);after=$i;delta=after-before;printf "%-24s %15s %15s %+15d\n",label[i],before,after,delta}}' "$table_before" "$table_after"
+}
+
+print_index_delta() {
+    [ -s "$index_before" ] && [ -s "$index_after" ] || return 0
+    awk -F'|' 'NR==FNR {for(i=3;i<=7;i++) b[$1,i]=$i; name[$1]=$2; next} {id=$1; printf "\n%s\n",name[id]; printf "%-24s %15s %15s %15s\n","metric","before","after","delta"; printf "%-24s %15s %15s %15s\n","------------------------","---------------","---------------","---------------"; label[3]="idx_scan";label[4]="idx_tup_read";label[5]="idx_tup_fetch";label[6]="idx_blks_read";label[7]="idx_blks_hit"; for(i=3;i<=7;i++){before=(b[id,i]==""?0:b[id,i]);after=$i;delta=after-before;printf "%-24s %15s %15s %+15d\n",label[i],before,after,delta}}' "$index_before" "$index_after"
 }
 
 if [ "$ANALYZE" = yes ]; then
-    echo; echo "WARNING: EXPLAIN ANALYZE executes the statement."; echo "Safety     : BEGIN -> EXPLAIN ANALYZE FORMAT JSON -> ROLLBACK"; [ -z "$DML_OPERATION" ] || echo "DML detected: $DML_OPERATION"
+    echo; echo "WARNING: EXPLAIN ANALYZE executes the statement."; echo "Safety     : BEGIN -> EXPLAIN ANALYZE -> ROLLBACK"; [ -z "$DML_OPERATION" ] || echo "DML detected: $DML_OPERATION"
     printf 'Type EXECUTE to continue: ' >&2; IFS= read -r confirm; [ "$confirm" = EXECUTE ] || { echo "Cancelled."; exit 1; }
     [ ! -s "$rel_file" ] || snapshot_stats "$table_before" "$index_before"
-    { printf 'BEGIN;\n'; emit_plan "$actual_json_opts"; printf 'ROLLBACK;\n'; } > "$tmp"
+    { printf 'BEGIN;\n'; emit_plan "$raw_text_opts"; printf 'ROLLBACK;\n'; } > "$tmp"
 else
-    emit_plan "$actual_json_opts" > "$tmp"
+    emit_plan "$raw_text_opts" > "$tmp"
 fi
 
 {
  echo "PostgreSQL execution plan analysis"; echo "script_version=$SCRIPT_VERSION"; echo "database=$PGDATABASE"; echo "sql_file=$SQL_FILE"; echo
 } > "$RESULT_FILE"
+
 section "Execution Plan" | tee -a "$RESULT_FILE"
-run_psql -X -qAt -P pager=off -v ON_ERROR_STOP=1 -f "$tmp" > "$actual_plan_json" 2>"$plan_error" || { cat "$plan_error" | tee -a "$RESULT_FILE" >&2; exit 1; }
-render_plan_summary "$actual_plan_json" > "$plan_summary" 2>"$plan_error" || { cat "$plan_error" >&2; echo "ERROR: Plan Tree Summary generation failed." >&2; exit 1; }
 cat "$plan_summary" | tee -a "$RESULT_FILE"
+
+if ! run_psql -X -qAt -P pager=off -v ON_ERROR_STOP=1 -f "$tmp" > "$raw_plan_output" 2>"$plan_error"; then
+    cat "$plan_error" | tee -a "$RESULT_FILE" >&2
+    echo "ERROR: Raw execution plan generation failed." | tee -a "$RESULT_FILE" >&2
+    exit 1
+fi
+
+if [ "$ANALYZE" = yes ]; then
+    section "Execution Plan Raw (TEXT / Actual)" | tee -a "$RESULT_FILE"
+else
+    section "Execution Plan Raw (TEXT / Planned)" | tee -a "$RESULT_FILE"
+fi
+cat "$raw_plan_output" | tee -a "$RESULT_FILE"
 
 if [ "$ANALYZE" = yes ] && [ -s "$rel_file" ]; then
     snapshot_stats "$table_after" "$index_after"
-    section "Table Statistics Delta" | tee -a "$RESULT_FILE"; print_delta "$table_before" "$table_after" 10 | tee -a "$RESULT_FILE"
-    section "Index Statistics / I/O Delta" | tee -a "$RESULT_FILE"; print_delta "$index_before" "$index_after" 7 | tee -a "$RESULT_FILE"
+    section "Table Statistics Delta" | tee -a "$RESULT_FILE"
+    print_table_delta | tee -a "$RESULT_FILE"
+    section "Index Statistics / I/O Delta" | tee -a "$RESULT_FILE"
+    print_index_delta | tee -a "$RESULT_FILE"
 fi
 
 echo "Current result saved: $RESULT_FILE"
