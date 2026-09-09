@@ -1,3 +1,4 @@
+# trigger: build v1.0.4 single-file artifact
 name: Build self-contained GR script
 
 on:
