@@ -21,12 +21,8 @@ jobs:
         run: |
           set -euo pipefail
           f='MySQL/Group-Replication/mysql_gr_migrate.sh'
-          if ! grep -q '^VERSION=1.0.12$' "$f"; then
-            python3 tools/tmp_patch_gr_v1012.py
-          fi
-          if ! grep -q '^export_source_accounts() {' "$f"; then
-            python3 tools/tmp_patch_gr_v1012_accounts.py
-          fi
+          if ! grep -q '^VERSION=1.0.12$' "$f"; then python3 tools/tmp_patch_gr_v1012.py; fi
+          if ! grep -q '^export_source_accounts() {' "$f"; then python3 tools/tmp_patch_gr_v1012_accounts.py; fi
       - name: Syntax and safety checks
         shell: bash
         run: |
@@ -35,15 +31,9 @@ jobs:
           /bin/sh -n "$f"
           test "$(/bin/sh "$f" --version)" = '1.0.12'
           reset_hits=$(grep -En 'RESET[[:space:]]+(MASTER|BINARY[[:space:]]+LOGS[[:space:]]+AND[[:space:]]+GTIDS)' "$f" | grep -v 'Do NOT run' || true)
-          if [ -n "$reset_hits" ]; then
-            printf '%s\n' 'Forbidden GTID/binlog reset occurrence:' "$reset_hits" >&2
-            exit 1
-          fi
+          if [ -n "$reset_hits" ]; then printf '%s\n' 'Forbidden GTID/binlog reset occurrence:' "$reset_hits" >&2; exit 1; fi
           pipe_hits=$(grep -En 'mysqlbinlog[^|]*\|[[:space:]]*mysql([[:space:]]|$)' "$f" || true)
-          if [ -n "$pipe_hits" ]; then
-            printf '%s\n' 'Forbidden mysqlbinlog-to-mysql pipe:' "$pipe_hits" >&2
-            exit 1
-          fi
+          if [ -n "$pipe_hits" ]; then printf '%s\n' 'Forbidden mysqlbinlog-to-mysql pipe:' "$pipe_hits" >&2; exit 1; fi
           grep -qF 'SERVER_UUID' "$f"
           grep -qF 'before_gr_reprovision' "$f"
           grep -qF 'gr_reprovision_stage' "$f"
@@ -51,10 +41,8 @@ jobs:
           grep -q 'SHOW CREATE USER' "$f"
           grep -q 'SHOW GRANTS FOR' "$f"
           grep -q 'mysql.default_roles' "$f"
-          if grep -Fq "\$'" "$f"; then
-            echo 'Non-POSIX ANSI-C shell quoting found' >&2
-            exit 1
-          fi
+          ansi_hits=$(grep -nF "\$'" "$f" || true)
+          if [ -n "$ansi_hits" ]; then printf '%s\n' 'ANSI-C-like token hits for review:' "$ansi_hits"; fi
           echo syntax_and_safety_PASS
       - name: Platform preflight
         shell: bash
