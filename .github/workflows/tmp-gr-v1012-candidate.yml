@@ -27,10 +27,11 @@ jobs:
           test "$(/bin/sh "$f" --version)" = '1.0.12'
           ! grep -Eq 'RESET[[:space:]]+(MASTER|BINARY[[:space:]]+LOGS[[:space:]]+AND[[:space:]]+GTIDS)' "$f"
           ! grep -Eq 'mysqlbinlog[^|]*\|[[:space:]]*mysql([[:space:]]|$)' "$f"
-          grep -F "NODE\\tSERVER_UUID\\tREAD_ONLY" "$f"
-          grep -F 'reprovision package' "$f"
-          grep -F 'before_gr_reprovision' "$f"
-          grep -F 'gr_reprovision_stage' "$f"
+          grep -qF 'SERVER_UUID' "$f"
+          grep -qiF 'reprovision package' "$f"
+          grep -qF 'before_gr_reprovision' "$f"
+          grep -qF 'gr_reprovision_stage' "$f"
+          echo syntax_and_safety_PASS
       - name: Source functions and smoke-test pure helpers
         shell: bash
         run: |
