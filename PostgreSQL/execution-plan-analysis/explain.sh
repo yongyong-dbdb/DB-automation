@@ -1,7 +1,7 @@
 #!/bin/sh
 set -u
 
-SCRIPT_VERSION="1.2.19"
+SCRIPT_VERSION="1.2.20"
 SCRIPT_DIR=$(CDPATH='' cd "$(dirname "$0")" && pwd)
 DEFAULT_OUTPUT_DIR="$SCRIPT_DIR/results"
 PSQL_BIN=${PSQL_BIN:-}
@@ -474,35 +474,85 @@ prepare_pgss_replay_sql() {
     echo
     echo "pg_stat_statements 정규화 파라미터 처리"
     printf '  SQL 내 최대 파라미터 번호 : $%s\n' "$_param_max"
-    printf '  원본 bind 최대 번호 추정 : %s\n' "$_guess"
+    if [ "$_guess" -gt 0 ]; then
+        printf '  자동 분류 - 기존 bind 변수     : $1 ~ $%s\n' "$_guess"
+    else
+        echo '  자동 분류 - 기존 bind 변수     : 없음'
+    fi
+    if [ "$_guess" -lt "$_param_max" ]; then
+        printf '  자동 분류 - 정규화 상수 후보   : $%s ~ $%s\n' "$((_guess + 1))" "$_param_max"
+    else
+        echo '  자동 분류 - 정규화 상수 후보   : 없음'
+    fi
     echo
     echo "안내: pg_stat_statements는 원래 literal을 추가 \$n 파라미터로 정규화할 수 있습니다."
-    echo "      원래 literal 값은 저장되지 않으므로 EXPLAIN 재현을 위해 값을 다시 입력해야 합니다."
-    echo "      자동 추정값보다 원본 bind 번호를 정확히 알고 있다면 직접 입력할 수 있습니다."
+    echo "      원래 literal 값은 저장되지 않으므로 정규화 상수 값은 직접 입력해야 합니다."
+    echo "      기존 bind 값은 분류 완료 후 예전 버전과 동일하게 SQL 조건의 테이블/컬럼을 찾아 후보값을 조회합니다."
 
-    _default_bind_max=${PGSS_ORIGINAL_BIND_MAX:-$_guess}
-    while :; do
-        printf '원본 SQL의 가장 큰 bind 번호 (원본 bind가 없으면 0) [%s]: ' "$_default_bind_max" >&2
-        IFS= read -r _bind_max || return 1
-        [ -n "$_bind_max" ] || _bind_max=$_default_bind_max
-        case $_bind_max in ''|*[!0-9]*) echo "ERROR: 0부터 $_param_max 사이의 숫자를 입력하세요." >&2; continue ;; esac
-        [ "$_bind_max" -ge 0 ] && [ "$_bind_max" -le "$_param_max" ] || { echo "ERROR: 0부터 $_param_max 사이의 숫자를 입력하세요." >&2; continue; }
-
-        _invalid=no
-        _n=1
-        while [ "$_n" -le "$_bind_max" ]; do
-            _context=$(pgss_parameter_context "$PGSS_RAW_SQL_FILE" "$_n")
-            if [ -n "$_context" ]; then
-                echo "ERROR: \$$_n 은 $_context literal 위치에 있어 원본 bind로 사용할 수 없습니다." >&2
-                echo "       원본 bind 최대 번호를 \$$_n 보다 작게 지정하세요." >&2
-                _invalid=yes
-                break
-            fi
-            _n=$((_n+1))
+    if [ -n "${PGSS_ORIGINAL_BIND_MAX:-}" ]; then
+        _bind_max=$PGSS_ORIGINAL_BIND_MAX
+    else
+        while :; do
+            printf '자동 분류 결과가 맞습니까? y/n [y]: ' >&2
+            IFS= read -r _class_ok || return 1
+            [ -n "$_class_ok" ] || _class_ok=y
+            _class_ok=$(printf '%s' "$_class_ok" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+            case $_class_ok in
+                y)
+                    _bind_max=$_guess
+                    break
+                    ;;
+                n)
+                    while :; do
+                        printf '기존 bind 변수의 마지막 번호 (예: $1~$6이면 6, 기존 bind가 없으면 0): ' >&2
+                        IFS= read -r _bind_max || return 1
+                        case $_bind_max in
+                            ''|*[!0-9]*) echo "ERROR: 0부터 $_param_max 사이의 숫자를 입력하세요." >&2; continue ;;
+                        esac
+                        [ "$_bind_max" -ge 0 ] && [ "$_bind_max" -le "$_param_max" ] || { echo "ERROR: 0부터 $_param_max 사이의 숫자를 입력하세요." >&2; continue; }
+                        if [ "$_bind_max" -eq 0 ]; then
+                            printf '주의: 0을 선택하면 $1~$%s를 모두 정규화 상수로 처리합니다. 계속하시겠습니까? y/n [n]: ' "$_param_max" >&2
+                            IFS= read -r _zero_ok || return 1
+                            [ -n "$_zero_ok" ] || _zero_ok=n
+                            _zero_ok=$(printf '%s' "$_zero_ok" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+                            [ "$_zero_ok" = y ] || continue
+                        fi
+                        break
+                    done
+                    break
+                    ;;
+                *) echo "ERROR: y 또는 n을 입력하세요." >&2 ;;
+            esac
         done
-        [ "$_invalid" = no ] && break
+    fi
+
+    _invalid=no
+    _n=1
+    while [ "$_n" -le "$_bind_max" ]; do
+        _context=$(pgss_parameter_context "$PGSS_RAW_SQL_FILE" "$_n")
+        if [ -n "$_context" ]; then
+            echo "ERROR: \$$_n 은 $_context literal 위치에 있어 기존 bind로 분류할 수 없습니다." >&2
+            _invalid=yes
+            break
+        fi
+        _n=$((_n+1))
     done
+    [ "$_invalid" = no ] || return 1
     PGSS_ORIGINAL_BIND_MAX=$_bind_max
+
+    echo
+    echo "최종 파라미터 분류"
+    if [ "$PGSS_ORIGINAL_BIND_MAX" -gt 0 ]; then
+        printf '  기존 bind 변수       : $1 ~ $%s\n' "$PGSS_ORIGINAL_BIND_MAX"
+    else
+        echo '  기존 bind 변수       : 없음'
+    fi
+    if [ "$PGSS_ORIGINAL_BIND_MAX" -lt "$_param_max" ]; then
+        printf '  정규화 상수          : $%s ~ $%s\n' "$((PGSS_ORIGINAL_BIND_MAX + 1))" "$_param_max"
+    else
+        echo '  정규화 상수          : 없음'
+    fi
+    echo
 
     PGSS_NORMALIZED_VALUES_FILE="$work_dir/pgss-normalized-values-used.txt"
     _map="$work_dir/pgss-normalized-map.tsv"
@@ -569,9 +619,9 @@ prepare_pgss_replay_sql() {
     echo
     echo "안내: 정규화 상수는 입력값으로 SQL에 복원했습니다."
     if [ "$PGSS_ORIGINAL_BIND_MAX" -gt 0 ]; then
-        printf '      원본 bind로 분류된 $1~$%s 만 PREPARE/EXECUTE 대상으로 처리합니다.\n' "$PGSS_ORIGINAL_BIND_MAX"
+        printf '      기존 bind로 분류된 $1~$%s는 기존 후보값/기본값 탐색 절차로 처리합니다.\n' "$PGSS_ORIGINAL_BIND_MAX"
     else
-        echo "      원본 bind로 분류된 파라미터가 없어 모든 \$n 값을 literal로 복원했습니다."
+        echo "      기존 bind로 분류된 파라미터가 없어 모든 \$n 값을 literal로 복원했습니다."
     fi
     echo
 }
@@ -799,43 +849,207 @@ build_bind_map() {
     bind_map="$work_dir/bind-map.txt"
     if ! {
         cat "$prepare_file"
-        cat <<'SQL'
+        cat <<'BIND_MAP_SQL'
 BEGIN;
 SELECT set_config('statement_timeout', :'sample_timeout', true) AS map_timeout \gset
 SET plan_cache_mode = force_generic_plan;
 CREATE TEMP TABLE explain_bind_plan (plan jsonb) ON COMMIT DROP;
 DO $map$
-DECLARE args text; result json;
+DECLARE
+    args text;
+    result json;
 BEGIN
-  SELECT string_agg('NULL', ', ' ORDER BY n) INTO args
-  FROM pg_prepared_statements p, generate_series(1, cardinality(p.parameter_types)) n
-  WHERE p.name='pg_explain_target';
-  EXECUTE 'EXPLAIN (VERBOSE, COSTS FALSE, FORMAT JSON) EXECUTE pg_explain_target' || CASE WHEN args IS NULL THEN '' ELSE '('||args||')' END INTO result;
-  INSERT INTO explain_bind_plan VALUES (result::jsonb);
-END $map$;
+    SELECT string_agg('NULL', ', ' ORDER BY n)
+      INTO args
+      FROM pg_prepared_statements p,
+           generate_series(1, cardinality(p.parameter_types)) n
+     WHERE p.name = 'pg_explain_target';
+    EXECUTE 'EXPLAIN (VERBOSE, COSTS FALSE, FORMAT JSON) EXECUTE pg_explain_target'
+         || CASE WHEN args IS NULL THEN '' ELSE '(' || args || ')' END
+      INTO result;
+    INSERT INTO explain_bind_plan VALUES (result::jsonb);
+END
+$map$;
 WITH RECURSIVE nodes(node) AS (
- SELECT plan->0->'Plan' FROM explain_bind_plan
- UNION ALL SELECT child FROM nodes, LATERAL jsonb_array_elements(COALESCE(node->'Plans','[]'::jsonb)) child
-), rels AS (
- SELECT DISTINCT node->>'Alias' alias, format('%I.%I',node->>'Schema',node->>'Relation Name') relation,
-        to_regclass(format('%I.%I',node->>'Schema',node->>'Relation Name')) relid
- FROM nodes WHERE node ? 'Schema' AND node ? 'Relation Name' AND node ? 'Alias'
-), expr AS (
- SELECT DISTINCT e.value txt FROM nodes, LATERAL jsonb_each_text(node) e
- WHERE e.key IN ('Filter','Index Cond','Recheck Cond','Hash Cond','Merge Cond','Join Filter')
-), refs AS (
- SELECT (regexp_matches(txt,'([a-zA-Z_][a-zA-Z0-9_$]*)\.([a-zA-Z_][a-zA-Z0-9_$]*)[^$]*\$([1-9][0-9]*)','g')) m FROM expr
-), cand AS (
- SELECT m[3] parameter, r.relid, m[2] column_name
- FROM refs JOIN rels r ON r.alias=m[1]
- JOIN pg_attribute a ON a.attrelid=r.relid AND a.attname=m[2] AND a.attnum>0 AND NOT a.attisdropped
+    SELECT plan->0->'Plan' FROM explain_bind_plan
+    UNION ALL
+    SELECT child FROM nodes,
+         LATERAL jsonb_array_elements(COALESCE(node->'Plans', '[]'::jsonb)) child
+), relations AS (
+    SELECT DISTINCT node->>'Alias' AS alias,
+           format('%I.%I', node->>'Schema', node->>'Relation Name') AS relation,
+           to_regclass(format('%I.%I', node->>'Schema', node->>'Relation Name')) AS relid
+    FROM nodes
+    WHERE node ? 'Schema' AND node ? 'Relation Name' AND node ? 'Alias'
+), expressions AS (
+    SELECT DISTINCT term
+    FROM nodes, LATERAL jsonb_each_text(node) e,
+         LATERAL regexp_split_to_table(e.value, '\s+(?:AND|OR)\s+') term
+    WHERE e.key IN ('Filter', 'Index Cond', 'Recheck Cond', 'Hash Cond', 'Merge Cond', 'Join Filter')
+), patterns AS (
+    SELECT '(?:[a-z_][a-z_0-9$]*|"(?:[^"]|"")+")' AS ident,
+           '(?:::(?:text|integer|bigint|smallint|numeric|boolean|date|uuid|character varying|double precision))?' AS cast_pattern
+), qualified_matches AS (
+    SELECT regexp_match(term,
+      '^\s*\(*\s*(' || ident || '\.' || ident || ')\)*' || cast_pattern ||
+      '\)*\s*(?:=|<>|!=|<=|>=|<|>|~~\*?|!~~\*?)\s*\(*\$([1-9][0-9]*)\)*' || cast_pattern || '\)*\s*$') AS m,
+      false AS reversed
+    FROM expressions, patterns
+    UNION ALL
+    SELECT regexp_match(term,
+      '^\s*\(*\$([1-9][0-9]*)\)*' || cast_pattern ||
+      '\)*\s*(?:=|<>|!=|<=|>=|<|>)\s*\(*(' || ident || '\.' || ident || ')\)*' || cast_pattern || '\)*\s*$'),
+      true
+    FROM expressions, patterns
+), qualified_refs AS (
+    SELECT CASE WHEN reversed THEN m[1] ELSE m[2] END AS parameter,
+           parse_ident(CASE WHEN reversed THEN m[2] ELSE m[1] END) AS names
+    FROM qualified_matches WHERE m IS NOT NULL
+), unqualified_matches AS (
+    SELECT regexp_match(term,
+      '^\s*\(*\s*(' || ident || ')\)*' || cast_pattern ||
+      '\)*\s*(?:=|<>|!=|<=|>=|<|>|~~\*?|!~~\*?)\s*\(*\$([1-9][0-9]*)\)*' || cast_pattern || '\)*\s*$') AS m,
+      false AS reversed
+    FROM expressions, patterns
+    UNION ALL
+    SELECT regexp_match(term,
+      '^\s*\(*\$([1-9][0-9]*)\)*' || cast_pattern ||
+      '\)*\s*(?:=|<>|!=|<=|>=|<|>)\s*\(*(' || ident || ')\)*' || cast_pattern || '\)*\s*$'),
+      true
+    FROM expressions, patterns
+), unqualified_refs AS (
+    SELECT CASE WHEN reversed THEN m[1] ELSE m[2] END AS parameter,
+           (parse_ident(CASE WHEN reversed THEN m[2] ELSE m[1] END))[1] AS column_name
+    FROM unqualified_matches WHERE m IS NOT NULL
+), direct_candidates AS (
+    SELECT DISTINCT q.parameter, r.relid, q.names[2] AS column_name, 1 AS priority
+    FROM qualified_refs q
+    JOIN relations r ON r.alias = q.names[1]
+    JOIN pg_attribute a ON a.attrelid = r.relid
+                       AND a.attname = q.names[2]
+                       AND a.attnum > 0 AND NOT a.attisdropped
+), unqualified_candidates AS (
+    SELECT DISTINCT u.parameter, r.relid, u.column_name, 2 AS priority
+    FROM unqualified_refs u
+    CROSS JOIN relations r
+    JOIN pg_attribute a ON a.attrelid = r.relid
+                       AND a.attname = u.column_name
+                       AND a.attnum > 0 AND NOT a.attisdropped
+), all_candidates AS (
+    SELECT * FROM direct_candidates
+    UNION ALL
+    SELECT * FROM unqualified_candidates
+), normalized AS (
+    SELECT DISTINCT c.parameter,
+           CASE WHEN pc.relispartition THEN pg_partition_root(c.relid) ELSE c.relid END AS normalized_relid,
+           c.column_name,
+           c.priority
+    FROM all_candidates c
+    JOIN pg_class pc ON pc.oid = c.relid
+), best_priority AS (
+    SELECT parameter, min(priority) AS priority
+    FROM normalized
+    GROUP BY parameter
 )
-SELECT parameter, format('%I.%I',n.nspname,c.relname), column_name
-FROM cand x JOIN pg_class c ON c.oid=x.relid JOIN pg_namespace n ON n.oid=c.relnamespace
-ORDER BY parameter::int,2,3;
+SELECT n.parameter,
+       format('%I.%I', ns.nspname, cls.relname) AS relation,
+       n.column_name,
+       n.priority
+FROM normalized n
+JOIN best_priority b USING (parameter, priority)
+JOIN pg_class cls ON cls.oid = n.normalized_relid
+JOIN pg_namespace ns ON ns.oid = cls.relnamespace
+WHERE format('%I.%I', ns.nspname, cls.relname) !~ E'[|\n\r]'
+  AND n.column_name !~ E'[|\n\r]'
+ORDER BY n.parameter::integer, n.priority, relation, n.column_name;
 ROLLBACK;
-SQL
-    } | run_psql -X -qAt -F '|' -v ON_ERROR_STOP=1 -v sample_timeout="$BIND_SAMPLE_TIMEOUT" > "$bind_map" 2>/dev/null; then : > "$bind_map"; fi
+BIND_MAP_SQL
+    } | run_psql -X -qAt -F '|' -v ON_ERROR_STOP=1 \
+        -v sample_timeout="$BIND_SAMPLE_TIMEOUT" > "$bind_map" 2>"$work_dir/bind-map.err"; then
+        : > "$bind_map"
+        echo 'Automatic bind-column mapping unavailable; manual selection will be offered.' >&2
+    fi
+}
+
+build_bind_constant_map() {
+    bind_constant_map="$work_dir/bind-constant-map.txt"
+    if ! {
+        cat "$prepare_file"
+        cat <<'BIND_CONSTANT_SQL'
+BEGIN;
+SELECT set_config('statement_timeout', :'sample_timeout', true) AS map_timeout \gset
+SET plan_cache_mode = force_generic_plan;
+CREATE TEMP TABLE explain_bind_constant_plan (plan jsonb) ON COMMIT DROP;
+DO $map$
+DECLARE
+    args text;
+    result json;
+BEGIN
+    SELECT string_agg('NULL', ', ' ORDER BY n)
+      INTO args
+      FROM pg_prepared_statements p,
+           generate_series(1, cardinality(p.parameter_types)) n
+     WHERE p.name = 'pg_explain_target';
+    EXECUTE 'EXPLAIN (VERBOSE, COSTS FALSE, FORMAT JSON) EXECUTE pg_explain_target'
+         || CASE WHEN args IS NULL THEN '' ELSE '(' || args || ')' END
+      INTO result;
+    INSERT INTO explain_bind_constant_plan VALUES (result::jsonb);
+END
+$map$;
+WITH RECURSIVE nodes(node) AS (
+    SELECT plan->0->'Plan' FROM explain_bind_constant_plan
+    UNION ALL
+    SELECT child FROM nodes,
+         LATERAL jsonb_array_elements(COALESCE(node->'Plans', '[]'::jsonb)) child
+), expressions AS (
+    SELECT DISTINCT term
+    FROM nodes, LATERAL jsonb_each_text(node) e,
+         LATERAL regexp_split_to_table(e.value, '\s+(?:AND|OR)\s+') term
+    WHERE e.key IN ('Filter', 'Index Cond', 'Recheck Cond', 'Hash Cond', 'Merge Cond', 'Join Filter', 'One-Time Filter')
+), patterns AS (
+    SELECT '(?:NULL|true|false|[-+]?[0-9]+(?:\.[0-9]+)?|''(?:[^'']|'''')*'')' AS literal,
+           '(?:::(?:text|integer|bigint|smallint|numeric|boolean|date|uuid|character varying|double precision))?' AS cast_pattern
+), matches AS (
+    SELECT regexp_match(term,
+      '^\s*\(*\s*(' || literal || ')\)*' || cast_pattern ||
+      '\)*\s*(?:=|<>|!=|<=|>=|<|>)\s*\(*\$([1-9][0-9]*)\)*' || cast_pattern || '\)*\s*$') AS m,
+      false AS reversed
+    FROM expressions, patterns
+    UNION ALL
+    SELECT regexp_match(term,
+      '^\s*\(*\$([1-9][0-9]*)\)*' || cast_pattern ||
+      '\)*\s*(?:=|<>|!=|<=|>=|<|>)\s*\(*(' || literal || ')\)*' || cast_pattern || '\)*\s*$'),
+      true
+    FROM expressions, patterns
+), normalized AS (
+    SELECT CASE WHEN reversed THEN m[1] ELSE m[2] END AS parameter,
+           CASE WHEN reversed THEN m[2] ELSE m[1] END AS literal
+    FROM matches
+    WHERE m IS NOT NULL
+), literal_values AS (
+    SELECT parameter,
+           CASE
+             WHEN literal = 'NULL' THEN '\N'
+             WHEN literal LIKE '''%''' THEN replace(substr(literal, 2, length(literal) - 2), '''''', '''')
+             ELSE literal
+           END AS default_value
+    FROM normalized
+), unique_value AS (
+    SELECT parameter, min(default_value) AS default_value
+    FROM literal_values
+    GROUP BY parameter
+    HAVING count(DISTINCT default_value) = 1
+)
+SELECT parameter, default_value
+FROM unique_value
+WHERE default_value !~ E'[|\n\r]'
+ORDER BY parameter::integer;
+ROLLBACK;
+BIND_CONSTANT_SQL
+    } | run_psql -X -qAt -F '|' -v ON_ERROR_STOP=1 \
+        -v sample_timeout="$BIND_SAMPLE_TIMEOUT" > "$bind_constant_map" 2>"$work_dir/bind-constant-map.err"; then
+        : > "$bind_constant_map"
+    fi
 }
 
 build_bind_type_map() {
@@ -855,44 +1069,108 @@ SQL
 }
 
 show_bind_candidates() {
-    bind_default_available=no; bind_default_value=
-    bind_type=$(awk -F'|' -v n="$bind_index" '$1==n{print $2;exit}' "$bind_type_map")
-    bind_empty_string_allowed=$(awk -F'|' -v n="$bind_index" '$1==n{print $3;exit}' "$bind_type_map")
+    bind_default_available=no
+    bind_default_value=
+    bind_type=$(awk -F'|' -v n="$bind_index" '$1 == n {print $2; exit}' "$bind_type_map")
+    bind_empty_string_allowed=$(awk -F'|' -v n="$bind_index" '$1 == n {print $3; exit}' "$bind_type_map")
     [ -n "$bind_type" ] || bind_type=unknown
     [ -n "$bind_empty_string_allowed" ] || bind_empty_string_allowed=no
     printf 'Parameter $%s type: %s\n' "$bind_index" "$bind_type"
+
+    constant_line=$(awk -F'|' -v n="$bind_index" '$1 == n {print; exit}' "$bind_constant_map")
+    if [ -n "$constant_line" ]; then
+        bind_default_value=${constant_line#*|}
+        bind_default_available=yes
+        printf 'Auto-detected $%s -> SQL constant default: %s\n' "$bind_index" "$bind_default_value"
+        return 0
+    fi
+
     bind_candidate_file="$work_dir/bind-candidates-$bind_index.txt"
-    awk -F'|' -v n="$bind_index" '$1==n{print $2"|"$3}' "$bind_map" | sort -u > "$bind_candidate_file"
-    count=$(awk 'END{print NR+0}' "$bind_candidate_file")
-    sample_relation=; sample_column=
-    if [ "$count" -eq 1 ]; then
-        line=$(sed -n '1p' "$bind_candidate_file"); sample_relation=${line%%|*}; sample_column=${line#*|}
+    awk -F'|' -v n="$bind_index" '$1 == n {print $2 "|" $3}' "$bind_map" | sort -u > "$bind_candidate_file"
+    bind_candidate_count=$(awk 'END {print NR+0}' "$bind_candidate_file")
+    sample_relation=
+    sample_column=
+    if [ "$bind_candidate_count" -eq 1 ]; then
+        candidate_line=$(sed -n '1p' "$bind_candidate_file")
+        sample_relation=${candidate_line%%|*}
+        sample_column=${candidate_line#*|}
         printf 'Auto-detected $%s -> %s / %s\n' "$bind_index" "$sample_relation" "$sample_column"
-    elif [ "$count" -gt 1 ]; then
+    elif [ "$bind_candidate_count" -gt 1 ]; then
         echo "Multiple candidate relations found for parameter \$$bind_index:"
-        n=1; while IFS='|' read -r r c; do printf '  %s) %s / %s\n' "$n" "$r" "$c"; n=$((n+1)); done < "$bind_candidate_file"
-        printf 'Select candidate for $%s [1]: ' "$bind_index" >&2; IFS= read -r choice; [ -n "$choice" ] || choice=1
-        line=$(sed -n "${choice}p" "$bind_candidate_file"); sample_relation=${line%%|*}; sample_column=${line#*|}
+        candidate_no=1
+        while IFS='|' read -r candidate_relation candidate_column; do
+            printf '  %s) %s / %s\n' "$candidate_no" "$candidate_relation" "$candidate_column"
+            candidate_no=$((candidate_no + 1))
+        done < "$bind_candidate_file"
+        while :; do
+            printf 'Select candidate for $%s [1]: ' "$bind_index" >&2
+            IFS= read -r candidate_choice || return 1
+            [ -n "$candidate_choice" ] || candidate_choice=1
+            case $candidate_choice in
+                *[!0-9]*|'') echo "ERROR: enter a candidate number." >&2; continue ;;
+            esac
+            if [ "$candidate_choice" -lt 1 ] || [ "$candidate_choice" -gt "$bind_candidate_count" ]; then
+                printf 'ERROR: choose 1-%s.\n' "$bind_candidate_count" >&2
+                continue
+            fi
+            candidate_line=$(sed -n "${candidate_choice}p" "$bind_candidate_file")
+            sample_relation=${candidate_line%%|*}
+            sample_column=${candidate_line#*|}
+            printf 'Selected $%s -> %s / %s\n' "$bind_index" "$sample_relation" "$sample_column"
+            break
+        done
     else
         echo "No automatic relation candidate found for this parameter." >&2
+        echo "The following table/column is only used to look up example values; press Enter to skip candidate lookup." >&2
     fi
-    if [ -z "$sample_relation" ]; then
-        printf 'Candidate source table for $%s (schema.table, empty to skip): ' "$bind_index" >&2; IFS= read -r sample_relation
-        [ -n "$sample_relation" ] || return 0
-        printf 'Candidate source column (exact name, empty to skip): ' >&2; IFS= read -r sample_column
-        [ -n "$sample_column" ] || return 0
-    fi
-    echo
-    printf 'Table value candidates for $%s (up to %s distinct values; not historical bind values)\n' "$bind_index" "$BIND_SAMPLE_LIMIT"
-    run_psql -X -q -P pager=off -v ON_ERROR_STOP=1 -v sample_relation="$sample_relation" -v sample_column="$sample_column" -v sample_limit="$BIND_SAMPLE_LIMIT" <<'SQL' || return 0
-SELECT format('SELECT DISTINCT %1$I AS candidate_value FROM %2$s WHERE %1$I IS NOT NULL LIMIT %3$s', :'sample_column', :'sample_relation'::regclass, :'sample_limit'::integer) \gexec
+
+    while :; do
+        if [ -z "$sample_relation" ] || [ -z "$sample_column" ]; then
+            printf 'Candidate source table for $%s (schema.table, empty to skip): ' "$bind_index" >&2
+            IFS= read -r sample_relation || return 1
+            [ -n "$sample_relation" ] || return 0
+            printf 'Candidate source column (exact name, empty to skip): ' >&2
+            IFS= read -r sample_column || return 1
+            [ -n "$sample_column" ] || return 0
+        fi
+
+        printf '\nTable value candidates for $%s (up to %s distinct values; not historical bind values)\n' "$bind_index" "$BIND_SAMPLE_LIMIT"
+        if run_psql -X -q -P pager=off -v ON_ERROR_STOP=1 \
+            -v sample_relation="$sample_relation" -v sample_column="$sample_column" \
+            -v sample_limit="$BIND_SAMPLE_LIMIT" -v sample_timeout="$BIND_SAMPLE_TIMEOUT" <<'SQL'
+BEGIN READ ONLY;
+SELECT set_config('statement_timeout', :'sample_timeout', true) AS sample_timeout \gset
+SELECT format(
+    'SELECT DISTINCT %1$I AS candidate_value FROM %2$s WHERE %1$I IS NOT NULL LIMIT %3$s',
+    :'sample_column', :'sample_relation'::regclass, :'sample_limit'::integer)
+\gexec
+COMMIT;
 SQL
-    bind_default_value=$(run_psql -X -qAt -v ON_ERROR_STOP=1 -v sample_relation="$sample_relation" -v sample_column="$sample_column" <<'SQL'
-SELECT format('SELECT DISTINCT %1$I::text FROM %2$s WHERE %1$I IS NOT NULL LIMIT 1', :'sample_column', :'sample_relation'::regclass) \gexec
+        then
+            bind_default_value=$(
+                run_psql -X -qAt -v ON_ERROR_STOP=1 \
+                    -v sample_relation="$sample_relation" -v sample_column="$sample_column" \
+                    -v sample_timeout="$BIND_SAMPLE_TIMEOUT" <<'SQL'
+BEGIN READ ONLY;
+SELECT set_config('statement_timeout', :'sample_timeout', true) AS sample_timeout \gset
+SELECT format(
+    'SELECT DISTINCT %1$I::text FROM %2$s WHERE %1$I IS NOT NULL AND %1$I::text !~ E''[\n\r]'' LIMIT 1',
+    :'sample_column', :'sample_relation'::regclass)
+\gexec
+COMMIT;
 SQL
-    ) || bind_default_value=
-    if [ -n "$bind_default_value" ]; then bind_default_available=yes; printf 'Default for $%s: %s\n' "$bind_index" "$bind_default_value"; fi
-    echo 'Candidates are distinct current table values and do not apply the original SQL filters.'
+            ) || bind_default_value=
+            if [ -n "$bind_default_value" ]; then
+                bind_default_available=yes
+                printf 'Default for $%s: %s\n' "$bind_index" "$bind_default_value"
+            fi
+            echo 'Candidates are distinct current table values and do not apply the original SQL filters.'
+            return 0
+        fi
+        echo 'Could not read candidates. Check table/column/permissions or retry; empty table skips candidates.' >&2
+        sample_relation=
+        sample_column=
+    done
 }
 
 _bind_default=n
@@ -913,18 +1191,30 @@ if [ "$BIND" = yes ]; then
     fi
     case $BIND_COUNT in ''|*[!0-9]*) echo "ERROR: invalid parameter count" >&2; exit 1 ;; esac
     BIND_SAMPLE_LIMIT=${BIND_SAMPLE_LIMIT:-3}; BIND_SAMPLE_TIMEOUT=${BIND_SAMPLE_TIMEOUT:-5s}
-    build_bind_map; build_bind_type_map || exit 1
+    if ! printf '%s\n' "$BIND_SAMPLE_LIMIT" | grep -Eq '^[0-9]*[1-9][0-9]*$'; then
+        echo "ERROR: BIND_SAMPLE_LIMIT must be a positive integer." >&2
+        exit 1
+    fi
+    build_bind_map
+    build_bind_constant_map
+    build_bind_type_map || exit 1
     echo "Bind parameter count: $BIND_COUNT"
     echo 'Enter each value as plain text (no SQL quotes). \N means SQL NULL. If a default is shown, Enter accepts it.'
     printf 'EXECUTE pg_explain_target' > "$execute_file"
     [ "$BIND_COUNT" -eq 0 ] || printf '(' >> "$execute_file"
     bind_index=1
     while [ "$bind_index" -le "$BIND_COUNT" ]; do
-        show_bind_candidates
+        show_bind_candidates || exit 1
         while :; do
-            if [ "$bind_default_available" = yes ]; then printf 'Value for $%s [%s]: ' "$bind_index" "$bind_default_value" >&2; else printf 'Value for $%s (\\N for NULL): ' "$bind_index" >&2; fi
+            if [ "$bind_default_available" = yes ]; then
+                printf 'Value for $%s [%s]: ' "$bind_index" "$bind_default_value" >&2
+            elif [ "$bind_empty_string_allowed" = yes ]; then
+                printf 'Value for $%s (empty string allowed, \\N for NULL): ' "$bind_index" >&2
+            else
+                printf 'Value for $%s (required, \\N for NULL): ' "$bind_index" >&2
+            fi
             IFS= read -r bind_value
-            if [ -z "$bind_value" ] && [ "$bind_default_available" = yes ]; then bind_value=$bind_default_value; fi
+            if [ -z "$bind_value" ] && [ "$bind_default_available" = yes ]; then bind_value=$bind_default_value; break; fi
             if [ -z "$bind_value" ] && [ "$bind_empty_string_allowed" != yes ]; then echo "ERROR: value required for $bind_type." >&2; continue; fi
             break
         done
