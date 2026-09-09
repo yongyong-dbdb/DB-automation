@@ -70,7 +70,13 @@ s = s.replace(old, new, 1)
 old = "            printf '  5. Restore %s into STAGING and verify GTID exactly equals %s.\\n' \"$dump\" \"$target\"\n            printf '  6. Recreate/verify an administrative account before final swap; never leave a passwordless root account exposed.\\n'\n"
 new = "            printf '  5. Restore %s into STAGING. Then execute source_accounts.sql through the isolated local socket with binary logging disabled.\\n' \"$dump\"\n            printf '     Account SQL contains authentication hashes and GRANT/role state; keep mode 600 and never print it to an unprotected terminal/log.\\n'\n            printf '  6. Verify application objects, Source account/role state, and GTID exactly equals %s before final swap.\\n' \"$target\"\n            printf '     If account/default-role export was incomplete, stop and use external/reviewed provisioning rather than marking all Source GTIDs executed.\\n'\n"
 if old not in s:
-    raise SystemExit('plan account step marker not found')
+    raise SystemExit('local plan account step marker not found')
+s = s.replace(old, new, 1)
+
+old = "            printf '  - Copy the dump and checksum to the target host before stopping the original instance, then verify checksum on that host.\\n'\n"
+new = "            printf '  - Copy the application dump, source_accounts.sql, and both checksum files to the target host before stopping the original instance; verify every checksum there.\\n'\n            printf '  - Restore both application data and Source account/role state in an isolated STAGING instance before any datadir swap.\\n'\n"
+if old not in s:
+    raise SystemExit('remote plan copy marker not found')
 s = s.replace(old, new, 1)
 
 note = '# v1.0.12: reversible reprovision package generation, staging/swap rollback plan, and stable abort TSV output.'
