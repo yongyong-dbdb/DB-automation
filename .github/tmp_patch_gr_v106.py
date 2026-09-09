@@ -1,0 +1,232 @@
+from pathlib import Path
+
+p = Path('MySQL/Group-Replication/mysql_gr_migrate.sh')
+s = p.read_text()
+
+def replace_once(old, new, label):
+    global s
+    count = s.count(old)
+    if count != 1:
+        raise SystemExit(f'{label}: expected exactly one match, found {count}')
+    s = s.replace(old, new, 1)
+
+replace_once('# mysql_gr_migrate.sh v1.0.5', '# mysql_gr_migrate.sh v1.0.6', 'header version')
+replace_once('VERSION=1.0.5', 'VERSION=1.0.6', 'runtime version')
+replace_once(
+    'MYSQL=${MYSQL_GR_MYSQL:-mysql}\nDUMP=${MYSQL_GR_MYSQLDUMP:-mysqldump}\n',
+    'MYSQL=${MYSQL_GR_MYSQL:-mysql}\nDUMP=${MYSQL_GR_MYSQLDUMP:-mysqldump}\nBINLOG=${MYSQL_GR_MYSQLBINLOG:-mysqlbinlog}\n',
+    'mysqlbinlog variable')
+replace_once(
+    'Environment: MYSQL_GR_WORK_ROOT, MYSQL_GR_MYSQL, MYSQL_GR_MYSQLDUMP',
+    'Environment: MYSQL_GR_WORK_ROOT, MYSQL_GR_MYSQL, MYSQL_GR_MYSQLDUMP, MYSQL_GR_MYSQLBINLOG',
+    'help environment')
+
+old_guard = r'''gtid_guard() {
+    i=$1; target=$2
+    gtid_compare "$i" "$target"
+    [ -z "$GTID_EXTRA" ] || die "Node $i contains extra/errant GTIDs ($GTID_ORIGIN). Review the recorded GTIDs and reconcile or externally reprovision; GTIDs are never reset automatically."
+    [ -z "$GTID_UNAVAILABLE" ] || die "Node $i is missing GTIDs already purged from node 1 binary logs; incremental catch-up is not possible. Externally reprovision from the authoritative source."
+}
+
+catchup() ('''
+
+new_guard = r'''gtid_guard() {
+    i=$1; target=$2
+    gtid_compare "$i" "$target"
+    [ -z "$GTID_EXTRA" ] || die "Node $i contains extra/errant GTIDs ($GTID_ORIGIN). Review the recorded GTIDs and reconcile or externally reprovision; GTIDs are never reset automatically."
+    [ -z "$GTID_UNAVAILABLE" ] || die "Node $i is missing GTIDs already purged from node 1 binary logs; incremental catch-up is not possible. Externally reprovision from the authoritative source."
+}
+
+mysqlbinlog_tool() (
+    i=$1
+    command -v "$BINLOG" >/dev/null 2>&1 || exit 1
+    tool=$(command -v "$BINLOG")
+    version_file="$RUN/node_${i}.mysqlbinlog_version.txt"
+    "$tool" --version > "$version_file" 2>&1 || exit 1
+    tool_version=$(sed -n 's/.*Ver \([0-9][0-9.]*\).*/\1/p' "$version_file" | head -n 1)
+    server_version=$(get "$i" version | sed 's/[^0-9.].*//')
+    [ -n "$tool_version" ] && [ "$tool_version" = "$server_version" ] || exit 1
+    printf '%s' "$tool"
+)
+
+write_mysqlbinlog_command() {
+    i=$1; include_gtids=$2; logs_file=$3
+    cmd_file="$RUN/node_${i}.mysqlbinlog_command.sh"
+    {
+        printf '#!/bin/sh\n'
+        printf '# Read-only GTID inspection helper. It only reads binary logs; it never pipes output into mysql.\n'
+        printf '# Use a mysqlbinlog client matching MySQL server version %s.\n' "$(get "$i" version)"
+        printf 'mysqlbinlog --read-from-remote-server --base64-output=DECODE-ROWS -vv '
+        if [ "$(get "$i" mode)" = socket ]; then
+            printf '%s ' '--protocol=SOCKET'
+            printf '%s ' "--socket=$(get "$i" socket)"
+        else
+            printf '%s ' '--protocol=TCP'
+            printf '%s ' "--host=$(get "$i" host)"
+            printf '%s ' "--port=$(get "$i" port)"
+            printf '%s ' "--ssl-mode=$(get "$i" admin_tls)"
+            if [ -s "$ROOT/$i/admin_ca" ]; then
+                printf '%s ' "--ssl-ca=$(get "$i" admin_ca)"
+            fi
+        fi
+        printf '%s ' "--user=$(get "$i" user)"
+        printf '%s ' '--password'
+        printf '%s ' "--include-gtids=$include_gtids"
+        tab=$(printf '\t')
+        while IFS="$tab" read -r log_name rest; do
+            [ -n "$log_name" ] || continue
+            shell_quote "$log_name"
+            printf ' '
+        done < "$logs_file"
+        printf '\n'
+    } > "$cmd_file"
+    chmod 700 "$cmd_file"
+    printf '%s' "$cmd_file"
+}
+
+inspect_extra_gtids() {
+    i=$1; target=$2
+    gtid_compare "$i" "$target"
+    extra=$GTID_EXTRA
+    [ -n "$extra" ] || { log "Node $i has no extra GTIDs to inspect."; return 0; }
+
+    logs_file="$RUN/node_${i}.binary_logs.tsv"
+    summary_file="$RUN/node_${i}.errant_gtid_inspection.tsv"
+    output_file="$RUN/node_${i}.errant_gtid.mysqlbinlog.txt"
+    error_file="$RUN/node_${i}.errant_gtid.mysqlbinlog.err"
+    sql "$i" 'SHOW BINARY LOGS;' > "$logs_file"
+    binlog_basename=$(val "$i" log_bin_basename)
+    available_extra=$(normalize_gtid "$(sql "$i" "SELECT GTID_SUBTRACT('$(q "$extra")',@@GLOBAL.gtid_purged);")")
+    purged_extra=$(normalize_gtid "$(sql "$i" "SELECT GTID_SUBTRACT('$(q "$extra")',GTID_SUBTRACT(@@GLOBAL.gtid_executed,@@GLOBAL.gtid_purged));")")
+    log_count=$(awk 'END{print NR+0}' "$logs_file")
+
+    {
+        printf 'FIELD\tVALUE\n'
+        printf 'NODE\t%s\n' "$i"
+        printf 'EXTRA_GTID\t%s\n' "$extra"
+        printf 'EXTRA_ORIGIN\t%s\n' "$GTID_ORIGIN"
+        printf 'EXTRA_AVAILABLE_IN_CURRENT_BINLOGS\t%s\n' "$available_extra"
+        printf 'EXTRA_PURGED_FROM_CURRENT_BINLOGS\t%s\n' "$purged_extra"
+        printf 'LOG_BIN_BASENAME\t%s\n' "$binlog_basename"
+        printf 'BINARY_LOG_COUNT\t%s\n' "$log_count"
+    } > "$summary_file"
+
+    log "Node $i read-only errant-GTID inspection:"
+    log "  Available in current binary logs: ${available_extra:-NONE}"
+    log "  Already purged from binary logs  : ${purged_extra:-NONE}"
+    log "  Binary log list                  : $logs_file"
+    log "  Inspection summary               : $summary_file"
+    [ -z "$purged_extra" ] || log '  NOTE: Purged GTIDs cannot be reconstructed from the current binary logs; use retained backups/audit evidence if transaction contents must be reviewed.'
+
+    [ -n "$available_extra" ] || {
+        log 'No extra GTID events remain in the current binary logs. No mysqlbinlog decoding was attempted.'
+        return 0
+    }
+
+    cmd_file=$(write_mysqlbinlog_command "$i" "$available_extra" "$logs_file")
+    log "  Read-only fallback command        : $cmd_file"
+    if ! tool=$(mysqlbinlog_tool "$i"); then
+        log 'Matching mysqlbinlog was not found on this controller. No package is installed automatically; use the generated read-only command with a matching MySQL client.'
+        return 0
+    fi
+
+    credential "$i"
+    set --
+    tab=$(printf '\t')
+    while IFS="$tab" read -r log_name rest; do
+        [ -n "$log_name" ] || continue
+        set -- "$@" "$log_name"
+    done < "$logs_file"
+    [ "$#" -gt 0 ] || { log "Node $i returned no binary log files; automatic decoding skipped."; return 0; }
+
+    # Read through the server rather than opening OS files directly. This works for
+    # local/remote nodes and encrypted binary logs, and does not execute the output.
+    if "$tool" --defaults-file="$TEMP/$i.cnf" --no-login-paths --read-from-remote-server --base64-output=DECODE-ROWS -vv --include-gtids="$available_extra" "$@" > "$output_file" 2> "$error_file"; then
+        chmod 600 "$output_file" "$error_file"
+        log "  mysqlbinlog evidence              : $output_file"
+        log '  WARNING: The evidence can contain SQL and row values; the file is stored under the protected run directory.'
+    else
+        chmod 600 "$error_file" 2>/dev/null || :
+        log 'Automatic mysqlbinlog decoding failed (for example, the account may lack REPLICATION SLAVE). No server data was changed.'
+        log "  mysqlbinlog error                 : $error_file"
+        log "  Use the generated command         : $cmd_file"
+    fi
+}
+
+divergence_workflow() {
+    i=$1; target=$2
+    gtid_compare "$i" "$target"
+    [ -n "$GTID_EXTRA" ] || return 0
+    log "Node $i has divergent GTID history. There is no automatic ignore, skip, GTID rewrite, or reset path."
+    while :; do
+        log '  inspect : read current binary logs and decode only the extra GTIDs; no SQL is applied.'
+        log '  external: stop here for reviewed reconciliation/reprovisioning from the authoritative source.'
+        log '  abort   : stop without changing GTID history; existing write fences/state remain preserved.'
+        action=$(required "Node $i divergent GTID action (inspect/external/abort)" inspect)
+        case $action in
+            inspect)
+                inspect_extra_gtids "$i" "$target"
+                log 'Inspection complete. Review the saved evidence before deciding how to reconcile the member.'
+                while :; do
+                    log '  external: reconcile/reprovision outside this script, then rerun after identity and GTID checks pass.'
+                    log '  abort   : stop now; no GTID reconciliation is attempted.'
+                    next_action=$(required "Node $i action after inspection (external/abort)" abort)
+                    case $next_action in
+                        external)
+                            log "Node $i must be reconciled or reprovisioned from authoritative node 1 using a separately validated procedure."
+                            log 'If server_uuid, channel, or instance identity changes during reprovisioning, use a fresh MYSQL_GR_WORK_ROOT and run discover again.'
+                            die "Node $i external reconciliation/reprovisioning required before GR migration";;
+                        abort) die "Node $i divergence left unchanged after read-only inspection";;
+                        *) log 'Invalid action. Enter external or abort.';;
+                    esac
+                done
+                ;;
+            external)
+                log "Node $i must be reconciled or reprovisioned from authoritative node 1 using a separately validated procedure."
+                log 'If server_uuid, channel, or instance identity changes during reprovisioning, use a fresh MYSQL_GR_WORK_ROOT and run discover again.'
+                die "Node $i external reconciliation/reprovisioning required before GR migration";;
+            abort) die "Node $i divergence left unchanged";;
+            *) log 'Invalid action. Enter inspect, external, or abort.';;
+        esac
+    done
+}
+
+catchup() ('''
+replace_once(old_guard, new_guard, 'divergence helper insertion')
+
+old_replica = r'''            EXISTING_REPLICA)
+                log "Node $i state: EXISTING_REPLICA - existing GTID channel will catch up to node 1 before GR cutover."
+                ch=$(q "$(get "$i" channel)")
+                # Check errant/unavailable GTIDs before changing channel state.
+                gtid_guard "$i" "$target"
+                log "Starting/catching up only node $i selected GTID channel after any configuration restart."
+                sql "$i" "START REPLICA FOR CHANNEL '$ch';"
+                catchup "$i" "$target"
+                put "$i" initialized replica
+                ;;'''
+new_replica = r'''            EXISTING_REPLICA)
+                log "Node $i state: EXISTING_REPLICA - existing GTID channel will catch up to node 1 before GR cutover."
+                ch=$(q "$(get "$i" channel)")
+                # Inspect divergence before changing the existing channel state.
+                gtid_compare "$i" "$target"
+                [ -z "$GTID_EXTRA" ] || divergence_workflow "$i" "$target"
+                [ -z "$GTID_UNAVAILABLE" ] || die "Node $i is missing GTIDs already purged from node 1 binary logs; incremental catch-up is not possible. Externally reprovision from the authoritative source."
+                log "Starting/catching up only node $i selected GTID channel after any configuration restart."
+                sql "$i" "START REPLICA FOR CHANNEL '$ch';"
+                catchup "$i" "$target"
+                put "$i" initialized replica
+                ;;'''
+replace_once(old_replica, new_replica, 'existing replica divergence flow')
+
+old_diverged = r'''            DIVERGED)
+                log "Node $i state: DIVERGED - extra GTIDs exist outside the authoritative node 1 set."
+                gtid_compare "$i" "$target"
+                die "Node $i contains divergent GTID history; inspect the recorded GTIDs and reconcile or externally reprovision"
+                ;;'''
+new_diverged = r'''            DIVERGED)
+                log "Node $i state: DIVERGED - extra GTIDs exist outside the authoritative node 1 set."
+                divergence_workflow "$i" "$target"
+                ;;'''
+replace_once(old_diverged, new_diverged, 'standalone divergence flow')
+
+p.write_text(s)
