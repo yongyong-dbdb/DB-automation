@@ -47,16 +47,10 @@ new_cmd = r'''        printf 'mysqlbinlog --read-from-remote-server --base64-out
         shell_quote "--include-gtids=$include_gtids"; printf ' '''
 replace_once(old_cmd, new_cmd, 'fallback command quoting')
 
-old_size = r'''    log_count=$(awk 'END{print NR+0}' "$logs_file")
-
-    {
-        printf 'FIELD\tVALUE\n' '''
-new_size = r'''    log_count=$(awk 'END{print NR+0}' "$logs_file")
-    log_bytes=$(awk -F '\t' '{sum += $2} END{printf "%.0f",sum+0}' "$logs_file")
-
-    {
-        printf 'FIELD\tVALUE\n' '''
-replace_once(old_size, new_size, 'binary log byte calculation')
+replace_once(
+    "    log_count=$(awk 'END{print NR+0}' \"$logs_file\")\n",
+    "    log_count=$(awk 'END{print NR+0}' \"$logs_file\")\n    log_bytes=$(awk -F '\\t' '{sum += $2} END{printf \"%.0f\",sum+0}' \"$logs_file\")\n",
+    'binary log byte calculation')
 
 old_summary = r'''        printf 'LOG_BIN_BASENAME\t%s\n' "$binlog_basename"
         printf 'BINARY_LOG_COUNT\t%s\n' "$log_count"
