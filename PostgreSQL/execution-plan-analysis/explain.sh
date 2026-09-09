@@ -1,7 +1,7 @@
 #!/bin/sh
 set -u
 
-SCRIPT_VERSION="1.2.21"
+SCRIPT_VERSION="1.2.22"
 SCRIPT_DIR=$(CDPATH='' cd "$(dirname "$0")" && pwd)
 DEFAULT_OUTPUT_DIR="$SCRIPT_DIR/results"
 PSQL_BIN=${PSQL_BIN:-}
@@ -1064,7 +1064,7 @@ BIND_MAP_SQL
     } | run_psql -X -qAt -F '|' -v ON_ERROR_STOP=1 \
         -v sample_timeout="$BIND_SAMPLE_TIMEOUT" > "$bind_map" 2>"$work_dir/bind-map.err"; then
         : > "$bind_map"
-        echo 'Automatic bind-column mapping unavailable; manual selection will be offered.' >&2
+        echo 'Automatic bind-column mapping unavailable; SQL text fallback will be used.' >&2
     fi
 }
 
@@ -1165,6 +1165,151 @@ SQL
     } | run_psql -X -qAt -F '|' -v ON_ERROR_STOP=1 > "$bind_type_map" || return 1
 }
 
+build_bind_text_fallback_maps() {
+    bind_text_map="$work_dir/bind-text-map.txt"
+    bind_text_constant_map="$work_dir/bind-text-constant-map.txt"
+    : > "$bind_text_map"
+    : > "$bind_text_constant_map"
+
+    _source_sql=$(cat "$SQL_FILE")
+
+    if ! run_psql -X -qAt -F '|' -v ON_ERROR_STOP=1 \
+        -v source_sql="$_source_sql" -v bind_count="$BIND_COUNT" <<'SQL' > "$bind_text_map" 2>"$work_dir/bind-text-map.err"
+WITH src AS (
+    SELECT regexp_replace(:'source_sql', E'[\n\r\t]+', ' ', 'g') AS q
+), params AS (
+    SELECT generate_series(1, :'bind_count'::integer) AS n
+), patterns AS (
+    SELECT '(?:"(?:[^"]|"")+"|[a-z_][a-z_0-9$]*)'::text AS ident,
+           '(?:::(?:text|integer|bigint|smallint|numeric|boolean|date|uuid|character varying|double precision))?'::text AS cast_pattern
+), refs AS (
+    SELECT p.n, m.ref
+    FROM src s
+    CROSS JOIN params p
+    CROSS JOIN patterns x
+    CROSS JOIN LATERAL (
+        SELECT (z.m)[1] AS ref
+        FROM regexp_matches(
+                 s.q,
+                 '(' || x.ident || '(?:\.' || x.ident || ')?)\s*' || x.cast_pattern ||
+                 '\s*(?:=|<>|!=|<=|>=|<|>|~~\*?|!~~\*?)\s*\$' || p.n || '(?![0-9])' || x.cast_pattern,
+                 'gi') AS z(m)
+        UNION ALL
+        SELECT (z.m)[1] AS ref
+        FROM regexp_matches(
+                 s.q,
+                 '\$' || p.n || '(?![0-9])' || x.cast_pattern ||
+                 '\s*(?:=|<>|!=|<=|>=|<|>)\s*(' || x.ident || '(?:\.' || x.ident || ')?)\s*' || x.cast_pattern,
+                 'gi') AS z(m)
+    ) m
+), columns AS (
+    SELECT DISTINCT n,
+           ref,
+           (parse_ident(ref))[cardinality(parse_ident(ref))] AS column_name
+    FROM refs
+    WHERE cardinality(parse_ident(ref)) BETWEEN 1 AND 3
+), candidates AS (
+    SELECT DISTINCT c.n,
+           format('%I.%I', ns.nspname, cls.relname) AS relation,
+           c.column_name
+    FROM columns c
+    CROSS JOIN src s
+    JOIN pg_attribute a
+      ON a.attname = c.column_name
+     AND a.attnum > 0
+     AND NOT a.attisdropped
+    JOIN pg_class cls
+      ON cls.oid = a.attrelid
+     AND cls.relkind IN ('r','p','v','m','f')
+    JOIN pg_namespace ns
+      ON ns.oid = cls.relnamespace
+    WHERE ns.nspname NOT IN ('pg_catalog','information_schema')
+      AND position(lower(cls.relname) in lower(s.q)) > 0
+      AND has_table_privilege(cls.oid, 'SELECT')
+)
+SELECT n, relation, column_name
+FROM candidates
+WHERE relation !~ E'[|\n\r]'
+  AND column_name !~ E'[|\n\r]'
+ORDER BY n, relation, column_name;
+SQL
+    then
+        : > "$bind_text_map"
+    fi
+
+    if ! run_psql -X -qAt -F '|' -v ON_ERROR_STOP=1 \
+        -v source_sql="$_source_sql" -v bind_count="$BIND_COUNT" <<'SQL' > "$bind_text_constant_map" 2>"$work_dir/bind-text-constant-map.err"
+WITH src AS (
+    SELECT regexp_replace(:'source_sql', E'[\n\r\t]+', ' ', 'g') AS q
+), params AS (
+    SELECT generate_series(1, :'bind_count'::integer) AS n
+), patterns AS (
+    SELECT '(NULL|true|false|[-+]?[0-9]+(?:\.[0-9]+)?|''(?:[^'']|'''')*'')'::text AS literal,
+           '(?:::(?:text|integer|bigint|smallint|numeric|boolean|date|uuid|character varying|double precision))?'::text AS cast_pattern
+), found AS (
+    SELECT p.n, (z.m)[1] AS literal
+    FROM src s
+    CROSS JOIN params p
+    CROSS JOIN patterns x
+    CROSS JOIN LATERAL regexp_matches(
+        s.q,
+        x.literal || x.cast_pattern || '\s*(?:=|<>|!=|<=|>=|<|>)\s*\$' || p.n || '(?![0-9])' || x.cast_pattern,
+        'gi') AS z(m)
+    UNION ALL
+    SELECT p.n, (z.m)[1] AS literal
+    FROM src s
+    CROSS JOIN params p
+    CROSS JOIN patterns x
+    CROSS JOIN LATERAL regexp_matches(
+        s.q,
+        '\$' || p.n || '(?![0-9])' || x.cast_pattern || '\s*(?:=|<>|!=|<=|>=|<|>)\s*' || x.literal || x.cast_pattern,
+        'gi') AS z(m)
+), normalized AS (
+    SELECT n,
+           CASE
+             WHEN lower(literal) = 'null' THEN '\N'
+             WHEN literal LIKE '''%''' THEN replace(substr(literal, 2, length(literal)-2), '''''', '''')
+             WHEN lower(literal) = 'true' THEN 'true'
+             WHEN lower(literal) = 'false' THEN 'false'
+             ELSE literal
+           END AS default_value
+    FROM found
+), unique_value AS (
+    SELECT n, min(default_value) AS default_value
+    FROM normalized
+    GROUP BY n
+    HAVING count(DISTINCT default_value) = 1
+)
+SELECT n, default_value
+FROM unique_value
+WHERE default_value !~ E'[|\n\r]'
+ORDER BY n;
+SQL
+    then
+        : > "$bind_text_constant_map"
+    fi
+
+    if [ -s "$bind_text_map" ]; then
+        while IFS='|' read -r _p _rel _col; do
+            [ -n "$_p" ] && [ -n "$_rel" ] && [ -n "$_col" ] || continue
+            if ! awk -F'|' -v n="$_p" '$1==n {found=1} END{exit found?0:1}' "$bind_map"; then
+                printf '%s|%s|%s|3\n' "$_p" "$_rel" "$_col" >> "$bind_map"
+            fi
+        done < "$bind_text_map"
+    fi
+
+    if [ -s "$bind_text_constant_map" ]; then
+        while IFS='|' read -r _p _value; do
+            [ -n "$_p" ] || continue
+            if ! awk -F'|' -v n="$_p" '$1==n {found=1} END{exit found?0:1}' "$bind_constant_map"; then
+                printf '%s|%s\n' "$_p" "$_value" >> "$bind_constant_map"
+            fi
+        done < "$bind_text_constant_map"
+    fi
+
+    unset _source_sql
+}
+
 show_bind_candidates() {
     bind_default_available=no
     bind_default_value=
@@ -1217,24 +1362,15 @@ show_bind_candidates() {
             break
         done
     else
-        echo "No automatic relation candidate found for this parameter." >&2
-        echo "The following table/column is only used to look up example values; press Enter to skip candidate lookup." >&2
+        echo "안내: \$$bind_index 와 직접 연결되는 테이블/컬럼을 자동으로 찾지 못했습니다." >&2
+        echo "      테이블명을 수동 입력받지 않고 bind 값을 직접 입력하는 단계로 진행합니다." >&2
+        return 0
     fi
 
-    while :; do
-        if [ -z "$sample_relation" ] || [ -z "$sample_column" ]; then
-            printf 'Candidate source table for $%s (schema.table, empty to skip): ' "$bind_index" >&2
-            IFS= read -r sample_relation || return 1
-            [ -n "$sample_relation" ] || return 0
-            printf 'Candidate source column (exact name, empty to skip): ' >&2
-            IFS= read -r sample_column || return 1
-            [ -n "$sample_column" ] || return 0
-        fi
-
-        printf '\nTable value candidates for $%s (up to %s distinct values; not historical bind values)\n' "$bind_index" "$BIND_SAMPLE_LIMIT"
-        if run_psql -X -q -P pager=off -v ON_ERROR_STOP=1 \
-            -v sample_relation="$sample_relation" -v sample_column="$sample_column" \
-            -v sample_limit="$BIND_SAMPLE_LIMIT" -v sample_timeout="$BIND_SAMPLE_TIMEOUT" <<'SQL'
+    printf '\nTable value candidates for $%s (up to %s distinct values; not historical bind values)\n' "$bind_index" "$BIND_SAMPLE_LIMIT"
+    if run_psql -X -q -P pager=off -v ON_ERROR_STOP=1 \
+        -v sample_relation="$sample_relation" -v sample_column="$sample_column" \
+        -v sample_limit="$BIND_SAMPLE_LIMIT" -v sample_timeout="$BIND_SAMPLE_TIMEOUT" <<'SQL'
 BEGIN READ ONLY;
 SELECT set_config('statement_timeout', :'sample_timeout', true) AS sample_timeout \gset
 SELECT format(
@@ -1243,11 +1379,11 @@ SELECT format(
 \gexec
 COMMIT;
 SQL
-        then
-            bind_default_value=$(
-                run_psql -X -qAt -v ON_ERROR_STOP=1 \
-                    -v sample_relation="$sample_relation" -v sample_column="$sample_column" \
-                    -v sample_timeout="$BIND_SAMPLE_TIMEOUT" <<'SQL'
+    then
+        bind_default_value=$(
+            run_psql -X -qAt -v ON_ERROR_STOP=1 \
+                -v sample_relation="$sample_relation" -v sample_column="$sample_column" \
+                -v sample_timeout="$BIND_SAMPLE_TIMEOUT" <<'SQL'
 BEGIN READ ONLY;
 SELECT set_config('statement_timeout', :'sample_timeout', true) AS sample_timeout \gset
 SELECT format(
@@ -1256,18 +1392,17 @@ SELECT format(
 \gexec
 COMMIT;
 SQL
-            ) || bind_default_value=
-            if [ -n "$bind_default_value" ]; then
-                bind_default_available=yes
-                printf 'Default for $%s: %s\n' "$bind_index" "$bind_default_value"
-            fi
-            echo 'Candidates are distinct current table values and do not apply the original SQL filters.'
-            return 0
+        ) || bind_default_value=
+        if [ -n "$bind_default_value" ]; then
+            bind_default_available=yes
+            printf 'Default for $%s: %s\n' "$bind_index" "$bind_default_value"
         fi
-        echo 'Could not read candidates. Check table/column/permissions or retry; empty table skips candidates.' >&2
-        sample_relation=
-        sample_column=
-    done
+        echo 'Candidates are distinct current table values and do not apply the original SQL filters.'
+        return 0
+    fi
+
+    echo "주의: $sample_relation / $sample_column 후보 조회에 실패했습니다. bind 값 직접 입력으로 진행합니다." >&2
+    return 0
 }
 
 _bind_default=n
@@ -1297,6 +1432,7 @@ if [ "$BIND" = yes ]; then
     build_bind_map
     build_bind_constant_map
     build_bind_type_map || exit 1
+    build_bind_text_fallback_maps
     echo "Bind parameter count: $BIND_COUNT"
     echo 'Enter each value as plain text (no SQL quotes). \N means SQL NULL. If a default is shown, Enter accepts it.'
     printf 'EXECUTE pg_explain_target' > "$execute_file"
@@ -1580,6 +1716,17 @@ else
         echo "ERROR: Raw execution plan generation failed." | tee -a "$RESULT_FILE" >&2
         exit 1
     fi
+fi
+
+if [ "$BIND" = yes ] && grep -Eiq 'One-Time Filter:[[:space:]]*false' "$raw_plan_output"; then
+    {
+        echo
+        echo "주의: 실행 계획에 One-Time Filter: false가 확인되었습니다."
+        echo "      입력한 bind 값 조합으로 상수 조건이 FALSE가 되어 하위 relation scan이 제거된 상태입니다."
+        echo "      이는 EXPLAIN 오류가 아니라 해당 bind 값에 대한 실제 계획 결과입니다."
+        echo "      SQL 상수와 비교되는 bind는 표시된 자동 기본값을 사용했는지 확인하세요."
+        echo
+    } | tee -a "$RESULT_FILE"
 fi
 
 render_plan_summary "$tree_plan_json" "$raw_plan_output" > "$plan_summary" || { echo "ERROR: Plan Summary generation failed." >&2; exit 1; }
