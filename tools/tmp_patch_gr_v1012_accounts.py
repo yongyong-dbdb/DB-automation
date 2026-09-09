@@ -23,7 +23,7 @@ export_source_accounts() {
     printf '%s\n' 'SET SESSION sql_log_bin=0;' >> "$account_sql"
     while IFS= read -r account; do
         [ -n "$account" ] || continue
-        case $account in *';'*|*$'\n'*) die 'Unexpected account literal from Source';; esac
+        case $account in *';'*) die 'Unexpected account literal from Source';; esac
         printf 'DROP USER IF EXISTS %s;\n' "$account" >> "$account_sql"
         if hasvar 1 print_identified_with_as_hex; then
             create=$(sql 1 "SET SESSION print_identified_with_as_hex=ON; SHOW CREATE USER $account;" | cut -f2-)
