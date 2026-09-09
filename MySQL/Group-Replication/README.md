@@ -1,4 +1,4 @@
-# MySQL GR 전환 자동화 v1.0.1
+# MySQL GR 전환 자동화 v1.0.2
 
 작성 기준: 2026-09-09. 전체 실행 코드: `mysql_gr_migrate.sh`.
 
@@ -9,7 +9,8 @@ GTID 비동기 복제 또는 Standalone에서 Group Replication을 구성하는 
 | 전환 방식 | GTID replication → GR / Standalone → GR |
 | GR 모드 | Single Primary / Multi Primary |
 | 멤버 수 | 2~9개, 실행 시 입력 |
-| 인스턴스 접속 | 로컬 Unix Socket / 원격 TCP |
+| 인스턴스 접속 | 로컬 Unix Socket / 원격 MySQL TCP |
+| 원격 OS 설정 | SSH 자동 적용 / 대상 서버에서 실행할 전체 Helper 복사 |
 | 초기 데이터 | 비어 있는 인스턴스에 전체 업무 DB dump / 이미 준비된 데이터 / 외부 초기화 |
 | 설정 Profile | minimum / production |
 | 복구 계정 | 신규 최소 권한 계정 / 기존 계정 검증 |
@@ -68,7 +69,7 @@ sh mysql_gr_migrate.sh discover
 | 단계 | 동작과 변경 범위 |
 |---|---|
 | discover | 전환 방식·Primary 모드·멤버·접속·광고 주소·XCom 포트·TLS 수집. DB 변경 없음 |
-| configure | 버전별 런타임 변수 확인 후 필수 cnf 조각 생성. 로컬 적용은 선택. 원본 옆 백업과 실제 mysqld 바이너리의 `--validate-config` 확인 후 적용 |
+| configure | 버전별 런타임 변수 확인 후 필수 cnf 조각 생성. 로컬 및 SSH 원격 적용은 선택. SSH 미사용 시 복사할 Helper 출력. 원본 옆 백업과 실제 mysqld 바이너리의 `--validate-config` 확인 후 적용 |
 | precheck | UUID·server_id·동일 버전·GR 필수 변수·필터·직접 Source 연결·테이블 키·엔진·XA·TLS·포트 검사 |
 | initialize | 애플리케이션 중단 확인, 전체 멤버 쓰기 차단·Event Scheduler 중지, Source GTID 고정, 기존 Replica 추격 또는 신규 노드 dump 적재, 스키마/업무 검증 |
 | cutover | 사전 조건 재확인, 선택한 async Channel만 STOP, GR Plugin·SET PERSIST·복구 계정 설정, Node 1 한 번만 Bootstrap, 나머지 Join, 모드별 검증 |
@@ -87,7 +88,7 @@ sh mysql_gr_migrate.sh discover
 - 여러 로컬 인스턴스가 같은 cnf를 사용하는 경우에는 자동 편집을 차단한다. 인스턴스별 그룹 구성을 확인한 뒤 직접 적용한다.
 - 실제 PID의 cgroup과 systemd MainPID가 일치할 때 선택한 서비스만 재시작한다.
 - 단독 직접 기동은 원래 바이너리·인자·`--defaults-file`·Datadir 소유자를 확인한 경우에만 선택적으로 재시작한다. `mysqld_safe` 등 Supervisor 또는 기동 방식이 불명확하면 해당 Launcher를 통해 수동 재시작한다.
-- 원격 인스턴스의 cnf 변경·서비스 재시작은 SSH로 실행하지 않는다. 생성된 설정을 해당 서버에서 적용·재시작한 뒤 precheck를 재실행한다.
+- 원격 인스턴스는 `configure`에서 `ssh/manual`을 선택한다. SSH로 실제 cnf·PID·UUID를 확인한 뒤 백업·검증·적용·재시작하거나, 동일 검증을 수행하는 Helper를 해당 서버로 복사해 실행한다.
 - GR Plugin은 `INSTALL PLUGIN`으로 설치한다. 추가적인 `plugin_load_add` 중복 설정을 만들지 않는다.
 - GR 자체 설정은 지원 변수를 확인한 후 `SET PERSIST`로 저장한다. 기존 `mysqld-auto.cnf` 값이 cnf보다 우선할 수 있으므로 최종 런타임 검증을 통과해야 한다.
 
@@ -135,7 +136,7 @@ XCom의 Incremental Recovery 계정에는 `REPLICATION SLAVE`, `CONNECTION_ADMIN
 
 - Oracle MySQL **8.0.27 이상 8.0.x, 8.4.x, 9.7.x**를 지원 대상으로 구현했다. 초기 그룹 구성은 정확히 같은 서버 버전만 허용한다. 다른 9.x 버전, MariaDB, Percona 및 업그레이드 중 혼합 버전은 차단한다.
 - IPv4/DNS, XCom 사용. IPv6, NAT/외부 포트 매핑, MYSQL 통신 Stack, Multi-source/복제 필터, 기존 활성 그룹 재구성은 별도 구현 대상이다.
-- 인증서 생성·배포, 원격 SSH 작업, 자동 Failover/Router 설정, Physical Backup/Clone 자체 수행은 포함하지 않는다. 활성 Clone Plugin이 있으면 의도치 않은 Clone 복구를 방지하기 위해 사전 검증에서 중단한다.
+- 인증서 생성·배포, 자동 Failover/Router 설정, Physical Backup/Clone 자체 수행은 포함하지 않는다. 활성 Clone Plugin이 있으면 의도치 않은 Clone 복구를 방지하기 위해 사전 검증에서 중단한다.
 - 셸 문법 및 모의 SQL 회귀 검증은 수행했다. 이 개발 환경에는 MySQL 서버가 없어 **실제 3개 인스턴스에서 GTID/Standalone → Single/Multi 전환을 수행한 통합 검증은 미실시**다. 이 버전을 실서버 검증 완료로 간주하면 안 된다.
 - `VALIDATION.md`에 통과한 검증 항목과 범위를 기록했다. `python3 test_gr.py`로 모의 검증을 재현할 수 있다.
 
@@ -143,7 +144,7 @@ XCom의 Incremental Recovery 계정에는 `REPLICATION SLAVE`, `CONNECTION_ADMIN
 
 사용자 문서:
 
-- [Replication(GTID) 구축 자동화 v1.0.13](https://app.notion.com/p/Replication-GTID-3d0dd8bb770e80ac92b5d2431c0242e8)
+- [Replication(GTID) 구축 자동화 v1.0.23](https://app.notion.com/p/Replication-GTID-3d0dd8bb770e80ac92b5d2431c0242e8)
 - [Group Replication](https://app.notion.com/p/Group-Replication-35fdd8bb770e80148b96e507cb48246d)
 - [Group Replication 구성](https://app.notion.com/p/363dd8bb770e808f9cd0f6c48aa0ab54)
 
@@ -164,9 +165,72 @@ XCom의 Incremental Recovery 계정에는 `REPLICATION SLAVE`, `CONNECTION_ADMIN
 
 `discover` 도중 중단되어 `meta/count`만 남은 경우, 등록 정보를 `discovery_backups/시간_PID/`에 보존하고 처음부터 다시 입력받는다. 기존 작업 디렉터리 전체를 삭제하거나 DB를 초기화하지 않는다. 등록 완료 파일이나 설정·초기화·전환 진행 흔적이 있으면 자동 재등록을 차단한다. `discover` 실패 안내는 DB 변경을 수행하지 않았음을 구분해 표시한다.
 
-기존 파일을 v1.0.1 전체 코드로 교체한 뒤 같은 작업 디렉터리에서 재실행한다. 파일명을 `gr_migrate.sh`로 저장한 경우:
+기존 파일을 v1.0.2 전체 코드로 교체한 뒤 같은 작업 디렉터리에서 재실행한다. 파일명을 `gr_migrate.sh`로 저장한 경우:
 
 ```sh
 sh gr_migrate.sh --version
 sh gr_migrate.sh discover
 ```
+
+## v1.0.2 — 원격 cnf 적용 및 복사 방식
+
+기존 `discover` 등록을 유지한 채 `sh gr_migrate.sh configure`를 실행한다. 원격으로 등록된 각 인스턴스에서 `ssh/manual`을 선택한다. Primary부터 등록 순서대로 처리하며, Secondary의 수동 작업을 마친 후 `precheck`로 전체 런타임을 확인한다.
+
+### 이전 GTID 설정 정보 활용
+
+기존 GTID 쉘의 `.mysql_gtid_replication.state`에는 `SOURCE_CNF`, `REPLICA_CNF`가 있다. 다만 원격 처리에서 값이 비어 있을 수 있으므로 존재 여부를 확인한다. 접속 Socket 또는 Host·Port가 일치하는 항목의 경로만 후보로 가져온다. 해당 경로가 현재 사용 중인지 실제 대상 서버에서 다시 검증한다. 새로 추가하는 세 번째 인스턴스의 경로는 별도로 탐지한다.
+
+기존 상태 파일이 다른 위치에 있으면:
+
+```sh
+export MYSQL_GR_GTID_STATE_FILE=/actual/path/.mysql_gtid_replication.state
+sh gr_migrate.sh configure
+```
+
+상태 파일을 쉘 코드로 실행하거나 `source/eval`하지 않는다. 기존 스크립트가 쓴 단순 따옴표 값만 읽는다. 복잡한 인용 형태는 자동으로 해석하지 않고 경로를 직접 선택한다.
+
+### SSH 사용 가능
+
+1. SSH Host·Port·OS 계정과 선택적인 개인키 경로 입력. SSH Port 기본값은 현재 SSH 설정에서 조회한다.
+2. 현재 OS 권한 또는 `sudo -n` 사용 선택. SSH 비밀번호/키 암호는 OpenSSH가 처리한다. `sshpass`를 사용하지 않는다.
+3. 대상 서버의 로컬 Socket으로 재접속해 Controller가 조회한 UUID·Datadir·Socket·PID File과 일치하는지 확인. Socket 인증이 다르면 별도 MySQL 계정을 입력한다.
+4. 실행 중인 PID·바이너리·`--defaults-file`·런타임 변수의 `VARIABLE_PATH`로 현재 cnf 후보 확인 및 선택.
+5. 현재 cnf 내용으로 수정 후보를 만들고, 실제 mysqld 바이너리의 `--validate-config`로 검증. 기존 명령행 Override를 유지한다.
+6. 적용 확인 후 원본 옆에 버전/시간별 백업 생성·내용 비교, 파일 권한과 소유권·파일 메타데이터를 보존한 후보로 교체.
+7. 선택한 경우 해당 인스턴스만 재시작. 재접속 후 UUID와 생성한 설정의 실제 Runtime 값까지 비교한다.
+
+systemd는 실제 MainPID가 일치하는 서비스만 사용한다. 직접 기동은 기존 실행 인자를 재사용하고, mysqld_safe는 확인된 기존 Wrapper 인자·작업 디렉터리·실행 OS 계정을 유지한다. Launcher가 불명확하거나 OS 권한이 부족하면 자동 재시작을 차단한다. SSH Host Key 검증은 해제하지 않는다.
+
+### SSH 불가 / 사용자가 복사하여 적용
+
+`manual`을 선택하면 `runs/실행번호/node_번호_apply_config.sh`를 생성하고 전체 내용을 화면에 출력할지 묻는다. SSH 점검 실패 또는 ssh 명령 미설치 시에도 이 경로를 제공한다. 파일 전송이 어려우면 화면의 Helper 전체 내용을 복사해서 Secondary 서버에 파일로 저장한다.
+
+예를 들어 Node 2에서는:
+
+```sh
+sh node_2_apply_config.sh
+```
+
+Helper는 해당 서버에서 아래 순서로 실행한다.
+
+1. 로컬 Socket 접속용 MySQL 계정·비밀번호 입력. 생성된 Helper에는 비밀번호가 없다.
+2. 실제 인스턴스 정보와 현재 사용하는 cnf 확인·경로 선택.
+3. **현재 cnf 내용을 복사해 기존 설정을 유지하는 후보 파일 생성 → 필요한 설정 병합 → 전체 수정 후보 내용을 화면에 출력.**
+4. 실제 mysqld로 검증 후 사용자가 `APPLY`를 입력했을 때만 원본 백업·내용 비교·교체.
+5. 재시작 여부를 별도로 선택. 재시작했다면 UUID와 실제 설정값 검증.
+
+원본을 새 설정 조각으로 통째로 덮어쓰지 않는다. 중복 실행 잠금, 기존 cnf 공유 여부, 동시 외부 수정 여부를 검사한다. 심볼릭 링크·하드 링크, 그룹별 옵션 파일 등 자동 편집 대상을 확정하기 어려운 구성은 중단한다.
+
+**SSH 접속 불가와 MySQL/GR 통신 불가는 구분한다.** Controller의 MySQL TCP 접속은 원격 인스턴스 등록·검증에 필요하다. 그룹 구성 완료에는 멤버 간 MySQL 복구 연결과 XCom 통신이 필요하다. 네트워크가 모두 차단된 상태를 파일 복사만으로 GR 정상 구성 상태로 만들 수는 없다.
+
+### 의존성과 검증 범위
+
+실행은 POSIX sh·기존 MySQL 클라이언트·Linux 기본 명령을 사용한다. SSH 방식을 선택할 때만 기존 OpenSSH를 사용한다. sudo는 선택 사항이다. `pip`, `npm`, `sshpass`, MySQL Shell 및 외부 Python 모듈을 설치/사용하지 않는다.
+
+추가 검증은 임시 파일과 모의 명령으로 수행했다. 실제 원격 SSH 로그인·systemd/mysqld_safe 재기동·실제 MySQL GR 전환 통합 검증은 미실시다. 구체적인 검증 항목은 `VALIDATION.md`를 참조한다.
+
+추가 공식 참고:
+
+- [OpenSSH ssh](https://man.openbsd.org/ssh)
+- [MySQL Server Configuration Validation](https://dev.mysql.com/doc/refman/8.4/en/server-configuration-validation.html)
+- [MySQL variables_info](https://dev.mysql.com/doc/refman/8.0/en/performance-schema-variables-info-table.html)

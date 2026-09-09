@@ -1,11 +1,11 @@
 #!/bin/sh
-# mysql_gr_migrate.sh v1.0.1
+# mysql_gr_migrate.sh v1.0.2
 # POSIX sh; OS utilities and MySQL clients only. No external language packages.
 # Supported: Oracle MySQL 8.0.27+, 8.4.x, 9.7.x; homogeneous exact versions.
 # Single-primary or multi-primary / XCom. Never resets GTID or binary logs.
 set -eu
 umask 077
-VERSION=1.0.1
+VERSION=1.0.2
 ROOT=${MYSQL_GR_WORK_ROOT:-"$(pwd)/mysql_gr_work"}
 MYSQL=${MYSQL_GR_MYSQL:-mysql}
 DUMP=${MYSQL_GR_MYSQLDUMP:-mysqldump}
@@ -25,7 +25,7 @@ required() (
 confirm() { [ "$(ask "Type $1 to continue" '')" = "$1" ] || die 'Cancelled.'; }
 uint() { case $1 in ''|*[!0-9]*) return 1;; *) return 0;; esac; }
 port_ok() { uint "$1" && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
-safe_host() { case $1 in ''|*[!a-zA-Z0-9_.-]*) die 'Use an IPv4 address or DNS name (IPv6 is not supported in v1.0.1).';; esac; }
+safe_host() { case $1 in ''|*[!a-zA-Z0-9_.-]*) die 'Use an IPv4 address or DNS name (IPv6 is not supported in v1.0.2).';; esac; }
 q() { printf '%s' "$1" | sed "s/\\\\/\\\\\\\\/g; s/'/''/g"; }
 optq() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 put() { printf '%s\n' "$3" > "$ROOT/$1/$2"; }
@@ -81,8 +81,9 @@ Usage: sh mysql_gr_migrate.sh discover|configure|precheck|initialize|cutover|joi
   all        Run the complete interactive workflow
 Environment: MYSQL_GR_WORK_ROOT, MYSQL_GR_MYSQL, MYSQL_GR_MYSQLDUMP
 Use the same absolute MYSQL_GR_WORK_ROOT for every invocation.
-No SSH/repository/package installation required. Remote cnf/restart is performed
-on that host using the generated snippet, then configure/precheck is rerun.
+Remote configure offers ssh or manual. SSH uses the existing OpenSSH client;
+manual emits a password-free helper to copy/run on the target host. No packages
+are installed. MYSQL_GR_GTID_STATE_FILE can point to an existing GTID state file.
 Credentials are prompted each run and deleted from temporary files on exit.
 EOF
 }
@@ -392,6 +393,395 @@ restart_direct() (
     else "$exe" "$@" --daemonize; fi
     wait_connection "$i"
 )
+# Values travel as shell-quoted assignments on SSH stdin, never command arguments.
+shell_quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+ssh_options() {
+    ssh_node=$1
+    command -v ssh >/dev/null 2>&1 || die 'OpenSSH client is required for remote OS management; no packages are installed automatically.'
+    if [ ! -f "$ROOT/$ssh_node/ssh_host" ]; then
+        ssh_host=$(required "Node $ssh_node SSH host" "$(get "$ssh_node" host)"); safe_host "$ssh_host"
+        case $ssh_host in -*) die 'Invalid SSH host';; esac
+        ssh_defaults=$(ssh -G "$ssh_host")
+        ssh_port=$(required 'SSH port' "$(printf '%s\n' "$ssh_defaults" | awk '$1=="port" {print $2;exit}')")
+        port_ok "$ssh_port" || die 'Invalid SSH port'
+        ssh_user=$(required 'SSH OS user' "$(printf '%s\n' "$ssh_defaults" | awk '$1=="user" {print $2;exit}')")
+        case $ssh_user in ''|-*|*[!A-Za-z0-9_.-]*) die 'Invalid SSH OS user';; esac
+        ssh_key=$(ask 'SSH private key path (blank = SSH config/agent/password)' '')
+        [ -z "$ssh_key" ] || [ -r "$ssh_key" ] || die 'SSH key is not readable'
+        privilege=$(required 'Remote OS privilege (current/sudo)' current)
+        case $privilege in current|sudo) :;; *) die 'Choose current or sudo';; esac
+        log 'sudo uses sudo -n: configure the required OS permissions first. SSH passwords are handled by OpenSSH; they are not stored by this script.'
+        put "$ssh_node" ssh_host "$ssh_host"; put "$ssh_node" ssh_port "$ssh_port"
+        put "$ssh_node" ssh_user "$ssh_user"; put "$ssh_node" ssh_key "$ssh_key"
+        put "$ssh_node" ssh_privilege "$privilege"
+    fi
+    if [ ! -f "$TEMP/$ssh_node.remote.cnf" ]; then
+        credential "$ssh_node"
+        choice=$(required "Node $ssh_node socket DB credentials (same/other)" same)
+        case $choice in
+            same) sed -n '/^user=/p; /^password=/p' "$TEMP/$ssh_node.cnf" > "$TEMP/$ssh_node.remote.cnf";;
+            other)
+                u=$(required 'Remote socket MySQL admin user' '')
+                pw=$(secret 'Remote socket MySQL admin password')
+                printf 'user="%s"\npassword="%s"\n' "$(optq "$u")" "$(optq "$pw")" > "$TEMP/$ssh_node.remote.cnf"
+                unset pw;;
+            *) die 'Choose same or other';;
+        esac
+    fi
+}
+ssh_transport() (
+    i=$1
+    set -- -T -o StrictHostKeyChecking=ask -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -p "$(get "$i" ssh_port)" -l "$(get "$i" ssh_user)"
+    key=$(get "$i" ssh_key)
+    [ -z "$key" ] || set -- "$@" -i "$key"
+    remote_command='sh -s'
+    [ "$(get "$i" ssh_privilege)" != sudo ] || remote_command='sudo -n sh -s'
+    ssh "$@" -- "$(get "$i" ssh_host)" "$remote_command"
+)
+remote_call() (
+    i=$1; action=$2; snippet=${3:-}; restart=${4:-no}
+    credential "$i"
+    payload="$TEMP/remote_${i}_${action}.sh"
+    {
+        printf 'set -eu\numask 077\n'
+        printf 'ACTION=%s\n' "$(shell_quote "$action")"
+        printf 'EXPECTED_UUID=%s\n' "$(shell_quote "$(get "$i" uuid)")"
+        printf 'EXPECTED_DATA=%s\n' "$(shell_quote "$(val "$i" datadir)")"
+        printf 'EXPECTED_SOCKET=%s\n' "$(shell_quote "$(val "$i" socket)")"
+        printf 'EXPECTED_PID_FILE=%s\n' "$(shell_quote "$(val "$i" pid_file)")"
+        printf 'BASEDIR=%s\n' "$(shell_quote "$(val "$i" basedir)")"
+        printf 'CNF=%s\n' "$(shell_quote "$(get "$i" cnf)")"
+        printf 'CLIENT_AUTH=%s\n' "$(shell_quote "$(cat "$TEMP/$i.remote.cnf")")"
+        printf 'SNIPPET=%s\n' "$(shell_quote "$(if [ -n "$snippet" ]; then cat "$snippet"; fi)")"
+        printf 'DO_RESTART=%s\n' "$(shell_quote "$restart")"
+        printf 'VERSION=%s\n' "$(shell_quote "$VERSION")"
+        remote_agent
+    } > "$payload"
+    # Capture the SSH exit status directly; a pipeline/tee must not hide failure.
+    if ssh_transport "$i" < "$payload" > "$RUN/node_${i}.remote_${action}.tsv"; then
+        rm -f "$payload"
+        cat "$RUN/node_${i}.remote_${action}.tsv"
+    else
+        rm -f "$payload"
+        cat "$RUN/node_${i}.remote_${action}.tsv" >&2
+        die "Node $i remote $action failed. Inspect SSH/server errors and retained configuration backups; no automatic database rollback."
+    fi
+)
+remote_agent() {
+    cat <<'REMOTE_AGENT'
+r_die() { printf 'REMOTE ERROR: %s\n' "$*" >&2; exit 1; }
+r_sql() { printf '%s\n' "$1" | "$RMYSQL" --defaults-file="$RTMP/client.cnf" --no-login-paths --batch --raw --skip-column-names; }
+r_cleanup() {
+    r_rc=$?; trap - 0 1 2 15
+    [ -z "${CANDIDATE:-}" ] || rm -f -- "$CANDIDATE"
+    [ -z "${CFGLOCK:-}" ] || rmdir "$CFGLOCK" 2>/dev/null || :
+    [ -z "${RTMP:-}" ] || rm -rf -- "$RTMP"
+    exit "$r_rc"
+}
+r_identity() {
+    actual=$(r_sql "SELECT CONCAT(@@server_uuid,'|',@@datadir,'|',@@socket,'|',@@pid_file);")
+    [ "$actual" = "$EXPECTED_UUID|$EXPECTED_DATA|$EXPECTED_SOCKET|$EXPECTED_PID_FILE" ] || r_die 'Remote socket instance differs from the controller SQL endpoint.'
+    RPID=$(cat "$EXPECTED_PID_FILE")
+    case $RPID in ''|*[!0-9]*) r_die 'Invalid runtime PID file';; esac
+    REXE=$(readlink -f "/proc/$RPID/exe")
+    case ${REXE##*/} in mysqld|mysqld-debug) :;; *) r_die 'PID is not mysqld';; esac
+    tr '\000' '\n' < "/proc/$RPID/cmdline" > "$RTMP/argv"
+    RCWD=$(readlink -f "/proc/$RPID/cwd")
+    ROWNER=$(stat -c %U "$EXPECTED_DATA")
+    RUID=$(stat -c %u "$EXPECTED_DATA")
+    RSTART=$(awk '{print $22}' "/proc/$RPID/stat")
+    RDEFAULT=$(sed -n 's/^--defaults-file=//p' "$RTMP/argv" | head -n 1)
+    RPARENT=$(awk '{print $4}' "/proc/$RPID/stat")
+    PNAME=$(cat "/proc/$RPARENT/comm" 2>/dev/null || :)
+    RSERVICE=$(sed -n 's#.*\/\([^/]*\.service\)$#\1#p' "/proc/$RPID/cgroup" | head -n 1)
+    RMETHOD=unknown
+    if [ -n "$RSERVICE" ] && command -v systemctl >/dev/null 2>&1 && [ "$(systemctl show "$RSERVICE" -p MainPID --value)" = "$RPID" ]; then
+        RMETHOD=systemd
+    else
+        case $PNAME in
+            mysqld_safe)
+                RMETHOD=mysqld_safe
+                tr '\000' '\n' < "/proc/$RPARENT/cmdline" > "$RTMP/safe_argv"
+                SAFE_CWD=$(readlink -f "/proc/$RPARENT/cwd")
+                SAFESTART=$(awk '{print $22}' "/proc/$RPARENT/stat")
+                SAFEUID=$(stat -c %u "/proc/$RPARENT")
+                [ "$(id -u)" = "$SAFEUID" ] || RMETHOD=unknown
+                # Preserve exact interpreter/script arguments; reject unknown wrappers.
+                grep -E '^(/[^[:cntrl:]]*/)?mysqld_safe$' "$RTMP/safe_argv" >/dev/null || RMETHOD=unknown;;
+            bash|sh|dash|init|systemd) RMETHOD=direct;;
+        esac
+    fi
+    r_sql "SELECT DISTINCT VARIABLE_PATH FROM performance_schema.variables_info WHERE VARIABLE_PATH<>'' ORDER BY VARIABLE_PATH;" > "$RTMP/candidates"
+    [ -z "$RDEFAULT" ] || printf '%s\n' "$RDEFAULT" >> "$RTMP/candidates"
+    sort -u "$RTMP/candidates" -o "$RTMP/candidates"
+}
+r_config_guard() {
+    case $CNF in /*) :;; *) r_die 'Choose an absolute remote configuration path';; esac
+    [ -f "$CNF" ] && [ ! -L "$CNF" ] || r_die 'Configuration must be a regular non-symlink file'
+    [ "$(stat -c %h "$CNF")" = 1 ] || r_die 'Hard-linked config requires manual review'
+    [ -w "$CNF" ] && [ -w "$(dirname "$CNF")" ] || r_die 'Insufficient OS permission to back up/apply config'
+    if [ -n "$RDEFAULT" ]; then
+        [ "$(readlink -f "$RDEFAULT")" = "$(readlink -f "$CNF")" ] || r_die 'Selected cnf is not the process --defaults-file'
+    else
+        grep -Fx -- "$CNF" "$RTMP/candidates" >/dev/null || r_die 'Selected config was not observed in runtime variable sources'
+    fi
+    grep -E '^--(no-defaults|defaults-group-suffix)(=|$)' "$RTMP/argv" >/dev/null && r_die 'Per-group/no-defaults startup needs separate configuration handling'
+    # Refuse a config explicitly used by another mysqld; default-file-less peers
+    # are also ambiguous when this server uses the default search path.
+    for proc in /proc/[0-9]*/cmdline; do
+        [ "$proc" != "/proc/$RPID/cmdline" ] || continue
+        [ -r "$proc" ] || continue
+        other_exe=$(readlink -f "${proc%/cmdline}/exe" 2>/dev/null || :)
+        case ${other_exe##*/} in mysqld|mysqld-debug) :;; *) continue;; esac
+        tr '\000' '\n' < "$proc" > "$RTMP/other_argv" || r_die 'Cannot inspect another mysqld'
+        other_cnf=$(sed -n 's/^--defaults-file=//p' "$RTMP/other_argv" | head -n 1)
+        if [ -n "$other_cnf" ]; then
+            [ "$(readlink -f "$other_cnf")" != "$(readlink -f "$CNF")" ] || r_die 'Another mysqld shares this configuration'
+        elif [ -z "$RDEFAULT" ]; then r_die 'Multiple mysqld processes use default configuration search paths'; fi
+    done
+}
+r_restart_guard() {
+    [ "$RMETHOD" != unknown ] || r_die 'Cannot safely identify the remote launcher; configuration can be applied with restart=no'
+    if [ "$RMETHOD" != systemd ]; then
+        [ "$(id -u)" = 0 ] || [ "$(id -u)" = "$RUID" ] || r_die 'Direct restart requires root or datadir owner'
+        [ -n "$RDEFAULT" ] || r_die 'Direct restart requires explicit --defaults-file'
+    fi
+}
+r_validate_candidate() {
+    # Keep command-line overrides and defaults-extra-file; replace only defaults-file.
+    set -- "--defaults-file=$CANDIDATE"
+    first=yes
+    while IFS= read -r arg; do
+        if [ "$first" = yes ]; then first=no; continue; fi
+        case $arg in --defaults-file=*|--daemonize|--daemonize=*) continue;; esac
+        set -- "$@" "$arg"
+    done < "$RTMP/argv"
+    if [ "$(id -u)" = 0 ]; then set -- "$@" "--user=$ROWNER"; fi
+    (cd "$RCWD"; "$REXE" "$@" --validate-config) > "$VALIDATE_LOG" 2>&1 || r_die "Config validation failed; original unchanged. Log: $VALIDATE_LOG"
+}
+r_same_process() {
+    [ "$(awk '{print $22}' "/proc/$RPID/stat" 2>/dev/null || :)" = "$RSTART" ] || r_die 'mysqld process changed during the operation'
+}
+r_wait_exit() {
+    pid=$1; start=$2; attempts=0
+    while [ "$(awk '{print $22}' "/proc/$pid/stat" 2>/dev/null || :)" = "$start" ]; do
+        [ "$attempts" -lt 150 ] || r_die 'Shutdown timed out; no replacement process launched'
+        sleep 2; attempts=$((attempts+1))
+    done
+}
+r_runtime_check() {
+    printf '%s\n' "$SNIPPET" > "$RTMP/expected_settings"
+    while IFS='=' read -r key wanted; do
+        case $key in ''|'#'*|'['*) continue;; *[!a-z_]*) r_die 'Unexpected generated variable name';; esac
+        [ "$key" != log_bin ] || wanted=ON
+        actual=$(r_sql "SELECT @@GLOBAL.$key;")
+        case "$wanted:$actual" in ON:1|ON:ON|OFF:0|OFF:OFF) :;;
+            *) [ "$actual" = "$wanted" ] || r_die "Runtime $key=$actual differs from $wanted; inspect persisted variables and command-line overrides";;
+        esac
+    done < "$RTMP/expected_settings"
+    printf 'RUNTIME_CONFIG\tPASSED\n'
+}
+r_restart() {
+    r_same_process
+    if [ "$RMETHOD" = systemd ]; then
+        [ "$(systemctl show "$RSERVICE" -p MainPID --value)" = "$RPID" ] || r_die 'Service MainPID changed'
+        systemctl restart "$RSERVICE" || r_die 'systemd restart failed'
+    else
+        # SQL SHUTDOWN tells mysqld_safe to exit instead of restarting a crashed child.
+        r_sql 'SHUTDOWN;' || r_die 'SQL shutdown failed'
+        r_wait_exit "$RPID" "$RSTART"
+        if [ "$RMETHOD" = mysqld_safe ]; then
+            r_wait_exit "$RPARENT" "$SAFESTART"
+            set --
+            while IFS= read -r arg; do set -- "$@" "$arg"; done < "$RTMP/safe_argv"
+            (cd "$SAFE_CWD"; nohup "$@" </dev/null >> "$START_LOG" 2>&1 &) 
+        else
+            set --; first=yes
+            while IFS= read -r arg; do
+                if [ "$first" = yes ]; then first=no; continue; fi
+                case $arg in --daemonize|--daemonize=*) continue;; esac
+                set -- "$@" "$arg"
+            done < "$RTMP/argv"
+            if [ "$(id -u)" = 0 ]; then set -- "$@" "--user=$ROWNER"; fi
+            (cd "$RCWD"; "$REXE" "$@" --daemonize) >> "$START_LOG" 2>&1 || r_die "Direct startup failed; inspect $START_LOG"
+        fi
+    fi
+    attempts=0
+    while [ "$attempts" -lt 90 ]; do
+        actual=$(r_sql 'SELECT @@server_uuid;' 2>/dev/null || :)
+        if [ "$actual" = "$EXPECTED_UUID" ]; then r_runtime_check; printf 'RESTART\tOK\n'; return; fi
+        [ -z "$actual" ] || r_die 'Unexpected instance after restart'
+        sleep 2; attempts=$((attempts+1))
+    done
+    r_die 'Restarted instance did not reconnect; preserve backup and inspect server logs'
+}
+r_main() {
+    RTMP=$(mktemp -d "${TMPDIR:-/tmp}/mysql_gr_remote.XXXXXX")
+    trap r_cleanup 0; trap 'exit 130' 2; trap 'exit 143' 1 15
+    RMYSQL="${BASEDIR%/}/bin/mysql"
+    [ -x "$RMYSQL" ] || RMYSQL=$(command -v mysql) || r_die 'Remote mysql client not found'
+    escaped_socket=$(printf '%s' "$EXPECTED_SOCKET" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    printf '[client]\n%s\nprotocol=SOCKET\nsocket="%s"\nconnect-timeout=10\n' "$CLIENT_AUTH" "$escaped_socket" > "$RTMP/client.cnf"
+    unset CLIENT_AUTH
+    r_identity
+    printf 'UUID\t%s\nPID\t%s\nBINARY\t%s\nLAUNCHER\t%s\nSERVICE\t%s\n' "$EXPECTED_UUID" "$RPID" "$REXE" "$RMETHOD" "$RSERVICE"
+    [ ! -r /etc/machine-id ] || printf 'HOST_ID\t%s\n' "$(cat /etc/machine-id)"
+    printf 'DEFAULT_CNF\t%s\n' "$RDEFAULT"
+    while IFS= read -r f; do printf 'CANDIDATE\t%s\n' "$f"; done < "$RTMP/candidates"
+    [ "$ACTION" != inspect ] || return 0
+    if [ "$ACTION" = manual ]; then
+        [ -n "$CNF" ] || CNF=$RDEFAULT
+        printf 'Actual main cnf path [%s]: ' "$CNF" >&2
+        IFS= read -r chosen || r_die 'Input ended'; CNF=${chosen:-$CNF}
+    fi
+    r_config_guard
+    [ "$DO_RESTART" != yes ] || r_restart_guard
+    CFGLOCK="${CNF}.gr_lock"; mkdir "$CFGLOCK" || { CFGLOCK=''; r_die 'Remote config is locked by another operation'; }
+    stamp="v${VERSION}_$(date +%Y%m%d_%H%M%S)_$$"
+    VALIDATE_LOG="${CNF}.gr_validate_${stamp}.log"
+    START_LOG="${CNF}.gr_start_${stamp}.log"
+    CANDIDATE=$(mktemp "${CNF}.gr_candidate.XXXXXX")
+    cp -a "$CNF" "$CANDIDATE"
+    cp -a "$CNF" "$RTMP/original.cnf"
+    sed '/^# BEGIN mysql_gr_migrate$/,/^# END mysql_gr_migrate$/d' "$CNF" > "$RTMP/config"
+    printf '\n# BEGIN mysql_gr_migrate\n%s\n# END mysql_gr_migrate\n' "$SNIPPET" >> "$RTMP/config"
+    cat "$RTMP/config" > "$CANDIDATE"
+    r_validate_candidate
+    printf 'CONFIG_VALIDATION\tPASSED\n'
+    [ "$ACTION" != plan ] || return 0
+    if [ "$ACTION" = manual ]; then
+        printf '\n--- Current cnf merged with proposed settings: %s ---\n' "$CNF"
+        cat "$CANDIDATE"
+        printf '\nBack up and apply this complete candidate? Type APPLY: ' >&2
+        IFS= read -r answer || r_die 'Input ended'
+        [ "$answer" = APPLY ] || { printf 'CONFIG_APPLIED\tNO\n'; return 0; }
+        printf 'Restart the detected instance now? (yes/no) [no]: ' >&2
+        IFS= read -r answer || r_die 'Input ended'; DO_RESTART=${answer:-no}
+        case $DO_RESTART in yes) r_restart_guard;; no) :;; *) r_die 'Choose yes/no';; esac
+        ACTION=apply
+    fi
+    [ "$ACTION" = apply ] || r_die 'Unknown remote action'
+    r_same_process
+    cmp -s "$CNF" "$RTMP/original.cnf" || r_die 'Configuration changed concurrently; original left unchanged'
+    BACKUP="${CNF}.before_gr_${stamp}"
+    [ ! -e "$BACKUP" ] || r_die 'Backup already exists'
+    cp -a "$CNF" "$BACKUP"
+    cmp -s "$CNF" "$BACKUP" || r_die 'Backup verification failed'
+    printf 'BACKUP\t%s\n' "$BACKUP"
+    cmp -s "$CNF" "$RTMP/original.cnf" || r_die 'Configuration changed after backup; no replacement performed'
+    mv -f "$CANDIDATE" "$CNF"; CANDIDATE=''
+    printf 'CONFIG_APPLIED\t%s\n' "$CNF"
+    [ "$DO_RESTART" != yes ] || r_restart
+}
+r_main
+REMOTE_AGENT
+}
+configure_remote() {
+    remote_node=$1; remote_snippet=$2
+    if ! command -v ssh >/dev/null 2>&1; then
+        log 'OpenSSH client unavailable; generating the manual helper without installing packages.'
+        configure_manual "$remote_node" "$remote_snippet"
+        return 0
+    fi
+    ssh_options "$remote_node"
+    if ! remote_call "$remote_node" inspect > "$RUN/node_${remote_node}.remote_inspect.display"; then
+        log 'SSH inspection failed. Preparing a password-free helper to copy and run on that host.'
+        configure_manual "$remote_node" "$remote_snippet"
+        return 0
+    fi
+    cat "$RUN/node_${remote_node}.remote_inspect.display" >&2
+    current_cnf=$(get "$remote_node" cnf)
+    [ -n "$current_cnf" ] || current_cnf=$(awk -F '\t' '$1=="DEFAULT_CNF" {print $2;exit}' "$RUN/node_${remote_node}.remote_inspect.display")
+    selected_cnf=$(required "Node $remote_node remote main cnf path" "$current_cnf")
+    put "$remote_node" cnf "$selected_cnf"
+    if ! remote_call "$remote_node" plan "$remote_snippet" no >&2; then
+        log 'Remote plan did not complete. Use the helper on that host to inspect and resolve the reported configuration issue.'
+        configure_manual "$remote_node" "$remote_snippet"
+        return 0
+    fi
+    log "Remote node $remote_node: back up $selected_cnf, apply the displayed configuration, optionally restart the detected instance."
+    [ "$(ask 'Apply this remote configuration? (yes/no)' no)" = yes ] || return 0
+    restart=$(required 'Restart this remote instance after applying? (yes/no)' yes)
+    case $restart in yes|no) :;; *) die 'Choose yes or no';; esac
+    remote_call "$remote_node" apply "$remote_snippet" "$restart" >&2
+    if [ "$restart" = yes ]; then wait_connection "$remote_node"; fi
+}
+
+# Read only simple quoted values written by the legacy GTID script. Never source/eval it.
+legacy_field() (
+    file=$1; key=$2
+    [ -r "$file" ] || exit 0
+    sed -n "s/^${key}='\\([^']*\\)'$/\\1/p" "$file" | head -n 1
+)
+legacy_cnf_candidate() (
+    i=$1
+    file=${MYSQL_GR_GTID_STATE_FILE:-${MYSQL_GTID_STATE_FILE:-"$(pwd)/.mysql_gtid_replication.state"}}
+    [ -r "$file" ] || exit 0
+    for role in SOURCE REPLICA; do
+        mode=$(legacy_field "$file" "${role}_MODE")
+        matched=no
+        if [ "$mode" = socket ]; then
+            sock=$(legacy_field "$file" "${role}_SOCKET")
+            [ -z "$sock" ] || [ "$sock" != "$(val "$i" socket)" ] || matched=yes
+        elif [ "$mode" = tcp ] && [ "$(get "$i" mode)" = tcp ]; then
+            if [ "$(legacy_field "$file" "${role}_HOST")" = "$(get "$i" host)" ] && [ "$(legacy_field "$file" "${role}_PORT")" = "$(get "$i" port)" ]; then matched=yes; fi
+        fi
+        if [ "$matched" = yes ]; then
+            candidate=$(legacy_field "$file" "${role}_CNF")
+            if [ -n "$candidate" ]; then printf '%s' "$candidate"; exit 0; fi
+        fi
+    done
+)
+configure_manual() (
+    i=$1; snippet=$2
+    file="$RUN/node_${i}_apply_config.sh"
+    {
+        printf '#!/bin/sh\n# Generated remote configuration helper v%s; no stored credentials.\nset -eu\numask 077\n' "$VERSION"
+        printf "ACTION='manual'\nDO_RESTART='no'\n"
+        printf 'VERSION=%s\n' "$(shell_quote "$VERSION")"
+        printf 'EXPECTED_UUID=%s\n' "$(shell_quote "$(get "$i" uuid)")"
+        printf 'EXPECTED_DATA=%s\n' "$(shell_quote "$(val "$i" datadir)")"
+        printf 'EXPECTED_SOCKET=%s\n' "$(shell_quote "$(val "$i" socket)")"
+        printf 'EXPECTED_PID_FILE=%s\n' "$(shell_quote "$(val "$i" pid_file)")"
+        printf 'BASEDIR=%s\n' "$(shell_quote "$(val "$i" basedir)")"
+        printf 'CNF=%s\n' "$(shell_quote "$(get "$i" cnf)")"
+        printf 'SNIPPET=%s\n' "$(shell_quote "$(cat "$snippet")")"
+        printf 'DEFAULT_DB_USER=%s\n' "$(shell_quote "$(get "$i" user)")"
+        cat <<'MANUAL_AUTH'
+printf 'Socket MySQL admin user [%s]: ' "$DEFAULT_DB_USER" >&2
+IFS= read -r db_user || exit 1; db_user=${db_user:-$DEFAULT_DB_USER}
+printf 'Socket MySQL admin password: ' >&2
+saved_tty=''
+if [ -t 0 ]; then
+    saved_tty=$(stty -g)
+    trap 'stty "$saved_tty"' 0
+    trap 'exit 1' 1 2 15
+    stty -echo
+fi
+IFS= read -r db_password || exit 1
+[ -z "$saved_tty" ] || stty "$saved_tty"
+trap - 0 1 2 15
+printf '\n' >&2
+manual_option_quote() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+CLIENT_AUTH=$(printf 'user="%s"\npassword="%s"' "$(manual_option_quote "$db_user")" "$(manual_option_quote "$db_password")")
+unset db_password
+MANUAL_AUTH
+        remote_agent
+    } > "$file"
+    sh -n "$file" || die 'Generated manual helper has invalid syntax'
+    log "Node $i manual configuration (SSH not required):"
+    log "  Copy this helper to the actual MySQL host: $file"
+    log "  On that host run: sh node_${i}_apply_config.sh"
+    log '  The helper discovers/checks the active cnf, copies its current content into a candidate, merges the GR settings, and prints the full candidate for copying.'
+    log '  It validates with the actual mysqld binary, then asks before backup/apply/restart.'
+    log '  Enter the local socket DB credentials there. No password is stored in this helper.'
+    log '  After completing each remote node, rerun precheck on this controller.'
+    log 'Settings to copy into the selected cnf (replace only the existing managed block):'
+    cat "$snippet" >&2
+    printf 'Node %s current cnf candidate: %s\n' "$i" "$(get "$i" cnf)" >&2
+    if [ "$(ask 'Print the complete helper for clipboard copying? (yes/no)' yes)" = yes ]; then cat "$file"; fi
+)
+
 configure() {
     PHASE=configure
     put meta mutation_started configure
@@ -419,7 +809,23 @@ configure() {
         snippet="$RUN/node_$i.cnf"
         config_lines "$i" "$sid" > "$snippet"
         log "Node $i proposed required configuration:"; cat "$snippet" >&2
-        if [ "$(get "$i" location)" = remote ] || [ -z "$(get "$i" cnf)" ]; then
+        if [ -z "$(get "$i" cnf)" ]; then
+            previous_cnf=$(legacy_cnf_candidate "$i")
+            if [ -n "$previous_cnf" ]; then
+                log "Node $i cnf candidate from matching GTID state: $previous_cnf (will be reverified on the actual host)"
+                put "$i" cnf "$previous_cnf"
+            fi
+        fi
+        if [ "$(get "$i" location)" = remote ]; then
+            remote_mode=$(required "Node $i OS configuration method (ssh/manual)" manual)
+            case $remote_mode in
+                ssh) configure_remote "$i" "$snippet";;
+                manual) configure_manual "$i" "$snippet";;
+                *) die 'Choose ssh or manual';;
+            esac
+            continue
+        fi
+        if [ -z "$(get "$i" cnf)" ]; then
             log "Apply $snippet on node $i, restart that instance, then rerun precheck."
             continue
         fi

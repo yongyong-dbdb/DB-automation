@@ -106,7 +106,162 @@ run('registration-only failure message', '''
 grep -F 'did not change databases' "$RUN/cleanup.log"
 ! grep -F 'Write fences' "$RUN/cleanup.log"
 ''')
-report=['# Validation v1.0.1','',f'Total: {len(results)}; passed: {sum(x[1] for x in results)}','', 'These are shell/mocked SQL regression tests. No live MySQL server was available.','']
+
+run('SSH quoting preserves literal metacharacters', r"""
+value="a'b \$(touch SHOULD_NOT_EXIST) \`id\` \\ space"
+quoted=$(shell_quote "$value")
+actual=$(printf 'v=%s\nprintf "%%s" "$v"\n' "$quoted" | sh)
+[ "$actual" = "$value" ]; [ ! -e SHOULD_NOT_EXIST ]
+""")
+run('legacy GTID state matches endpoint without sourcing', r"""
+put 1 mode tcp; put 1 host dbhost; put 1 port 45873
+MYSQL_GR_GTID_STATE_FILE="$ROOT/legacy.state"
+cat > "$MYSQL_GR_GTID_STATE_FILE" <<'STATE'
+SOURCE_MODE='tcp'
+SOURCE_HOST='dbhost'
+SOURCE_PORT='45873'
+SOURCE_CNF='/etc/my_custom.cnf'
+touch SHOULD_NOT_EXIST
+STATE
+[ "$(legacy_cnf_candidate 1)" = /etc/my_custom.cnf ]
+[ ! -e SHOULD_NOT_EXIST ]
+put 1 port 45874
+[ -z "$(legacy_cnf_candidate 1)" ]
+""")
+run('legacy socket maps instance rather than node order', r"""
+MYSQL_GR_GTID_STATE_FILE="$ROOT/legacy.state"
+printf "REPLICA_MODE='socket'\nREPLICA_SOCKET='/data/custom.sock'\nREPLICA_CNF='/etc/custom2.cnf'\n" > "$MYSQL_GR_GTID_STATE_FILE"
+val() { printf /data/custom.sock; }
+[ "$(legacy_cnf_candidate 1)" = /etc/custom2.cnf ]
+""")
+run('manual helper has no controller password and is valid sh', r"""
+put 1 user admin; put 1 uuid uuid-one; put 1 cnf /etc/my_custom.cnf
+val() { case $2 in datadir) printf /data/;; socket) printf /data/custom.sock;; pid_file) printf /data/custom.pid;; basedir) printf /usr;; esac; }
+ask() { printf no; }
+printf '[mysqld]\nserver_id=72\n' > "$RUN/snippet"
+printf 'password="CONTROLLER_SECRET"\n' > "$TEMP/1.cnf"
+configure_manual 1 "$RUN/snippet"
+sh -n "$RUN/node_1_apply_config.sh"
+! grep -F CONTROLLER_SECRET "$RUN/node_1_apply_config.sh"
+grep -F "ACTION='manual'" "$RUN/node_1_apply_config.sh"
+grep -F 'Current cnf merged with proposed settings' "$RUN/node_1_apply_config.sh"
+""")
+agent = r"""
+remote_agent > "$TEMP/agent.sh"
+sed '$d' "$TEMP/agent.sh" > "$TEMP/functions.sh"
+. "$TEMP/functions.sh"
+"""
+run('remote identity rejects wrong socket UUID before writes', agent+r"""
+EXPECTED_UUID=expected; EXPECTED_DATA=/data/; EXPECTED_SOCKET=/sock; EXPECTED_PID_FILE=/pid
+r_sql() { printf 'wrong|/data/|/sock|/pid'; }
+r_identity
+""", 1)
+run('unknown remote launcher blocks automatic restart', agent+r"""
+RMETHOD=unknown
+r_restart_guard
+""", 1)
+run('remote cnf path mismatch blocks editing', agent+r"""
+CNF="$ROOT/actual.cnf"; RDEFAULT="$ROOT/other.cnf"
+printf '[mysqld]\n' > "$CNF"; cp "$CNF" "$RDEFAULT"
+r_config_guard
+""", 1)
+fixture = agent+r"""
+CNF="$ROOT/current.cnf"; BASEDIR="$ROOT"; EXPECTED_SOCKET=/unused
+mkdir -p "$ROOT/bin"; ln -s /bin/true "$ROOT/bin/mysql"
+CLIENT_AUTH='user=fixture'; EXPECTED_UUID=testuuid; VERSION=1.0.2
+SNIPPET='[mysqld]
+server_id=72'
+DO_RESTART=no
+printf '[mysqld]\nport=45873\nlog_bin=/keep/binlog\n' > "$CNF"
+chmod 640 "$CNF"
+r_identity() {
+    RDEFAULT=$CNF; RPID=$$; REXE=/not-executed; RMETHOD=direct; RSERVICE=''
+    printf '%s\n' "$CNF" > "$RTMP/candidates"
+    printf '/not-executed\n--defaults-file=%s\n' "$CNF" > "$RTMP/argv"
+}
+r_same_process() { :; }
+r_validate_candidate() { printf validated > "$VALIDATE_LOG"; }
+"""
+run('remote plan leaves original unchanged',fixture+r"""
+ACTION=plan
+(r_main)
+grep -Fx 'port=45873' "$CNF"
+! grep -F server_id "$CNF"
+[ "$(stat -c %a "$CNF")" = 640 ]
+[ ! -d "$CNF.gr_lock" ]
+""")
+run('remote apply preserves content permissions and exact backup',fixture+r"""
+ACTION=apply
+cp "$CNF" "$ROOT/before"
+(r_main)
+grep -Fx 'port=45873' "$CNF"
+grep -Fx 'log_bin=/keep/binlog' "$CNF"
+grep -Fx 'server_id=72' "$CNF"
+[ "$(stat -c %a "$CNF")" = 640 ]
+cmp "$ROOT/before" "$CNF".before_gr_*
+[ ! -d "$CNF.gr_lock" ]
+""")
+run('validation failure never modifies remote cnf',fixture+r"""
+ACTION=apply
+cp "$CNF" "$ROOT/before"
+r_validate_candidate() { r_die 'simulated validation failure'; }
+(r_main) && exit 1
+cmp "$CNF" "$ROOT/before"
+[ ! -d "$CNF.gr_lock" ]
+""")
+run('remote concurrent edit blocks stale replacement',fixture+r"""
+ACTION=apply
+r_validate_candidate() { printf 'external-edit\n' >> "$CNF"; }
+(r_main) && exit 1
+grep -Fx external-edit "$CNF"
+! grep -F server_id "$CNF"
+""")
+run('remote config lock collision preserves other lock',fixture+r"""
+ACTION=apply
+mkdir "$CNF.gr_lock"
+(r_main) && exit 1
+[ -d "$CNF.gr_lock" ]
+! grep -F server_id "$CNF"
+""")
+run('manual user refusal leaves current cnf unchanged',fixture+r"""
+ACTION=manual
+cp "$CNF" "$ROOT/before"
+printf '\nNO\n' | (r_main)
+cmp "$CNF" "$ROOT/before"
+""")
+run('manual approval merges current cnf and makes backup',fixture+r"""
+ACTION=manual
+printf '\nAPPLY\nno\n' | (r_main)
+grep -Fx 'port=45873' "$CNF"
+grep -Fx 'server_id=72' "$CNF"
+[ ! -d "$CNF.gr_lock" ]
+""")
+
+run('SSH transport uses selected port and host-key verification', r"""
+put 1 ssh_port 45999; put 1 ssh_user mysqlops; put 1 ssh_key ''; put 1 ssh_privilege sudo; put 1 ssh_host dbhost
+ssh() { printf '%s\n' "$@" > "$RUN/ssh_args"; cat > "$RUN/ssh_stdin"; }
+printf 'payload\n' | ssh_transport 1
+grep -Fx 45999 "$RUN/ssh_args"
+grep -Fx StrictHostKeyChecking=ask "$RUN/ssh_args"
+grep -Fx 'sudo -n sh -s' "$RUN/ssh_args"
+grep -Fx payload "$RUN/ssh_stdin"
+""")
+run('remote runtime settings match generated configuration',agent+r"""
+RTMP="$TEMP/runtime"; mkdir -p "$RTMP"
+SNIPPET='[mysqld]
+server_id=72
+log_bin'
+r_sql() { case $1 in *server_id*) printf 72;; *log_bin*) printf 1;; esac; }
+r_runtime_check
+""")
+run('remote runtime override is detected',agent+r"""
+RTMP="$TEMP/runtime"; mkdir -p "$RTMP"
+SNIPPET='[mysqld]
+server_id=72'
+r_sql() { printf 73; }
+r_runtime_check
+""", 1)
+report=['# Validation v1.0.2','',f'Total: {len(results)}; passed: {sum(x[1] for x in results)}','', 'These are shell/mocked SQL regression tests. No live MySQL server was available.','']
 for name,ok,rc,output in results: report.append(f'- {"PASS" if ok else "FAIL"}: {name}')
 (script.parent / 'VALIDATION.md').write_text('\n'.join(report)+'\n')
 if not all(x[1] for x in results): raise SystemExit(1)

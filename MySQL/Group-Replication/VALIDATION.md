@@ -1,6 +1,6 @@
-# Validation v1.0.1
+# Validation v1.0.2
 
-Total: 27; passed: 27
+Total: 44; passed: 44
 
 These are shell/mocked SQL regression tests. No live MySQL server was available.
 
@@ -31,3 +31,20 @@ These are shell/mocked SQL regression tests. No live MySQL server was available.
 - PASS: migration marker prevents re-registration
 - PASS: legacy node write-fence marker preserved
 - PASS: registration-only failure message
+- PASS: SSH quoting preserves literal metacharacters
+- PASS: legacy GTID state matches endpoint without sourcing
+- PASS: legacy socket maps instance rather than node order
+- PASS: manual helper has no controller password and is valid sh
+- PASS: remote identity rejects wrong socket UUID before writes
+- PASS: unknown remote launcher blocks automatic restart
+- PASS: remote cnf path mismatch blocks editing
+- PASS: remote plan leaves original unchanged
+- PASS: remote apply preserves content permissions and exact backup
+- PASS: validation failure never modifies remote cnf
+- PASS: remote concurrent edit blocks stale replacement
+- PASS: remote config lock collision preserves other lock
+- PASS: manual user refusal leaves current cnf unchanged
+- PASS: manual approval merges current cnf and makes backup
+- PASS: SSH transport uses selected port and host-key verification
+- PASS: remote runtime settings match generated configuration
+- PASS: remote runtime override is detected
