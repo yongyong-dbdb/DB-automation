@@ -1,7 +1,7 @@
 #!/bin/sh
 set -u
 
-SCRIPT_VERSION="1.2.8"
+SCRIPT_VERSION="1.2.9"
 SCRIPT_DIR=$(CDPATH='' cd "$(dirname "$0")" && pwd)
 DEFAULT_OUTPUT_DIR="$SCRIPT_DIR/results"
 PSQL_BIN=${PSQL_BIN:-}
@@ -194,24 +194,32 @@ render_plan_summary() {
     {
         json_sql_prefix "$_json_file"
         cat <<'SQL'
-nodes(path, node, is_last, depth) AS (
-    SELECT ARRAY[]::integer[], doc->0->'Plan', true, 0 FROM plan_source
+nodes(path, node, is_last, depth, prefix) AS (
+    SELECT ARRAY[]::integer[], doc->0->'Plan', true, 0, ''::text
+    FROM plan_source
   UNION ALL
     SELECT n.path || c.ord::integer,
            c.child,
            c.ord = jsonb_array_length(COALESCE(n.node->'Plans','[]'::jsonb)),
-           n.depth + 1
+           n.depth + 1,
+           n.prefix || CASE
+               WHEN n.depth = 0 THEN ''
+               WHEN n.is_last THEN '    '
+               ELSE '|   '
+           END
     FROM nodes n
     CROSS JOIN LATERAL jsonb_array_elements(COALESCE(n.node->'Plans','[]'::jsonb)) WITH ORDINALITY AS c(child,ord)
 ), formatted AS (
     SELECT path,
+           depth,
            concat(
-               repeat('   ', depth),
-               CASE WHEN depth=0 THEN '' WHEN is_last THEN '└─ ' ELSE '├─ ' END,
+               prefix,
+               CASE WHEN depth=0 THEN '' WHEN is_last THEN '`-- ' ELSE '|-- ' END,
                COALESCE(node->>'Node Type',''),
                CASE WHEN node ? 'Index Name' THEN concat(' using ', node->>'Index Name') ELSE '' END,
                CASE WHEN node ? 'Relation Name' THEN concat(' on ', CASE WHEN node ? 'Schema' THEN concat(node->>'Schema','.') ELSE '' END, node->>'Relation Name') ELSE '' END
-           ) AS node_type,
+           ) AS node_line,
+           concat(prefix, CASE WHEN depth=0 THEN '  ' WHEN is_last THEN '    ' ELSE '|   ' END) AS detail_prefix,
            COALESCE(array_to_string(ARRAY(SELECT jsonb_array_elements_text(COALESCE(node->'Sort Key','[]'::jsonb))), ', '), '') AS sort_key,
            COALESCE(node->>'Index Cond','') AS index_cond,
            COALESCE(node->>'Recheck Cond','') AS recheck_cond,
@@ -221,7 +229,7 @@ nodes(path, node, is_last, depth) AS (
            COALESCE(node->>'Filter','') AS filter
     FROM nodes
 )
-SELECT COALESCE(node_type,''), sort_key, index_cond, recheck_cond, hash_cond, merge_cond, join_filter, filter
+SELECT node_line, detail_prefix, sort_key, index_cond, recheck_cond, hash_cond, merge_cond, join_filter, filter
 FROM formatted
 ORDER BY path;
 SQL
@@ -233,13 +241,24 @@ SQL
     }
 
     awk -F '\t' '
-BEGIN {
-    printf "%-56s | %-24s | %-38s | %-30s | %-30s | %-30s | %-30s | %-38s\n", "Node-Type","Sort-Key","Index-Cond","Recheck-Cond","Hash-Cond","Merge-Cond","Join-Filter","Filter";
-    printf "%-56s-+-%-24s-+-%-38s-+-%-30s-+-%-30s-+-%-30s-+-%-30s-+-%-38s\n", "--------------------------------------------------------","------------------------","--------------------------------------","------------------------------","------------------------------","------------------------------","------------------------------","--------------------------------------";
+function clip(s,n) {
+    if (n < 20) n=20
+    return length(s)<=n ? s : substr(s,1,n-3) "..."
 }
-function clip(s,n) { return length(s)<=n?s:substr(s,1,n-3)"..." }
+function detail(prefix,label,value,    room) {
+    if (value=="") return
+    room=120-length(prefix)-length(label)-3
+    printf "%s%-13s : %s\n", prefix, label, clip(value,room)
+}
 {
-    printf "%-56s | %-24s | %-38s | %-30s | %-30s | %-30s | %-30s | %-38s\n", clip($1,56),clip($2,24),clip($3,38),clip($4,30),clip($5,30),clip($6,30),clip($7,30),clip($8,38)
+    print $1
+    detail($2,"Sort Key",$3)
+    detail($2,"Index Cond",$4)
+    detail($2,"Recheck Cond",$5)
+    detail($2,"Hash Cond",$6)
+    detail($2,"Merge Cond",$7)
+    detail($2,"Join Filter",$8)
+    detail($2,"Filter",$9)
 }' "$_rows"
 }
 
@@ -377,6 +396,12 @@ if [ "$BIND" = yes ]; then
 fi
 
 ANALYZE=$(ask 'Use ANALYZE? yes/no' no)
+if [ "$ANALYZE" = yes ]; then
+    echo
+    echo "WARNING: EXPLAIN ANALYZE executes the target SQL."
+    echo "         The target SQL will actually be executed."
+    echo
+fi
 VERBOSE=$(ask 'Use VERBOSE? yes/no' no)
 COSTS=$(ask 'Use COSTS? yes/no' yes)
 SETTINGS=$(ask 'Use SETTINGS? yes/no' yes)
@@ -458,11 +483,13 @@ print_table_delta() {
 
 print_index_delta() {
     [ -s "$index_before" ] && [ -s "$index_after" ] || return 0
-    awk -F'|' 'NR==FNR {for(i=3;i<=7;i++) b[$1,i]=$i; name[$1]=$2; next} {id=$1; printf "\n%s\n",name[id]; printf "%-24s %15s %15s %15s\n","metric","before","after","delta"; printf "%-24s %15s %15s %15s\n","------------------------","---------------","---------------","---------------"; label[3]="idx_scan";label[4]="idx_tup_read";label[5]="idx_tup_fetch";label[6]="idx_blks_read";label[7]="idx_blks_hit"; for(i=3;i<=7;i++){before=(b[id,i]==""?0:b[id,i]);after=$i;delta=after-before;printf "%-24s %15s %15s %+15d\n",label[i],before,after,delta}}' "$index_before" "$index_after"
+    awk -F'|' 'NR==FNR {for(i=3;i<=7;i++) b[$1,i]=$i; name[$1]=$2; next} {id=$1; printf "\n%s\n",name[id]; printf "%-24s %15s %15s %15s\n","metric","before","after","delta"; printf "%-24s %15s %15s %15s\n","------------------------","---------------","---------------","---------------"; label[3]="idx_scan";label[4]="idx_tup_read";label[5]="idx_scan";label[4]="idx_tup_read";label[5]="idx_tup_fetch";label[6]="idx_blks_read";label[7]="idx_blks_hit"; for(i=3;i<=7;i++){before=(b[id,i]==""?0:b[id,i]);after=$i;delta=after-before;printf "%-24s %15s %15s %+15d\n",label[i],before,after,delta}}' "$index_before" "$index_after"
 }
 
 if [ "$ANALYZE" = yes ]; then
-    echo; echo "WARNING: EXPLAIN ANALYZE executes the statement."; echo "Safety     : BEGIN -> EXPLAIN ANALYZE -> ROLLBACK"; [ -z "$DML_OPERATION" ] || echo "DML detected: $DML_OPERATION"
+    echo
+    [ -z "$DML_OPERATION" ] || echo "DML detected: $DML_OPERATION"
+    echo "Safety     : BEGIN -> EXPLAIN ANALYZE -> ROLLBACK"
     printf 'Type EXECUTE to continue: ' >&2; IFS= read -r confirm; [ "$confirm" = EXECUTE ] || { echo "Cancelled."; exit 1; }
     [ ! -s "$rel_file" ] || snapshot_stats "$table_before" "$index_before"
     { printf 'BEGIN;\n'; emit_plan "$raw_text_opts"; printf 'ROLLBACK;\n'; } > "$tmp"
@@ -474,7 +501,7 @@ fi
  echo "PostgreSQL execution plan analysis"; echo "script_version=$SCRIPT_VERSION"; echo "database=$PGDATABASE"; echo "sql_file=$SQL_FILE"; echo
 } > "$RESULT_FILE"
 
-section "Execution Plan" | tee -a "$RESULT_FILE"
+section "Execution Plan Summary" | tee -a "$RESULT_FILE"
 cat "$plan_summary" | tee -a "$RESULT_FILE"
 
 if ! run_psql -X -qAt -P pager=off -v ON_ERROR_STOP=1 -f "$tmp" > "$raw_plan_output" 2>"$plan_error"; then
