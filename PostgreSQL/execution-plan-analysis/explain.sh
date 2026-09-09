@@ -1,7 +1,7 @@
 #!/bin/sh
 set -u
 
-SCRIPT_VERSION="1.2.23"
+SCRIPT_VERSION="1.2.24"
 SCRIPT_DIR=$(CDPATH='' cd "$(dirname "$0")" && pwd)
 DEFAULT_OUTPUT_DIR="$SCRIPT_DIR/results"
 PSQL_BIN=${PSQL_BIN:-}
@@ -292,6 +292,13 @@ PGSS_RAW_SQL_FILE=
 PGSS_ORIGINAL_BIND_MAX=
 PGSS_NORMALIZED_VALUES_FILE=
 PGSS_NORMALIZED_NULL_USED=no
+BIND_SAMPLE_LIMIT=${BIND_SAMPLE_LIMIT:-3}
+BIND_SAMPLE_TIMEOUT=${BIND_SAMPLE_TIMEOUT:-5s}
+if ! printf '%s\n' "$BIND_SAMPLE_LIMIT" | grep -Eq '^[0-9]*[1-9][0-9]*$'; then
+    echo "ERROR: BIND_SAMPLE_LIMIT must be a positive integer." >&2
+    exit 1
+fi
+
 detect_pg_stat_statements() {
     PGSS_RELATION=$(run_psql -X -qAt -v ON_ERROR_STOP=1 <<'SQL' 2>/dev/null || true
 SELECT format('%I.pg_stat_statements', n.nspname)
@@ -537,6 +544,218 @@ pgss_rewrite_typed_literals() {
         "$_src" > "$_dst"
 }
 
+build_pgss_normalized_candidate_map() {
+    _src_file=$1
+    _first_param=$2
+    _last_param=$3
+    _out_file=$4
+    : > "$_out_file"
+    [ "$_first_param" -le "$_last_param" ] || return 0
+
+    _source_sql=$(cat "$_src_file")
+    if ! run_psql -X -qAt -F '|' -v ON_ERROR_STOP=1 \
+        -v source_sql="$_source_sql" -v first_param="$_first_param" -v last_param="$_last_param" <<'SQL' > "$_out_file" 2>"$work_dir/pgss-normalized-candidates.err"
+WITH RECURSIVE
+src AS (
+    SELECT regexp_replace(:'source_sql', E'[\n\r\t]+', ' ', 'g') AS q
+), params AS (
+    SELECT generate_series(:'first_param'::integer, :'last_param'::integer) AS n
+), patterns AS (
+    SELECT '(?:"(?:[^"]|"")+"|[a-z_][a-z_0-9$]*)'::text AS ident,
+           '(?:::(?:text|integer|bigint|smallint|numeric|boolean|date|uuid|character varying|double precision|timestamp(?: with(?:out)? time zone)?|time(?: with(?:out)? time zone)?|interval))?'::text AS cast_pattern,
+           '(?:(?:date|time(?: with(?:out)? time zone)?|timestamp(?: with(?:out)? time zone)?|interval)\s+)?'::text AS typed_prefix
+), refs AS (
+    SELECT p.n, (z.m)[1] AS ref
+    FROM src s
+    CROSS JOIN params p
+    CROSS JOIN patterns x
+    CROSS JOIN LATERAL regexp_matches(
+        s.q,
+        '(' || x.ident || '(?:\.' || x.ident || ')?)\s*' || x.cast_pattern ||
+        '\s*(?:=|<>|!=|<=|>=|<|>|~~\*?|!~~\*?)\s*' || x.typed_prefix ||
+        '\$' || p.n || '(?![0-9])' || x.cast_pattern,
+        'gi') AS z(m)
+    UNION ALL
+    SELECT p.n, (z.m)[1] AS ref
+    FROM src s
+    CROSS JOIN params p
+    CROSS JOIN patterns x
+    CROSS JOIN LATERAL regexp_matches(
+        s.q,
+        x.typed_prefix || '\$' || p.n || '(?![0-9])' || x.cast_pattern ||
+        '\s*(?:=|<>|!=|<=|>=|<|>|~~\*?|!~~\*?)\s*(' || x.ident || '(?:\.' || x.ident || ')?)\s*' || x.cast_pattern,
+        'gi') AS z(m)
+    UNION ALL
+    SELECT p.n, (z.m)[1] AS ref
+    FROM src s
+    CROSS JOIN params p
+    CROSS JOIN patterns x
+    CROSS JOIN LATERAL regexp_matches(
+        s.q,
+        '(' || x.ident || '(?:\.' || x.ident || ')?)\s+(?:not\s+)?in\s*\([^)]*\$' || p.n || '(?![0-9])[^)]*\)',
+        'gi') AS z(m)
+), param_edges AS (
+    SELECT (m)[1]::integer AS a, (m)[2]::integer AS b
+    FROM src,
+         LATERAL regexp_matches(q, '\$([1-9][0-9]*)\s*=\s*\$([1-9][0-9]*)', 'g') AS r(m)
+    UNION
+    SELECT (m)[2]::integer, (m)[1]::integer
+    FROM src,
+         LATERAL regexp_matches(q, '\$([1-9][0-9]*)\s*=\s*\$([1-9][0-9]*)', 'g') AS r(m)
+), walk(origin, n, path) AS (
+    SELECT p.n, p.n, ARRAY[p.n]
+    FROM params p
+    UNION ALL
+    SELECT w.origin, e.b, w.path || e.b
+    FROM walk w
+    JOIN param_edges e ON e.a = w.n
+    WHERE NOT e.b = ANY(w.path)
+      AND cardinality(w.path) < 16
+), columns AS (
+    SELECT DISTINCT r.n,
+           r.ref,
+           (parse_ident(r.ref))[cardinality(parse_ident(r.ref))] AS column_name,
+           CASE WHEN cardinality(parse_ident(r.ref)) >= 2
+                THEN (parse_ident(r.ref))[cardinality(parse_ident(r.ref)) - 1]
+                ELSE NULL
+           END AS qualifier
+    FROM refs r
+    WHERE cardinality(parse_ident(r.ref)) BETWEEN 1 AND 3
+), direct_candidates AS (
+    SELECT DISTINCT c.n,
+           cls.oid AS relid,
+           format('%I.%I', ns.nspname, cls.relname) AS relation,
+           c.column_name,
+           CASE
+             WHEN c.qualifier IS NOT NULL AND lower(c.qualifier) = lower(cls.relname) THEN 1
+             WHEN pg_table_is_visible(cls.oid) THEN 2
+             ELSE 3
+           END AS priority
+    FROM columns c
+    CROSS JOIN src s
+    JOIN pg_attribute a
+      ON a.attname = c.column_name
+     AND a.attnum > 0
+     AND NOT a.attisdropped
+    JOIN pg_class cls
+      ON cls.oid = a.attrelid
+     AND cls.relkind IN ('r','p','v','m','f')
+    JOIN pg_namespace ns
+      ON ns.oid = cls.relnamespace
+    WHERE ns.nspname NOT IN ('pg_catalog','information_schema')
+      AND position(lower(cls.relname) in lower(s.q)) > 0
+      AND has_table_privilege(cls.oid, 'SELECT')
+), propagated AS (
+    SELECT DISTINCT w.origin AS parameter,
+           d.relation,
+           d.column_name,
+           d.priority + CASE WHEN w.n = w.origin THEN 0 ELSE 10 END AS priority
+    FROM walk w
+    JOIN direct_candidates d ON d.n = w.n
+), best AS (
+    SELECT parameter, min(priority) AS priority
+    FROM propagated
+    GROUP BY parameter
+)
+SELECT p.parameter, p.relation, p.column_name, p.priority
+FROM propagated p
+JOIN best b USING (parameter, priority)
+WHERE p.relation !~ E'[|\n\r]'
+  AND p.column_name !~ E'[|\n\r]'
+ORDER BY p.parameter, p.priority, p.relation, p.column_name;
+SQL
+    then
+        : > "$_out_file"
+        return 1
+    fi
+    unset _source_sql
+    return 0
+}
+
+show_pgss_normalized_candidates() {
+    _param=$1
+    _candidate_map=$2
+    PGSS_NORMALIZED_DEFAULT_AVAILABLE=no
+    PGSS_NORMALIZED_DEFAULT_VALUE=
+
+    _candidate_file="$work_dir/pgss-normalized-candidates-${_param}.txt"
+    awk -F'|' -v n="$_param" '$1 == n {print $2 "|" $3}' "$_candidate_map" | sort -u > "$_candidate_file"
+    _candidate_count=$(awk 'END {print NR+0}' "$_candidate_file")
+    [ "$_candidate_count" -gt 0 ] || return 1
+
+    _sample_relation=
+    _sample_column=
+    if [ "$_candidate_count" -eq 1 ]; then
+        _candidate_line=$(sed -n '1p' "$_candidate_file")
+        _sample_relation=${_candidate_line%%|*}
+        _sample_column=${_candidate_line#*|}
+        printf 'Auto-detected normalized constant $%s -> %s / %s\n' "$_param" "$_sample_relation" "$_sample_column"
+    else
+        printf '정규화 상수 $%s와 연결 가능한 테이블/컬럼 후보:\n' "$_param"
+        _candidate_no=1
+        while IFS='|' read -r _candidate_relation _candidate_column; do
+            printf '  %s) %s / %s\n' "$_candidate_no" "$_candidate_relation" "$_candidate_column"
+            _candidate_no=$((_candidate_no + 1))
+        done < "$_candidate_file"
+        while :; do
+            printf '정규화 상수 $%s 후보 소스 선택 [1]: ' "$_param" >&2
+            IFS= read -r _candidate_choice || return 1
+            [ -n "$_candidate_choice" ] || _candidate_choice=1
+            case $_candidate_choice in
+                ''|*[!0-9]*) echo "ERROR: 후보 번호를 입력하세요." >&2; continue ;;
+            esac
+            if [ "$_candidate_choice" -lt 1 ] || [ "$_candidate_choice" -gt "$_candidate_count" ]; then
+                printf 'ERROR: 1-%s 사이의 번호를 입력하세요.\n' "$_candidate_count" >&2
+                continue
+            fi
+            _candidate_line=$(sed -n "${_candidate_choice}p" "$_candidate_file")
+            _sample_relation=${_candidate_line%%|*}
+            _sample_column=${_candidate_line#*|}
+            break
+        done
+    fi
+
+    _sample_file="$work_dir/pgss-normalized-values-${_param}.txt"
+    : > "$_sample_file"
+    if ! run_psql -X -qAt -v ON_ERROR_STOP=1 \
+        -v sample_relation="$_sample_relation" -v sample_column="$_sample_column" \
+        -v sample_limit="$BIND_SAMPLE_LIMIT" -v sample_timeout="$BIND_SAMPLE_TIMEOUT" <<'SQL' > "$_sample_file" 2>"$work_dir/pgss-normalized-values-${_param}.err"
+BEGIN READ ONLY;
+SELECT set_config('statement_timeout', :'sample_timeout', true) AS sample_timeout \gset
+SELECT format(
+    'SELECT DISTINCT %1$I::text FROM %2$s WHERE %1$I IS NOT NULL AND %1$I::text <> '''' AND %1$I::text !~ E''[\n\r]'' LIMIT %3$s',
+    :'sample_column', :'sample_relation'::regclass, :'sample_limit'::integer)
+\gexec
+COMMIT;
+SQL
+    then
+        echo "주의: $_sample_relation / $_sample_column 후보값 조회에 실패했습니다. 직접 입력으로 진행합니다." >&2
+        return 1
+    fi
+
+    _sample_count=$(awk 'END {print NR+0}' "$_sample_file")
+    [ "$_sample_count" -gt 0 ] || {
+        echo "안내: $_sample_relation / $_sample_column 에서 사용 가능한 비 NULL 후보값을 찾지 못했습니다." >&2
+        return 1
+    }
+
+    echo
+    printf '정규화 상수 $%s 후보값 (현재 테이블 DISTINCT, 최대 %s개)\n' "$_param" "$BIND_SAMPLE_LIMIT"
+    printf '  source: %s / %s\n' "$_sample_relation" "$_sample_column"
+    _sample_no=1
+    while IFS= read -r _sample_value; do
+        printf '  %s) %s\n' "$_sample_no" "$_sample_value"
+        _sample_no=$((_sample_no + 1))
+    done < "$_sample_file"
+    PGSS_NORMALIZED_DEFAULT_VALUE=$(sed -n '1p' "$_sample_file")
+    if [ -n "$PGSS_NORMALIZED_DEFAULT_VALUE" ]; then
+        PGSS_NORMALIZED_DEFAULT_AVAILABLE=yes
+        printf 'Default for normalized constant $%s: %s\n' "$_param" "$PGSS_NORMALIZED_DEFAULT_VALUE"
+    fi
+    echo '후보값은 과거 실제 literal 값이 아니라 현재 테이블의 DISTINCT 예시값입니다.'
+    return 0
+}
+
 prepare_pgss_replay_sql() {
     [ "$SQL_SOURCE_KIND" = pgss ] || return 0
     [ -n "$PGSS_RAW_SQL_FILE" ] || return 0
@@ -584,8 +803,9 @@ prepare_pgss_replay_sql() {
     fi
     echo
     echo "안내: pg_stat_statements는 원래 literal을 추가 \$n 파라미터로 정규화할 수 있습니다."
-    echo "      원래 literal 값은 저장되지 않으므로 정규화 상수 값은 직접 입력해야 합니다."
-    echo "      기존 bind 값은 분류 완료 후 예전 버전과 동일하게 SQL 조건의 테이블/컬럼을 찾아 후보값을 조회합니다."
+    echo "      정규화 상수가 테이블 컬럼과 직접 연결되거나 = 관계의 다른 파라미터를 통해 컬럼과 연결되면"
+    echo "      현재 테이블에서 DISTINCT 후보값을 최대 $BIND_SAMPLE_LIMIT개 조회하여 먼저 보여줍니다."
+    echo "      연결 컬럼을 찾을 수 없는 상수만 직접 입력합니다. 후보값은 과거 실제 literal 값은 아닙니다."
 
     if [ -n "${PGSS_ORIGINAL_BIND_MAX:-}" ]; then
         _bind_max=$PGSS_ORIGINAL_BIND_MAX
@@ -656,22 +876,43 @@ prepare_pgss_replay_sql() {
     _map="$work_dir/pgss-normalized-map.tsv"
     _typed="$work_dir/pgss-typed-rewrite.sql"
     _replay="$work_dir/pgss-replay.sql"
+    _candidate_map="$work_dir/pgss-normalized-candidate-map.txt"
     : > "$PGSS_NORMALIZED_VALUES_FILE"
     : > "$_map"
+    : > "$_candidate_map"
 
-    _n=$((PGSS_ORIGINAL_BIND_MAX + 1))
+    _first_normalized=$((PGSS_ORIGINAL_BIND_MAX + 1))
+    if [ "$_first_normalized" -le "$_param_max" ]; then
+        if ! build_pgss_normalized_candidate_map "$PGSS_RAW_SQL_FILE" "$_first_normalized" "$_param_max" "$_candidate_map"; then
+            echo "안내: 정규화 상수의 테이블/컬럼 후보 자동 탐색에 실패하여 직접 입력 fallback을 사용합니다." >&2
+        fi
+    fi
+
+    _n=$_first_normalized
     while [ "$_n" -le "$_param_max" ]; do
         if grep -Eq "\\\$${_n}([^0-9]|$)" "$PGSS_RAW_SQL_FILE"; then
             _context=$(pgss_parameter_context "$PGSS_RAW_SQL_FILE" "$_n")
+            PGSS_NORMALIZED_DEFAULT_AVAILABLE=no
+            PGSS_NORMALIZED_DEFAULT_VALUE=
+            show_pgss_normalized_candidates "$_n" "$_candidate_map" >/dev/stdout 2>/dev/stderr || true
+
             while :; do
-                if [ -n "$_context" ]; then
+                if [ "$PGSS_NORMALIZED_DEFAULT_AVAILABLE" = yes ]; then
+                    if [ -n "$_context" ]; then
+                        printf '정규화 상수 $%s 값 [%s] (context=%s, \\N=SQL NULL): ' "$_n" "$PGSS_NORMALIZED_DEFAULT_VALUE" "$_context" >&2
+                    else
+                        printf '정규화 상수 $%s 값 [%s] (\\N=SQL NULL): ' "$_n" "$PGSS_NORMALIZED_DEFAULT_VALUE" >&2
+                    fi
+                elif [ -n "$_context" ]; then
                     printf '정규화 상수 $%s 값 (context=%s, \\N=SQL NULL / 실제 원본 literal이 NULL인 경우만): ' "$_n" "$_context" >&2
                 else
                     printf '정규화 상수 $%s 값 (\\N=SQL NULL / 실제 원본 literal이 NULL인 경우만): ' "$_n" >&2
                 fi
                 IFS= read -r _value || return 1
-                if [ -z "$_value" ]; then
-                    echo "ERROR: pg_stat_statements에는 원래 literal 값이 없으므로 값을 입력해야 합니다." >&2
+                if [ -z "$_value" ] && [ "$PGSS_NORMALIZED_DEFAULT_AVAILABLE" = yes ]; then
+                    _value=$PGSS_NORMALIZED_DEFAULT_VALUE
+                elif [ -z "$_value" ]; then
+                    echo "ERROR: pg_stat_statements에는 원래 literal 값이 없고 자동 후보도 없으므로 값을 입력해야 합니다." >&2
                     continue
                 fi
 
@@ -739,7 +980,7 @@ prepare_pgss_replay_sql() {
 
     SQL_FILE=$_replay
     echo
-    echo "안내: 정규화 상수는 입력값으로 SQL에 복원했습니다."
+    echo "안내: 정규화 상수는 선택/입력한 값으로 SQL에 복원했습니다."
     if [ "$PGSS_ORIGINAL_BIND_MAX" -gt 0 ]; then
         printf '      기존 bind로 분류된 $1~$%s는 기존 후보값/기본값 탐색 절차로 처리합니다.\n' "$PGSS_ORIGINAL_BIND_MAX"
     else
@@ -1449,11 +1690,6 @@ if [ "$BIND" = yes ]; then
         exit 1
     fi
     case $BIND_COUNT in ''|*[!0-9]*) echo "ERROR: invalid parameter count" >&2; exit 1 ;; esac
-    BIND_SAMPLE_LIMIT=${BIND_SAMPLE_LIMIT:-3}; BIND_SAMPLE_TIMEOUT=${BIND_SAMPLE_TIMEOUT:-5s}
-    if ! printf '%s\n' "$BIND_SAMPLE_LIMIT" | grep -Eq '^[0-9]*[1-9][0-9]*$'; then
-        echo "ERROR: BIND_SAMPLE_LIMIT must be a positive integer." >&2
-        exit 1
-    fi
     build_bind_map
     build_bind_constant_map
     build_bind_type_map || exit 1
