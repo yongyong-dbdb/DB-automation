@@ -1,11 +1,11 @@
 #!/bin/sh
-# mysql_gr_migrate.sh v1.0.10
+# mysql_gr_migrate.sh v1.0.11
 # POSIX sh; OS utilities and MySQL clients only. No external language packages.
 # Supported: Oracle MySQL 8.0.27+, 8.4.x, 9.7.x; homogeneous exact versions.
 # Single-primary or multi-primary / XCom. Never resets GTID or binary logs.
 set -eu
 umask 077
-VERSION=1.0.10
+VERSION=1.0.11
 ROOT=${MYSQL_GR_WORK_ROOT:-"$(pwd)/mysql_gr_work"}
 MYSQL=${MYSQL_GR_MYSQL:-mysql}
 DUMP=${MYSQL_GR_MYSQLDUMP:-mysqldump}
@@ -1304,15 +1304,34 @@ summarize_mysqlbinlog_evidence() {
                 if (match(upper,/(TABLE|EVENT|VIEW|PROCEDURE|FUNCTION|TRIGGER|DATABASE|SCHEMA)[[:space:]]+/)) {
                     kind=substr(upper,RSTART,RLENGTH)
                     gsub(/[[:space:]]/,"",kind)
-                    obj=substr(line,RSTART+RLENGTH)
-                    sub(/^[[:space:]]+/,"",obj)
-                    sub(/^[Ii][Ff][[:space:]]+[Nn][Oo][Tt][[:space:]]+[Ee][Xx][Ii][Ss][Tt][Ss][[:space:]]+/,"",obj)
-                    sub(/^[Ii][Ff][[:space:]]+[Ee][Xx][Ii][Ss][Tt][Ss][[:space:]]+/,"",obj)
-                    sub(/[[:space:](;,].*$/,"",obj)
-                    gsub(/`/,"",obj)
-                    if (kind!="DATABASE" && kind!="SCHEMA" && obj !~ /\./ && db!="") obj=db "." obj
-                    if (obj=="") obj="UNKNOWN"
-                    emit("DDL",op " " kind,obj,line)
+                    rest=substr(line,RSTART+RLENGTH)
+                    sub(/^[[:space:]]+/,"",rest)
+                    if (op=="RENAME" && kind=="TABLE") {
+                        clean=rest; gsub(/`/,"",clean)
+                        pair_count=split(clean,pairs,/,/)
+                        for (pi=1; pi<=pair_count; pi++) {
+                            pair=pairs[pi]
+                            sub(/^[[:space:]]+/,"",pair); sub(/[[:space:]]+$/,"",pair)
+                            n=split(pair,rn,/[[:space:]]+[Tt][Oo][[:space:]]+/)
+                            if (n==2) {
+                                src=rn[1]; dst=rn[2]
+                                sub(/[[:space:];].*$/,"",src); sub(/[[:space:];].*$/,"",dst)
+                                if (src !~ /\./ && db!="") src=db "." src
+                                if (dst !~ /\./ && db!="") dst=db "." dst
+                                emit("DDL",op " " kind,src,line)
+                                emit("DDL",op " " kind,dst,line)
+                            } else emit("DDL",op " " kind,"UNKNOWN",line)
+                        }
+                    } else {
+                        obj=rest
+                        sub(/^[Ii][Ff][[:space:]]+[Nn][Oo][Tt][[:space:]]+[Ee][Xx][Ii][Ss][Tt][Ss][[:space:]]+/,"",obj)
+                        sub(/^[Ii][Ff][[:space:]]+[Ee][Xx][Ii][Ss][Tt][Ss][[:space:]]+/,"",obj)
+                        sub(/[[:space:](;,].*$/,"",obj)
+                        gsub(/`/,"",obj)
+                        if (kind!="DATABASE" && kind!="SCHEMA" && obj !~ /\./ && db!="") obj=db "." obj
+                        if (obj=="") obj="UNKNOWN"
+                        emit("DDL",op " " kind,obj,line)
+                    }
                 } else {
                     emit("DDL",op " OBJECT","UNKNOWN",line)
                 }
@@ -1958,7 +1977,7 @@ status() {
 platform_preflight() {
     # Fail before any database/config mutation when the controller shell
     # environment cannot support the portable code paths used by this script.
-    for c in awk sed grep sort cut tr head tail dirname basename mktemp cmp diff date cp mv rm mkdir cat chmod; do
+    for c in awk sed grep sort cut tr head tail dirname basename mktemp cmp diff date cp mv rm mkdir cat chmod readlink sha256sum tee stat id sleep; do
         command -v "$c" >/dev/null 2>&1 || die "Required controller utility not found: $c"
     done
     # Keep awk checks POSIX-compatible. The parentheses around a relational
@@ -1993,6 +2012,7 @@ main() {
 # v1.0.8: client option-group compatibility, preflight checks, local-first binlog inspection and abort guidance.
 # v1.0.9: generic per-GTID DML/DDL summaries and safe current-metadata comparison for divergent members.
 # v1.0.10: POSIX-awk conditional fix and controller utility/awk compatibility preflight before mutation.
+# v1.0.11: broader controller utility preflight and RENAME TABLE source/target metadata coverage.
 safe_host() { case $1 in ''|*[!a-zA-Z0-9_.-]*) die "Use an IPv4 address or DNS name (IPv6 is not supported in v$VERSION).";; esac; }
 
 host_is_local() (
