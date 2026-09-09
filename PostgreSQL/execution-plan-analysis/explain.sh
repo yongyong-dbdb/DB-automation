@@ -1,7 +1,7 @@
 #!/bin/sh
 set -u
 
-SCRIPT_VERSION="1.2.18"
+SCRIPT_VERSION="1.2.19"
 SCRIPT_DIR=$(CDPATH='' cd "$(dirname "$0")" && pwd)
 DEFAULT_OUTPUT_DIR="$SCRIPT_DIR/results"
 PSQL_BIN=${PSQL_BIN:-}
@@ -184,9 +184,9 @@ confirm_database_switch() {
 prepare_pgss_execution_user() {
     [ "$PGUSER" != postgres ] || return 0
     echo
-    echo "NOTICE: pg_stat_statements may contain statements executed by other database users."
-    echo "        For operational analysis, the script does not use SET ROLE or SET search_path."
-    echo "        Using postgres avoids privilege-related query text/EXPLAIN failures where possible."
+    echo "안내: pg_stat_statements에는 다른 데이터베이스 사용자가 실행한 SQL도 포함될 수 있습니다."
+    echo "      운영 분석 안전성을 위해 SET ROLE 및 SET search_path는 수행하지 않습니다."
+    echo "      권한에 따른 query text 조회/EXPLAIN 실패를 줄이기 위해 postgres 사용자 사용을 권장합니다."
     while :; do
         printf 'Current user is %s. Switch analysis user to postgres? y/n [y]: ' "$PGUSER" >&2
         IFS= read -r _ans || return 1
@@ -195,7 +195,7 @@ prepare_pgss_execution_user() {
         case $_ans in
             y) switch_user postgres || return 1; return 0 ;;
             n)
-                echo "WARNING: continuing as $PGUSER. Other users' query text or referenced objects may not be accessible."
+                echo "주의: $PGUSER 사용자로 계속 진행합니다. 다른 사용자의 query text 또는 참조 객체에 접근하지 못할 수 있습니다."
                 return 0
                 ;;
             *) echo "ERROR: enter y or n." >&2 ;;
@@ -211,6 +211,9 @@ ORIGINAL_QUERY_USER=
 ORIGINAL_QUERY_USERID=
 PGSS_EXECUTE_USER=
 PGSS_SEARCH_PATH=
+PGSS_RAW_SQL_FILE=
+PGSS_ORIGINAL_BIND_MAX=
+PGSS_NORMALIZED_VALUES_FILE=
 detect_pg_stat_statements() {
     PGSS_RELATION=$(run_psql -X -qAt -v ON_ERROR_STOP=1 <<'SQL' 2>/dev/null || true
 SELECT format('%I.pg_stat_statements', n.nspname)
@@ -361,6 +364,7 @@ SQL
         ORIGINAL_QUERY_USERID=$_source_userid
         PGSS_EXECUTE_USER=$(run_psql -X -qAt -v ON_ERROR_STOP=1 -c 'SELECT current_user;' 2>/dev/null || printf '%s' "$PGUSER")
         PGSS_SEARCH_PATH=$(run_psql -X -qAt -v ON_ERROR_STOP=1 -c 'SHOW search_path;' 2>/dev/null || printf '<unavailable>')
+        PGSS_RAW_SQL_FILE=$_pgss_sql
         SQL_FILE=$_pgss_sql
         SQL_SOURCE_KIND=pgss
         SQL_SOURCE_DESC="pg_stat_statements queryid=$QUERYID"
@@ -374,13 +378,202 @@ SQL
         printf '  current search_path  : %s\n' "$PGSS_SEARCH_PATH"
         printf '  original search_path : unavailable in pg_stat_statements\n'
         echo
-        echo "NOTICE: EXPLAIN will run as the current login user shown above."
-        echo "        SET ROLE and SET search_path are not performed."
-        echo "        If the SQL uses unqualified object names, object resolution may differ from the original session."
-        echo "        pg_stat_statements stores normalized representative query text; literal values may appear as bind parameters."
+        echo "안내: EXPLAIN은 위에 표시된 현재 접속 사용자로 수행합니다."
+        echo "      SET ROLE 및 SET search_path는 수행하지 않습니다."
+        echo "      스키마가 생략된 객체명은 원본 세션과 다른 객체로 해석될 수 있습니다."
+        echo "      pg_stat_statements의 query는 정규화된 대표 SQL이며 원래 literal 값은 저장되지 않습니다."
         echo
         return 0
     done
+}
+
+pgss_parameter_context() {
+    _file=$1
+    _n=$2
+    if grep -Eiq "[Tt][Ii][Mm][Ee][Ss][Tt][Aa][Mm][Pp][[:space:]]+[Ww][Ii][Tt][Hh][[:space:]]+[Tt][Ii][Mm][Ee][[:space:]]+[Zz][Oo][Nn][Ee][[:space:]]+\\\$${_n}([^0-9]|$)" "$_file"; then printf 'timestamptz'; return 0; fi
+    if grep -Eiq "[Tt][Ii][Mm][Ee][Ss][Tt][Aa][Mm][Pp][[:space:]]+[Ww][Ii][Tt][Hh][Oo][Uu][Tt][[:space:]]+[Tt][Ii][Mm][Ee][[:space:]]+[Zz][Oo][Nn][Ee][[:space:]]+\\\$${_n}([^0-9]|$)" "$_file"; then printf 'timestamp'; return 0; fi
+    if grep -Eiq "[Tt][Ii][Mm][Ee][[:space:]]+[Ww][Ii][Tt][Hh][[:space:]]+[Tt][Ii][Mm][Ee][[:space:]]+[Zz][Oo][Nn][Ee][[:space:]]+\\\$${_n}([^0-9]|$)" "$_file"; then printf 'timetz'; return 0; fi
+    if grep -Eiq "[Tt][Ii][Mm][Ee][[:space:]]+[Ww][Ii][Tt][Hh][Oo][Uu][Tt][[:space:]]+[Tt][Ii][Mm][Ee][[:space:]]+[Zz][Oo][Nn][Ee][[:space:]]+\\\$${_n}([^0-9]|$)" "$_file"; then printf 'time'; return 0; fi
+    if grep -Eiq "[Ii][Nn][Tt][Ee][Rr][Vv][Aa][Ll][[:space:]]+\\\$${_n}([^0-9]|$)" "$_file"; then printf 'interval'; return 0; fi
+    if grep -Eiq "[Tt][Ii][Mm][Ee][Ss][Tt][Aa][Mm][Pp][[:space:]]+\\\$${_n}([^0-9]|$)" "$_file"; then printf 'timestamp'; return 0; fi
+    if grep -Eiq "[Dd][Aa][Tt][Ee][[:space:]]+\\\$${_n}([^0-9]|$)" "$_file"; then printf 'date'; return 0; fi
+    if grep -Eiq "[Tt][Ii][Mm][Ee][[:space:]]+\\\$${_n}([^0-9]|$)" "$_file"; then printf 'time'; return 0; fi
+    printf ''
+}
+
+pgss_render_sql_value() {
+    _value=$1
+    _context=$2
+    if [ "$_value" = '\N' ]; then
+        printf 'NULL'
+        return 0
+    fi
+    _escaped=$(printf '%s' "$_value" | sed "s/'/''/g")
+    if [ -n "$_context" ]; then
+        printf "'%s'" "$_escaped"
+        return 0
+    fi
+    if printf '%s\n' "$_value" | grep -Eq '^[+-]?(([0-9]+([.][0-9]*)?)|([.][0-9]+))([eE][+-]?[0-9]+)?$'; then
+        printf '%s' "$_value"
+        return 0
+    fi
+    case $(printf '%s' "$_value" | tr '[:upper:]' '[:lower:]') in
+        true) printf 'TRUE'; return 0 ;;
+        false) printf 'FALSE'; return 0 ;;
+    esac
+    printf "'%s'" "$_escaped"
+}
+
+pgss_rewrite_typed_literals() {
+    _src=$1
+    _dst=$2
+    sed -E \
+        -e 's/[Tt][Ii][Mm][Ee][Ss][Tt][Aa][Mm][Pp][[:space:]]+[Ww][Ii][Tt][Hh][[:space:]]+[Tt][Ii][Mm][Ee][[:space:]]+[Zz][Oo][Nn][Ee][[:space:]]+(\$[1-9][0-9]*)/(\1)::timestamptz/g' \
+        -e 's/[Tt][Ii][Mm][Ee][Ss][Tt][Aa][Mm][Pp][[:space:]]+[Ww][Ii][Tt][Hh][Oo][Uu][Tt][[:space:]]+[Tt][Ii][Mm][Ee][[:space:]]+[Zz][Oo][Nn][Ee][[:space:]]+(\$[1-9][0-9]*)/(\1)::timestamp/g' \
+        -e 's/[Tt][Ii][Mm][Ee][[:space:]]+[Ww][Ii][Tt][Hh][[:space:]]+[Tt][Ii][Mm][Ee][[:space:]]+[Zz][Oo][Nn][Ee][[:space:]]+(\$[1-9][0-9]*)/(\1)::timetz/g' \
+        -e 's/[Tt][Ii][Mm][Ee][[:space:]]+[Ww][Ii][Tt][Hh][Oo][Uu][Tt][[:space:]]+[Tt][Ii][Mm][Ee][[:space:]]+[Zz][Oo][Nn][Ee][[:space:]]+(\$[1-9][0-9]*)/(\1)::time/g' \
+        -e 's/[Ii][Nn][Tt][Ee][Rr][Vv][Aa][Ll][[:space:]]+(\$[1-9][0-9]*)/(\1)::interval/g' \
+        -e 's/[Tt][Ii][Mm][Ee][Ss][Tt][Aa][Mm][Pp][[:space:]]+(\$[1-9][0-9]*)/(\1)::timestamp/g' \
+        -e 's/[Dd][Aa][Tt][Ee][[:space:]]+(\$[1-9][0-9]*)/(\1)::date/g' \
+        -e 's/[Tt][Ii][Mm][Ee][[:space:]]+(\$[1-9][0-9]*)/(\1)::time/g' \
+        "$_src" > "$_dst"
+}
+
+prepare_pgss_replay_sql() {
+    [ "$SQL_SOURCE_KIND" = pgss ] || return 0
+    [ -n "$PGSS_RAW_SQL_FILE" ] || return 0
+    grep -Eq '\$[1-9][0-9]*' "$PGSS_RAW_SQL_FILE" || return 0
+
+    _scan=$(awk '
+    {
+        s=$0
+        while (match(s,/\$[1-9][0-9]*/)) {
+            n=substr(s,RSTART+1,RLENGTH-1)+0
+            pos++
+            count[n]++
+            if (!(n in first)) first[n]=pos
+            if (n>maxn) maxn=n
+            s=substr(s,RSTART+RLENGTH)
+        }
+    }
+    END {
+        guess=0
+        for (n=1;n<=maxn;n++) {
+            evidence=(count[n]>1)
+            for (m=n+1;m<=maxn;m++)
+                if ((m in first) && first[n]>first[m]) evidence=1
+            if (evidence && n>guess) guess=n
+        }
+        printf "%d|%d\n",maxn,guess
+    }' "$PGSS_RAW_SQL_FILE")
+    _param_max=${_scan%%|*}
+    _guess=${_scan#*|}
+    case $_param_max in ''|*[!0-9]*) return 0 ;; esac
+    [ "$_param_max" -gt 0 ] || return 0
+
+    echo
+    echo "pg_stat_statements 정규화 파라미터 처리"
+    printf '  SQL 내 최대 파라미터 번호 : $%s\n' "$_param_max"
+    printf '  원본 bind 최대 번호 추정 : %s\n' "$_guess"
+    echo
+    echo "안내: pg_stat_statements는 원래 literal을 추가 \$n 파라미터로 정규화할 수 있습니다."
+    echo "      원래 literal 값은 저장되지 않으므로 EXPLAIN 재현을 위해 값을 다시 입력해야 합니다."
+    echo "      자동 추정값보다 원본 bind 번호를 정확히 알고 있다면 직접 입력할 수 있습니다."
+
+    _default_bind_max=${PGSS_ORIGINAL_BIND_MAX:-$_guess}
+    while :; do
+        printf '원본 SQL의 가장 큰 bind 번호 (원본 bind가 없으면 0) [%s]: ' "$_default_bind_max" >&2
+        IFS= read -r _bind_max || return 1
+        [ -n "$_bind_max" ] || _bind_max=$_default_bind_max
+        case $_bind_max in ''|*[!0-9]*) echo "ERROR: 0부터 $_param_max 사이의 숫자를 입력하세요." >&2; continue ;; esac
+        [ "$_bind_max" -ge 0 ] && [ "$_bind_max" -le "$_param_max" ] || { echo "ERROR: 0부터 $_param_max 사이의 숫자를 입력하세요." >&2; continue; }
+
+        _invalid=no
+        _n=1
+        while [ "$_n" -le "$_bind_max" ]; do
+            _context=$(pgss_parameter_context "$PGSS_RAW_SQL_FILE" "$_n")
+            if [ -n "$_context" ]; then
+                echo "ERROR: \$$_n 은 $_context literal 위치에 있어 원본 bind로 사용할 수 없습니다." >&2
+                echo "       원본 bind 최대 번호를 \$$_n 보다 작게 지정하세요." >&2
+                _invalid=yes
+                break
+            fi
+            _n=$((_n+1))
+        done
+        [ "$_invalid" = no ] && break
+    done
+    PGSS_ORIGINAL_BIND_MAX=$_bind_max
+
+    PGSS_NORMALIZED_VALUES_FILE="$work_dir/pgss-normalized-values-used.txt"
+    _map="$work_dir/pgss-normalized-map.tsv"
+    _typed="$work_dir/pgss-typed-rewrite.sql"
+    _replay="$work_dir/pgss-replay.sql"
+    : > "$PGSS_NORMALIZED_VALUES_FILE"
+    : > "$_map"
+
+    _n=$((PGSS_ORIGINAL_BIND_MAX + 1))
+    while [ "$_n" -le "$_param_max" ]; do
+        if grep -Eq "\\\$${_n}([^0-9]|$)" "$PGSS_RAW_SQL_FILE"; then
+            _context=$(pgss_parameter_context "$PGSS_RAW_SQL_FILE" "$_n")
+            if [ -n "$_context" ]; then
+                printf '정규화 상수 $%s 값 (context=%s, \\N=SQL NULL): ' "$_n" "$_context" >&2
+            else
+                printf '정규화 상수 $%s 값 (\\N=SQL NULL): ' "$_n" >&2
+            fi
+            IFS= read -r _value || return 1
+            while [ -z "$_value" ]; do
+                echo "ERROR: pg_stat_statements에는 원래 literal 값이 없으므로 값을 입력해야 합니다." >&2
+                if [ -n "$_context" ]; then
+                    printf '정규화 상수 $%s 값 (context=%s, \\N=SQL NULL): ' "$_n" "$_context" >&2
+                else
+                    printf '정규화 상수 $%s 값 (\\N=SQL NULL): ' "$_n" >&2
+                fi
+                IFS= read -r _value || return 1
+            done
+            _sql_value=$(pgss_render_sql_value "$_value" "$_context")
+            printf '%s\t%s\n' "$_n" "$_sql_value" >> "$_map"
+            printf '$%s [normalized constant%s] = %s\n' "$_n" "${_context:+ / $_context}" "${_value}" >> "$PGSS_NORMALIZED_VALUES_FILE"
+        fi
+        _n=$((_n+1))
+    done
+
+    if [ ! -s "$_map" ]; then
+        echo "안내: 정규화 상수로 분류된 파라미터가 없습니다. 원본 SQL을 그대로 사용합니다."
+        return 0
+    fi
+
+    pgss_rewrite_typed_literals "$PGSS_RAW_SQL_FILE" "$_typed" || return 1
+    awk -F '\t' '
+    NR==FNR {
+        p=index($0,"\t")
+        if (p>0) {
+            n=substr($0,1,p-1)
+            repl[n]=substr($0,p+1)
+        }
+        next
+    }
+    {
+        s=$0
+        out=""
+        while (match(s,/\$[1-9][0-9]*/)) {
+            n=substr(s,RSTART+1,RLENGTH-1)
+            out=out substr(s,1,RSTART-1)
+            if (n in repl) out=out repl[n]
+            else out=out substr(s,RSTART,RLENGTH)
+            s=substr(s,RSTART+RLENGTH)
+        }
+        print out s
+    }' "$_map" "$_typed" > "$_replay" || return 1
+
+    SQL_FILE=$_replay
+    echo
+    echo "안내: 정규화 상수는 입력값으로 SQL에 복원했습니다."
+    if [ "$PGSS_ORIGINAL_BIND_MAX" -gt 0 ]; then
+        printf '      원본 bind로 분류된 $1~$%s 만 PREPARE/EXECUTE 대상으로 처리합니다.\n' "$PGSS_ORIGINAL_BIND_MAX"
+    else
+        echo "      원본 bind로 분류된 파라미터가 없어 모든 \$n 값을 literal로 복원했습니다."
+    fi
+    echo
 }
 
 detect_pg_stat_statements
@@ -410,6 +603,10 @@ while :; do
     printf 'ERROR: cannot read SQL file: %s\n' "$SQL_FILE" >&2
     SQL_FILE=
 done
+
+if [ "$SQL_SOURCE_KIND" = pgss ]; then
+    prepare_pgss_replay_sql || { echo "ERROR: pg_stat_statements SQL replay preparation failed." >&2; exit 1; }
+fi
 
 SERVER_VERSION_NUM=$(run_psql -X -Atqc 'SHOW server_version_num') || exit 1
 case $SERVER_VERSION_NUM in ''|*[!0-9]*) echo "ERROR: invalid server_version_num" >&2; exit 1 ;; esac
@@ -705,7 +902,15 @@ prepare_file="$work_dir/prepare.sql"; execute_file="$work_dir/execute.sql"; bind
 if [ "$BIND" = yes ]; then
     printf 'Parameter types, comma-separated [auto infer]: ' >&2; IFS= read -r bind_types
     { printf 'SET standard_conforming_strings = on;\nPREPARE pg_explain_target'; [ -z "$bind_types" ] || printf ' (%s)' "$bind_types"; printf ' AS\n'; cat "$SQL_FILE"; printf '\n;\n'; } > "$prepare_file"
-    BIND_COUNT=$({ cat "$prepare_file"; echo "SELECT cardinality(parameter_types) FROM pg_prepared_statements WHERE name='pg_explain_target';"; } | run_psql -X -qAt -v ON_ERROR_STOP=1) || { echo "ERROR: Could not prepare SQL." >&2; exit 1; }
+    if ! BIND_COUNT=$({ cat "$prepare_file"; echo "SELECT cardinality(parameter_types) FROM pg_prepared_statements WHERE name='pg_explain_target';"; } | run_psql -X -qAt -v ON_ERROR_STOP=1); then
+        if [ "$SQL_SOURCE_KIND" = pgss ]; then
+            echo "안내: pg_stat_statements에는 원본 bind의 데이터 타입이 저장되지 않습니다." >&2
+            echo "      정규화 상수는 복원했지만 남은 bind의 타입을 문맥만으로 추론할 수 없는 SQL일 수 있습니다." >&2
+            echo "      필요한 경우 Parameter types에 원본 bind 타입을 쉼표로 직접 지정하세요." >&2
+        fi
+        echo "ERROR: Could not prepare SQL." >&2
+        exit 1
+    fi
     case $BIND_COUNT in ''|*[!0-9]*) echo "ERROR: invalid parameter count" >&2; exit 1 ;; esac
     BIND_SAMPLE_LIMIT=${BIND_SAMPLE_LIMIT:-3}; BIND_SAMPLE_TIMEOUT=${BIND_SAMPLE_TIMEOUT:-5s}
     build_bind_map; build_bind_type_map || exit 1
@@ -951,6 +1156,11 @@ fi
      echo "execute_user=$PGSS_EXECUTE_USER"
      echo "execute_search_path=$PGSS_SEARCH_PATH"
      echo "original_search_path=unavailable"
+     [ -z "$PGSS_ORIGINAL_BIND_MAX" ] || echo "pgss_original_bind_max=$PGSS_ORIGINAL_BIND_MAX"
+     if [ -n "$PGSS_NORMALIZED_VALUES_FILE" ] && [ -s "$PGSS_NORMALIZED_VALUES_FILE" ]; then
+         echo "pgss_normalized_values:"
+         sed 's/^/  /' "$PGSS_NORMALIZED_VALUES_FILE"
+     fi
  fi
  echo
  cat "$options_summary"
