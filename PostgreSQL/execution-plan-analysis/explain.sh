@@ -1,7 +1,7 @@
 #!/bin/sh
 set -u
 
-SCRIPT_VERSION="1.2.9"
+SCRIPT_VERSION="1.2.10"
 SCRIPT_DIR=$(CDPATH='' cd "$(dirname "$0")" && pwd)
 DEFAULT_OUTPUT_DIR="$SCRIPT_DIR/results"
 PSQL_BIN=${PSQL_BIN:-}
@@ -188,78 +188,30 @@ SQL
 }
 
 render_plan_summary() {
-    _json_file=$1
-    _rows="$work_dir/plan-summary-rows.tsv"
-    _sep=$(printf '\t')
-    {
-        json_sql_prefix "$_json_file"
-        cat <<'SQL'
-nodes(path, node, is_last, depth, prefix) AS (
-    SELECT ARRAY[]::integer[], doc->0->'Plan', true, 0, ''::text
-    FROM plan_source
-  UNION ALL
-    SELECT n.path || c.ord::integer,
-           c.child,
-           c.ord = jsonb_array_length(COALESCE(n.node->'Plans','[]'::jsonb)),
-           n.depth + 1,
-           n.prefix || CASE
-               WHEN n.depth = 0 THEN ''
-               WHEN n.is_last THEN '    '
-               ELSE '|   '
-           END
-    FROM nodes n
-    CROSS JOIN LATERAL jsonb_array_elements(COALESCE(n.node->'Plans','[]'::jsonb)) WITH ORDINALITY AS c(child,ord)
-), formatted AS (
-    SELECT path,
-           depth,
-           concat(
-               prefix,
-               CASE WHEN depth=0 THEN '' WHEN is_last THEN '`-- ' ELSE '|-- ' END,
-               COALESCE(node->>'Node Type',''),
-               CASE WHEN node ? 'Index Name' THEN concat(' using ', node->>'Index Name') ELSE '' END,
-               CASE WHEN node ? 'Relation Name' THEN concat(' on ', CASE WHEN node ? 'Schema' THEN concat(node->>'Schema','.') ELSE '' END, node->>'Relation Name') ELSE '' END
-           ) AS node_line,
-           concat(prefix, CASE WHEN depth=0 THEN '  ' WHEN is_last THEN '    ' ELSE '|   ' END) AS detail_prefix,
-           COALESCE(array_to_string(ARRAY(SELECT jsonb_array_elements_text(COALESCE(node->'Sort Key','[]'::jsonb))), ', '), '') AS sort_key,
-           COALESCE(node->>'Index Cond','') AS index_cond,
-           COALESCE(node->>'Recheck Cond','') AS recheck_cond,
-           COALESCE(node->>'Hash Cond','') AS hash_cond,
-           COALESCE(node->>'Merge Cond','') AS merge_cond,
-           COALESCE(node->>'Join Filter','') AS join_filter,
-           COALESCE(node->>'Filter','') AS filter
-    FROM nodes
-)
-SELECT node_line, detail_prefix, sort_key, index_cond, recheck_cond, hash_cond, merge_cond, join_filter, filter
-FROM formatted
-ORDER BY path;
-SQL
-    } | run_psql -X -qAt -F "$_sep" -v ON_ERROR_STOP=1 > "$_rows" || return 1
+    _text_file=$1
+    awk '
+{
+    t=$0
+    sub(/^[[:space:]]+/, "", t)
 
-    [ -s "$_rows" ] || {
-        echo "ERROR: Plan Tree rows were not generated." >&2
-        return 1
+    # Plan node: keep PostgreSQL cost/rows/width and ANALYZE actual time/rows/loops.
+    if ($0 ~ /\(cost=[^)]*\)/ && (t ~ /^->/ || $0 !~ /^[[:space:]]/)) {
+        print $0
+        next
     }
 
-    awk -F '\t' '
-function clip(s,n) {
-    if (n < 20) n=20
-    return length(s)<=n ? s : substr(s,1,n-3) "..."
-}
-function detail(prefix,label,value,    room) {
-    if (value=="") return
-    room=120-length(prefix)-length(label)-3
-    printf "%s%-13s : %s\n", prefix, label, clip(value,room)
-}
-{
-    print $1
-    detail($2,"Sort Key",$3)
-    detail($2,"Index Cond",$4)
-    detail($2,"Recheck Cond",$5)
-    detail($2,"Hash Cond",$6)
-    detail($2,"Merge Cond",$7)
-    detail($2,"Join Filter",$8)
-    detail($2,"Filter",$9)
-}' "$_rows"
+    # Keep useful node predicates/keys only.
+    if (t ~ /^(Sort Key|Index Cond|Recheck Cond|Hash Cond|Merge Cond|Join Filter|Filter):/) {
+        print $0
+        next
+    }
+
+    # Keep subplan labels so tree context is not lost.
+    if (t ~ /^(CTE|InitPlan|SubPlan)([[:space:]]|$)/) {
+        print $0
+        next
+    }
+}' "$_text_file"
 }
 
 build_bind_map() {
@@ -399,7 +351,8 @@ ANALYZE=$(ask 'Use ANALYZE? yes/no' no)
 if [ "$ANALYZE" = yes ]; then
     echo
     echo "WARNING: EXPLAIN ANALYZE executes the target SQL."
-    echo "         The target SQL will actually be executed."
+    echo "         DML is executed inside BEGIN -> EXPLAIN ANALYZE -> ROLLBACK."
+    echo "         DML data changes are rolled back after plan collection."
     echo
 fi
 VERBOSE=$(ask 'Use VERBOSE? yes/no' no)
@@ -466,7 +419,6 @@ emit_plan() {
 emit_plan "$tree_json_opts" | run_psql -X -qAt -v ON_ERROR_STOP=1 > "$tree_plan_json" 2>"$plan_error" || { cat "$plan_error" >&2; exit 1; }
 extract_plan_metadata "$tree_plan_json" "$rel_file" "$dml_file" || { echo "ERROR: PostgreSQL JSON metadata parsing failed." >&2; exit 1; }
 DML_OPERATION=$(sed -n '1p' "$dml_file")
-render_plan_summary "$tree_plan_json" > "$plan_summary" 2>"$plan_error" || { cat "$plan_error" >&2; echo "ERROR: Plan Tree Summary generation failed." >&2; exit 1; }
 
 snapshot_stats() {
     tf=$1; inf=$2; : > "$tf"; : > "$inf"
@@ -483,16 +435,22 @@ print_table_delta() {
 
 print_index_delta() {
     [ -s "$index_before" ] && [ -s "$index_after" ] || return 0
-    awk -F'|' 'NR==FNR {for(i=3;i<=7;i++) b[$1,i]=$i; name[$1]=$2; next} {id=$1; printf "\n%s\n",name[id]; printf "%-24s %15s %15s %15s\n","metric","before","after","delta"; printf "%-24s %15s %15s %15s\n","------------------------","---------------","---------------","---------------"; label[3]="idx_scan";label[4]="idx_tup_read";label[5]="idx_scan";label[4]="idx_tup_read";label[5]="idx_tup_fetch";label[6]="idx_blks_read";label[7]="idx_blks_hit"; for(i=3;i<=7;i++){before=(b[id,i]==""?0:b[id,i]);after=$i;delta=after-before;printf "%-24s %15s %15s %+15d\n",label[i],before,after,delta}}' "$index_before" "$index_after"
+    awk -F'|' 'NR==FNR {for(i=3;i<=7;i++) b[$1,i]=$i; name[$1]=$2; next} {id=$1; printf "\n%s\n",name[id]; printf "%-24s %15s %15s %15s\n","metric","before","after","delta"; printf "%-24s %15s %15s %15s\n","------------------------","---------------","---------------","---------------"; label[3]="idx_scan";label[4]="idx_tup_read";label[5]="idx_tup_fetch";label[6]="idx_blks_read";label[7]="idx_blks_hit"; for(i=3;i<=7;i++){before=(b[id,i]==""?0:b[id,i]);after=$i;delta=after-before;printf "%-24s %15s %15s %+15d\n",label[i],before,after,delta}}' "$index_before" "$index_after"
 }
 
 if [ "$ANALYZE" = yes ]; then
     echo
-    [ -z "$DML_OPERATION" ] || echo "DML detected: $DML_OPERATION"
-    echo "Safety     : BEGIN -> EXPLAIN ANALYZE -> ROLLBACK"
+    if [ -n "$DML_OPERATION" ]; then
+        echo "DML detected: $DML_OPERATION"
+        echo "Safety     : BEGIN -> EXPLAIN ANALYZE -> ROLLBACK"
+    fi
     printf 'Type EXECUTE to continue: ' >&2; IFS= read -r confirm; [ "$confirm" = EXECUTE ] || { echo "Cancelled."; exit 1; }
     [ ! -s "$rel_file" ] || snapshot_stats "$table_before" "$index_before"
-    { printf 'BEGIN;\n'; emit_plan "$raw_text_opts"; printf 'ROLLBACK;\n'; } > "$tmp"
+    if [ -n "$DML_OPERATION" ]; then
+        { printf 'BEGIN;\n'; emit_plan "$raw_text_opts"; printf 'ROLLBACK;\n'; } > "$tmp"
+    else
+        emit_plan "$raw_text_opts" > "$tmp"
+    fi
 else
     emit_plan "$raw_text_opts" > "$tmp"
 fi
@@ -501,14 +459,16 @@ fi
  echo "PostgreSQL execution plan analysis"; echo "script_version=$SCRIPT_VERSION"; echo "database=$PGDATABASE"; echo "sql_file=$SQL_FILE"; echo
 } > "$RESULT_FILE"
 
-section "Execution Plan Summary" | tee -a "$RESULT_FILE"
-cat "$plan_summary" | tee -a "$RESULT_FILE"
-
 if ! run_psql -X -qAt -P pager=off -v ON_ERROR_STOP=1 -f "$tmp" > "$raw_plan_output" 2>"$plan_error"; then
     cat "$plan_error" | tee -a "$RESULT_FILE" >&2
     echo "ERROR: Raw execution plan generation failed." | tee -a "$RESULT_FILE" >&2
     exit 1
 fi
+
+render_plan_summary "$raw_plan_output" > "$plan_summary" || { echo "ERROR: Plan Summary generation failed." >&2; exit 1; }
+
+section "Execution Plan Summary" | tee -a "$RESULT_FILE"
+cat "$plan_summary" | tee -a "$RESULT_FILE"
 
 if [ "$ANALYZE" = yes ]; then
     section "Execution Plan Raw (TEXT / Actual)" | tee -a "$RESULT_FILE"
