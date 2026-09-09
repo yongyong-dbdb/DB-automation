@@ -1,11 +1,11 @@
 #!/bin/sh
-# mysql_gr_migrate.sh v1.0.4
+# mysql_gr_migrate.sh v1.0.5
 # POSIX sh; OS utilities and MySQL clients only. No external language packages.
 # Supported: Oracle MySQL 8.0.27+, 8.4.x, 9.7.x; homogeneous exact versions.
 # Single-primary or multi-primary / XCom. Never resets GTID or binary logs.
 set -eu
 umask 077
-VERSION=1.0.4
+VERSION=1.0.5
 ROOT=${MYSQL_GR_WORK_ROOT:-"$(pwd)/mysql_gr_work"}
 MYSQL=${MYSQL_GR_MYSQL:-mysql}
 DUMP=${MYSQL_GR_MYSQLDUMP:-mysqldump}
@@ -22,7 +22,20 @@ required() (
     [ -n "$a" ] || { log 'A value is required.'; exit 1; }
     printf '%s' "$a"
 )
-confirm() { [ "$(ask "Type $1 to continue" '')" = "$1" ] || die 'Cancelled.'; }
+confirm() {
+    expected=$1; alias=${2:-}
+    while :; do
+        answer=$(ask "Type $expected to continue" '')
+        if [ "$answer" = "$expected" ] || { [ -n "$alias" ] && [ "$answer" = "$alias" ]; }; then
+            return 0
+        fi
+        if [ -n "$alias" ]; then
+            log "Confirmation did not match. Enter '$expected' or '$alias'."
+        else
+            log "Confirmation did not match. Enter '$expected'."
+        fi
+    done
+}
 uint() { case $1 in ''|*[!0-9]*) return 1;; *) return 0;; esac; }
 port_ok() { uint "$1" && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
 safe_host() { case $1 in ''|*[!a-zA-Z0-9_.-]*) die 'Use an IPv4 address or DNS name (IPv6 is not supported in v1.0.2).';; esac; }
@@ -223,12 +236,15 @@ discover() {
     PHASE=discover
     prepare_discovery
     mkdir -p "$ROOT/meta"
-    log '1) Existing GTID replication -> GR'; log '2) Standalone -> GR'
+    log '1) Existing GTID replication -> GR : reuse an existing GTID source/replica topology; replicas catch up before cutover.'
+    log '2) Standalone -> GR                 : build GR from standalone/new members; each non-source member is inspected before provisioning.'
     choice=$(required 'Migration mode (1/2)' '')
     case $choice in 1) put meta mode gtid;; 2) put meta mode standalone;; *) die 'Choose 1 or 2';; esac
     count=$(required 'Member count (2..9)' 3)
     uint "$count" && [ "$count" -ge 2 ] && [ "$count" -le 9 ] || die 'Member count must be 2..9'
     put meta count "$count"
+    log '  single: one writable PRIMARY; secondaries remain read-only.'
+    log '  multi : all members can accept writes; application conflict handling is required.'
     topology=$(required 'GR primary mode (single/multi)' single)
     case $topology in single|multi) :;; *) die 'Choose single or multi';; esac
     put meta primary_mode "$topology"
@@ -255,6 +271,8 @@ discover() {
             h=$(required 'Management host' ''); safe_host "$h"; put "$i" host "$h"
             p=$(required 'Management TCP port' ''); port_ok "$p" || die 'Invalid port'; put "$i" port "$p"
             put "$i" location remote
+            log '  VERIFY_IDENTITY: encrypted connection with CA/host identity verification (recommended).'
+            log '  REQUIRED       : encrypted connection without server identity verification.'
             tls=$(required 'Management TLS (VERIFY_IDENTITY/REQUIRED)' VERIFY_IDENTITY)
             case $tls in VERIFY_IDENTITY|REQUIRED) :;; *) die 'Invalid TLS mode';; esac
             put "$i" admin_tls "$tls"
@@ -310,6 +328,8 @@ discover() {
 
     put meta allowlist "$(required 'XCom IP allowlist (member IPs/CIDRs, comma-separated; no spaces)' '')"
     case "$(get meta allowlist)" in *[!A-Za-z0-9_.,:/-]*) die 'Invalid allowlist';; esac
+    log '  VERIFY_IDENTITY: verify the distributed-recovery server certificate identity (recommended).'
+    log '  REQUIRED       : require TLS but do not verify server identity.'
     tls=$(required 'GR TLS (VERIFY_IDENTITY/REQUIRED)' VERIFY_IDENTITY)
     case $tls in VERIFY_IDENTITY|REQUIRED) :;; *) die 'Invalid GR TLS';; esac
     [ "$tls" != REQUIRED ] || confirm 'ALLOW UNVERIFIED GR TLS'
@@ -324,6 +344,7 @@ discover() {
     put meta complete yes
     PHASE=registered
     log "Discovery complete: $ROOT"
+    [ "$STEP" = all ] || log "NEXT: sh mysql_gr_migrate.sh configure"
 }
 no_group() {
     for ng in $(ids); do
@@ -637,7 +658,7 @@ r_main() {
     r_config_guard
     [ "$DO_RESTART" != yes ] || r_restart_guard
     CFGLOCK="${CNF}.gr_lock"; mkdir "$CFGLOCK" || { CFGLOCK=''; r_die 'Remote config is locked by another operation'; }
-    stamp="v${VERSION}_$(date +%Y%m%d_%H%M%S)_$$"
+    stamp="$(date +%Y%m%d_%H%M%S)_$$"
     VALIDATE_LOG="${CNF}.gr_validate_${stamp}.log"
     START_LOG="${CNF}.gr_start_${stamp}.log"
     CANDIDATE=$(mktemp "${CNF}.gr_candidate.XXXXXX")
@@ -786,8 +807,16 @@ configure() {
     PHASE=configure
     put meta mutation_started configure
     connected; no_group; endpoints_check
+    while :; do
+    log '  minimum   : GR-required settings only; preserves existing durability policy where possible.'
+    log '  production: minimum + sync_binlog=1, innodb_flush_log_at_trx_commit=1 and FULL row image.'
     profile=$(required 'Configuration profile (minimum/production)' minimum)
-    case $profile in minimum|production) :;; *) die 'Invalid profile';; esac
+    case $profile in
+        minimum|min) profile=minimum; break;;
+        production|prod) profile=production; break;;
+        *) log 'Invalid profile. Enter minimum/min or production/prod.';;
+    esac
+done
     put meta profile "$profile"
     if [ "$profile" = production ]; then
         log 'Production profile adds sync_binlog=1, innodb_flush_log_at_trx_commit=1 and FULL row image; storage I/O can increase.'
@@ -845,7 +874,7 @@ configure() {
         if ! "$exe" --defaults-file="$candidate" --validate-config > "$RUN/node_$i.config_validation.log" 2>&1; then
             rm -f "$candidate"; die "Configuration validation failed: $RUN/node_$i.config_validation.log"
         fi
-        backup="${cnf}.before_gr_v${VERSION}_$(date +%Y%m%d_%H%M%S)_$$"
+        backup="${cnf}.before_gr_$(date +%Y%m%d_%H%M%S)_$$"
         cp -p "$cnf" "$backup"; cmp -s "$cnf" "$backup" || die 'Config backup verification failed'
         cat "$candidate" > "$cnf"; rm -f "$candidate"
         log "Saved backup: $backup"
@@ -858,6 +887,7 @@ configure() {
         fi
     done
     log 'Configuration generation finished. Runtime precheck is mandatory before initialization.'
+    [ "$STEP" = all ] || log 'NEXT: sh mysql_gr_migrate.sh precheck'
 }
 channels_check() (
     i=$1; ch=$(q "$(get "$i" channel)")
@@ -911,10 +941,11 @@ precheck() {
         sql "$i" 'SELECT @@version,@@server_uuid,@@server_id,@@gtid_executed,@@gtid_purged,@@read_only,@@super_read_only,@@event_scheduler;' > "$RUN/node_$i.precheck.tsv"
     done
     log 'PRECHECK PASSED'
+    [ "$STEP" != precheck ] || log 'NEXT: sh mysql_gr_migrate.sh initialize'
 }
 fence() {
     log 'Stop application writers, DDL jobs, backup/restore jobs and privileged maintenance connections first.'
-    confirm 'WRITERS STOPPED'
+    confirm 'WRITERS STOPPED' 'STOPPED'
     for i in $(ids); do
         if [ ! -f "$ROOT/$i/before_read_only" ]; then
             put "$i" before_read_only "$(val "$i" read_only)"
@@ -926,72 +957,221 @@ fence() {
         [ "$(sql "$i" "SELECT COUNT(*) FROM information_schema.innodb_trx;")" = 0 ] || die "Node $i has active InnoDB transactions; drain then retry"
     done
 }
-catchup() (
+normalize_gtid() {
+    printf '%s' "$1" | tr -d '[:space:]'
+}
+
+gtid_origin() {
+    extra=$(normalize_gtid "$1")
+    node_uuid=$(printf '%s' "$2" | tr 'A-Z' 'a-z')
+    source_uuid=$(printf '%s' "$3" | tr 'A-Z' 'a-z')
+    [ -n "$extra" ] || { printf '%s' NONE; return; }
+    local_seen=no; source_seen=no; other_seen=no
+    for component in $(printf '%s' "$extra" | tr ',' ' '); do
+        component=$(printf '%s' "$component" | tr 'A-Z' 'a-z')
+        case $component in
+            "${node_uuid}":*) local_seen=yes;;
+            "${source_uuid}":*) source_seen=yes;;
+            *) other_seen=yes;;
+        esac
+    done
+    if [ "$other_seen" = yes ]; then
+        printf '%s' THIRD_PARTY_OR_MIXED
+    elif [ "$local_seen" = yes ] && [ "$source_seen" = yes ]; then
+        printf '%s' LOCAL_AND_SOURCE_UUID
+    elif [ "$local_seen" = yes ]; then
+        printf '%s' LOCAL_NODE_UUID
+    elif [ "$source_seen" = yes ]; then
+        printf '%s' SOURCE_UUID
+    else
+        printf '%s' UNKNOWN
+    fi
+}
+
+gtid_compare() {
+    i=$1; target=$(normalize_gtid "$2")
+    node_gtid=$(normalize_gtid "$(val "$i" gtid_executed)")
+    node_purged=$(normalize_gtid "$(val "$i" gtid_purged)")
+    extra=$(normalize_gtid "$(sql "$i" "SELECT GTID_SUBTRACT(@@GLOBAL.gtid_executed,'$(q "$target")');")")
+    missing=$(normalize_gtid "$(sql "$i" "SELECT GTID_SUBTRACT('$(q "$target")',@@GLOBAL.gtid_executed);")")
+    source_available=$(normalize_gtid "$(sql 1 'SELECT GTID_SUBTRACT(@@GLOBAL.gtid_executed,@@GLOBAL.gtid_purged);')")
+    unavailable=''
+    if [ -n "$missing" ]; then
+        unavailable=$(normalize_gtid "$(sql 1 "SELECT GTID_SUBTRACT('$(q "$missing")','$(q "$source_available")');")")
+    fi
+    source_uuid=$(get 1 uuid)
+    node_uuid=$(get "$i" uuid)
+    origin=$(gtid_origin "$extra" "$node_uuid" "$source_uuid")
+    {
+        printf 'FIELD\tVALUE\n'
+        printf 'SOURCE_UUID\t%s\n' "$source_uuid"
+        printf 'NODE_UUID\t%s\n' "$node_uuid"
+        printf 'TARGET_GTID\t%s\n' "$target"
+        printf 'NODE_GTID\t%s\n' "$node_gtid"
+        printf 'NODE_GTID_PURGED\t%s\n' "$node_purged"
+        printf 'EXTRA_GTID\t%s\n' "$extra"
+        printf 'MISSING_GTID\t%s\n' "$missing"
+        printf 'MISSING_UNAVAILABLE_ON_SOURCE\t%s\n' "$unavailable"
+        printf 'EXTRA_ORIGIN\t%s\n' "$origin"
+    } > "$RUN/node_${i}.gtid_compare.tsv"
+    GTID_EXTRA=$extra
+    GTID_MISSING=$missing
+    GTID_UNAVAILABLE=$unavailable
+    GTID_ORIGIN=$origin
+    if [ -n "$extra" ] || [ -n "$missing" ]; then
+        log "Node $i GTID comparison:"
+        log "  Source UUID                  : $source_uuid"
+        log "  Node UUID                    : $node_uuid"
+        log "  Extra on Node $i             : ${extra:-NONE}"
+        log "  Missing on Node $i           : ${missing:-NONE}"
+        log "  Missing unavailable on Source: ${unavailable:-NONE}"
+        log "  Extra origin                 : $origin"
+        log "  Evidence                     : $RUN/node_${i}.gtid_compare.tsv"
+    fi
+}
+
+gtid_guard() {
     i=$1; target=$2
-    [ "$(sql "$i" "SELECT WAIT_FOR_EXECUTED_GTID_SET('$(q "$target")',300);")" = 0 ] || die "Node $i GTID wait timed out"
-    [ "$(sql "$i" "SELECT GTID_SUBTRACT(@@GLOBAL.gtid_executed,'$(q "$target")');")" = '' ] || die "Node $i contains extra/errant GTIDs; reconcile or externally reprovision"
+    gtid_compare "$i" "$target"
+    [ -z "$GTID_EXTRA" ] || die "Node $i contains extra/errant GTIDs ($GTID_ORIGIN). Review the recorded GTIDs and reconcile or externally reprovision; GTIDs are never reset automatically."
+    [ -z "$GTID_UNAVAILABLE" ] || die "Node $i is missing GTIDs already purged from node 1 binary logs; incremental catch-up is not possible. Externally reprovision from the authoritative source."
+}
+
+catchup() (
+    i=$1; target=$(normalize_gtid "$2")
+    gtid_guard "$i" "$target"
+    if [ -n "$GTID_MISSING" ]; then
+        wait_rc=$(sql "$i" "SELECT WAIT_FOR_EXECUTED_GTID_SET('$(q "$target")',300);")
+        if [ "$wait_rc" != 0 ]; then
+            gtid_compare "$i" "$target"
+            die "Node $i GTID wait timed out; inspect the GTID comparison evidence"
+        fi
+    fi
+    gtid_compare "$i" "$target"
+    [ -z "$GTID_EXTRA" ] || die "Node $i acquired extra/errant GTIDs during catch-up; reconcile before GR migration"
+    [ -z "$GTID_MISSING" ] || die "Node $i is still missing GTIDs after catch-up"
 )
+
+classify_member() {
+    i=$1; target=$2
+    if [ "$i" = 1 ]; then printf '%s' SOURCE; return; fi
+    if [ "$(get "$i" kind)" = replica ]; then printf '%s' EXISTING_REPLICA; return; fi
+    app_count=$(sql "$i" "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name NOT IN ('mysql','sys','performance_schema','information_schema');")
+    source_app_count=$(sql 1 "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name NOT IN ('mysql','sys','performance_schema','information_schema');")
+    node_gtid=$(normalize_gtid "$(val "$i" gtid_executed)")
+    if [ "$app_count" = 0 ] && [ -z "$node_gtid" ]; then
+        printf '%s' NEW_EMPTY
+        return
+    fi
+    gtid_compare "$i" "$target"
+    if [ -n "$GTID_EXTRA" ]; then
+        printf '%s' DIVERGED
+    elif [ -n "$GTID_MISSING" ]; then
+        printf '%s' NEEDS_PROVISIONING
+    elif [ "$source_app_count" -gt 0 ] && [ "$app_count" = 0 ]; then
+        printf '%s' NEEDS_PROVISIONING
+    else
+        printf '%s' PREPROVISIONED
+    fi
+}
+
 initialize() {
     PHASE=initialize
     put meta mutation_started initialize
     precheck; fence
-    target=$(val 1 gtid_executed)
+    target=$(normalize_gtid "$(val 1 gtid_executed)")
     put meta frozen_gtid "$target"
     for i in $(ids); do
         [ "$i" != 1 ] || continue
-        if [ "$(get "$i" kind)" = replica ]; then
-            ch=$(q "$(get "$i" channel)")
-            log "Starting/catching up only node $i selected GTID channel after any configuration restart."
-            sql "$i" "START REPLICA FOR CHANNEL '$ch';"
-            catchup "$i" "$target"
-            put "$i" initialized replica
-            continue
-        fi
-        method=$(required "Node $i initialization (dump/already/external)" dump)
-        case $method in
-            external) log 'Restore the authoritative full data/GTID set using your validated physical backup/Clone procedure, then select already.'; die 'External initialization pending';;
-            already)
+        state=$(classify_member "$i" "$target")
+        put "$i" state "$state"
+        case $state in
+            EXISTING_REPLICA)
+                log "Node $i state: EXISTING_REPLICA - existing GTID channel will catch up to node 1 before GR cutover."
+                ch=$(q "$(get "$i" channel)")
+                # Check errant/unavailable GTIDs before changing channel state.
+                gtid_guard "$i" "$target"
+                log "Starting/catching up only node $i selected GTID channel after any configuration restart."
+                sql "$i" "START REPLICA FOR CHANNEL '$ch';"
+                catchup "$i" "$target"
+                put "$i" initialized replica
+                ;;
+            NEW_EMPTY)
+                log "Node $i state: NEW_EMPTY - no application schema and no executed GTID history."
+                log '  dump    : provision from node 1 with a consistent logical dump and source GTID set.'
+                log '  external: use a separately validated physical backup/other provisioning procedure.'
+                while :; do
+                    method=$(required "Node $i initialization (dump/external)" dump)
+                    case $method in dump|external) break;; *) log 'Invalid initialization method. Enter dump or external.';; esac
+                done
+                if [ "$method" = external ]; then
+                    log 'Restore the authoritative full data/GTID set, then rerun initialize. No GTID reset is performed by this script.'
+                    die "Node $i external initialization pending"
+                fi
+                [ -z "$(normalize_gtid "$(val "$i" gtid_executed)")" ] || die "Node $i gained GTID history after classification; no automatic GTID reset is performed"
+                [ "$(sql "$i" "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name NOT IN ('mysql','sys','performance_schema','information_schema');")" = 0 ] || die "Node $i is no longer empty; externally provision it"
+                dbs=$(sql 1 "SELECT schema_name FROM information_schema.schemata WHERE schema_name NOT IN ('mysql','sys','performance_schema','information_schema') ORDER BY schema_name;")
+                [ -n "$dbs" ] || die 'Authoritative source has no application DBs; use external/preprovisioned verification for this intentionally empty topology'
+                for db in $dbs; do case $db in *[!A-Za-z0-9_\$]*) die 'Database name requires external provisioning';; esac; done
+                command -v "$DUMP" >/dev/null 2>&1 || die 'Matching mysqldump executable required'
+                "$DUMP" --version > "$RUN/mysqldump_version.txt"
+                dv=$(sed -n 's/.*Ver \([0-9][0-9.]*\).*/\1/p' "$RUN/mysqldump_version.txt")
+                sv=$(get 1 version | sed 's/[^0-9.].*//')
+                [ "$dv" = "$sv" ] || die "mysqldump version $dv does not match server $sv; set MYSQL_GR_MYSQLDUMP"
+                confirm "INITIALIZE EMPTY NODE $i"
+                dump="$RUN/full_application_node_$i.sql"
+                set -f; set -- $dbs; set +f
+                "$DUMP" --defaults-file="$TEMP/1.cnf" --no-login-paths --single-transaction --quick --skip-lock-tables --routines --events --triggers --hex-blob --set-gtid-purged=ON --databases "$@" > "$dump" 2> "$RUN/node_$i.dump.log"
+                [ -s "$dump" ] || die 'Empty dump'
+                sha256sum "$dump" > "$dump.sha256"
+                [ "$(normalize_gtid "$(val 1 gtid_executed)")" = "$target" ] || die 'Source changed during initialization'
+                mkdir -p "$TEMP/unfenced"; : > "$TEMP/unfenced/$i"
+                sql "$i" 'SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF;'
+                if ! "$MYSQL" --defaults-file="$TEMP/$i.cnf" --no-login-paths --binary-mode < "$dump" > "$RUN/node_$i.restore.log" 2>&1; then
+                    sql "$i" 'SET GLOBAL super_read_only=ON;' || :
+                    die "Restore failed; node $i requires external clean reprovisioning before retry"
+                fi
+                events=$(sql "$i" "SELECT CONCAT('ALTER EVENT ',CHAR(96),REPLACE(EVENT_SCHEMA,CHAR(96),CONCAT(CHAR(96),CHAR(96))),CHAR(96),'.',CHAR(96),REPLACE(EVENT_NAME,CHAR(96),CONCAT(CHAR(96),CHAR(96))),CHAR(96),' DISABLE;') FROM information_schema.events;")
+                sql "$i" "SET SESSION sql_log_bin=0; $events SET GLOBAL super_read_only=ON;"
+                rm -f "$TEMP/unfenced/$i"
+                catchup "$i" "$target"
+                put "$i" initialized dump
+                ;;
+            PREPROVISIONED)
+                log "Node $i state: PREPROVISIONED - GTID set matches node 1 and application schemas exist; row equality is NOT inferred from GTIDs."
+                log '  already : accept only after confirming the node came from the authoritative dataset and full data consistency was verified.'
+                log '  external: replace/re-provision it using a separately validated procedure.'
+                while :; do
+                    method=$(required "Node $i initialization (already/external)" already)
+                    case $method in already|external) break;; *) log 'Invalid initialization method. Enter already or external.';; esac
+                done
+                if [ "$method" = external ]; then
+                    die "Node $i external re-provisioning pending"
+                fi
                 confirm "NODE $i DATA AND GTID VERIFIED"
-                catchup "$i" "$target"; put "$i" initialized external; continue;;
-            dump) :;; *) die 'Invalid initialization method';;
+                catchup "$i" "$target"
+                put "$i" initialized preprovisioned
+                ;;
+            NEEDS_PROVISIONING)
+                log "Node $i state: NEEDS_PROVISIONING - it is not empty and does not exactly match the authoritative GTID/data starting point."
+                gtid_compare "$i" "$target"
+                die "Node $i requires external provisioning from node 1 before GR migration; automatic merge/reset is not performed"
+                ;;
+            DIVERGED)
+                log "Node $i state: DIVERGED - extra GTIDs exist outside the authoritative node 1 set."
+                gtid_compare "$i" "$target"
+                die "Node $i contains divergent GTID history; inspect the recorded GTIDs and reconcile or externally reprovision"
+                ;;
+            *) die "Unknown node $i initialization state: $state";;
         esac
-        [ -z "$(val "$i" gtid_executed)" ] || die "Node $i has GTID history; no automatic GTID reset is performed"
-        [ "$(sql "$i" "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name NOT IN ('mysql','sys','performance_schema','information_schema');")" = 0 ] || die "Node $i is not empty; use external provisioning"
-        # Strict names keep positional arguments and DEFINER/event SQL unambiguous.
-        dbs=$(sql 1 "SELECT schema_name FROM information_schema.schemata WHERE schema_name NOT IN ('mysql','sys','performance_schema','information_schema') ORDER BY schema_name;")
-        [ -n "$dbs" ] || die 'No application DBs; use already for an intentionally empty topology'
-        for db in $dbs; do case $db in *[!A-Za-z0-9_\$]*) die 'Database name requires external provisioning';; esac; done
-        command -v "$DUMP" >/dev/null 2>&1 || die 'Matching mysqldump executable required'
-        "$DUMP" --version > "$RUN/mysqldump_version.txt"
-        dv=$(sed -n 's/.*Ver \([0-9][0-9.]*\).*/\1/p' "$RUN/mysqldump_version.txt")
-        sv=$(get 1 version | sed 's/[^0-9.].*//')
-        [ "$dv" = "$sv" ] || die "mysqldump version $dv does not match server $sv; set MYSQL_GR_MYSQLDUMP"
-        confirm "INITIALIZE EMPTY NODE $i"
-        dump="$RUN/full_application_node_$i.sql"
-        # Source is fenced: GTID snapshot remains stable throughout the dump.
-        set -f; set -- $dbs; set +f
-        "$DUMP" --defaults-file="$TEMP/1.cnf" --no-login-paths --single-transaction --quick --skip-lock-tables --routines --events --triggers --hex-blob --set-gtid-purged=ON --databases "$@" > "$dump" 2> "$RUN/node_$i.dump.log"
-        [ -s "$dump" ] || die 'Empty dump'
-        sha256sum "$dump" > "$dump.sha256"
-        [ "$(val 1 gtid_executed)" = "$target" ] || die 'Source changed during initialization'
-        mkdir -p "$TEMP/unfenced"; : > "$TEMP/unfenced/$i"
-        sql "$i" 'SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF;'
-        if ! "$MYSQL" --defaults-file="$TEMP/$i.cnf" --no-login-paths --binary-mode < "$dump" > "$RUN/node_$i.restore.log" 2>&1; then
-            sql "$i" 'SET GLOBAL super_read_only=ON;' || :
-            die "Restore failed; node $i requires external clean reprovisioning before retry"
-        fi
-        # Dumped events stay disabled; no replicated event may run twice.
-        events=$(sql "$i" "SELECT CONCAT('ALTER EVENT ',CHAR(96),REPLACE(EVENT_SCHEMA,CHAR(96),CONCAT(CHAR(96),CHAR(96))),CHAR(96),'.',CHAR(96),REPLACE(EVENT_NAME,CHAR(96),CONCAT(CHAR(96),CHAR(96))),CHAR(96),' DISABLE;') FROM information_schema.events;")
-        sql "$i" "SET SESSION sql_log_bin=0; $events SET GLOBAL super_read_only=ON;"
-        rm -f "$TEMP/unfenced/$i"
-        catchup "$i" "$target"
-        put "$i" initialized dump
     done
-    [ "$(val 1 gtid_executed)" = "$target" ] || die 'Source changed while fenced'
+    [ "$(normalize_gtid "$(val 1 gtid_executed)")" = "$target" ] || die 'Source changed while fenced'
     data_checks
     put meta initialized yes
     log 'INITIALIZATION PASSED. All nodes remain write-fenced; event schedulers remain OFF.'
+    [ "$STEP" = all ] || log 'NEXT: sh mysql_gr_migrate.sh cutover'
 }
+
 data_checks() {
     manifest_sql="SELECT TABLE_SCHEMA,TABLE_NAME,TABLE_TYPE,COALESCE(ENGINE,'') FROM information_schema.tables WHERE TABLE_SCHEMA NOT IN ('mysql','sys','performance_schema','information_schema') ORDER BY TABLE_SCHEMA,TABLE_NAME; SELECT TABLE_SCHEMA,TABLE_NAME,COLUMN_NAME,ORDINAL_POSITION,COLUMN_TYPE,IS_NULLABLE,COALESCE(COLUMN_DEFAULT,'<NULL>'),EXTRA FROM information_schema.columns WHERE TABLE_SCHEMA NOT IN ('mysql','sys','performance_schema','information_schema') ORDER BY TABLE_SCHEMA,TABLE_NAME,ORDINAL_POSITION;"
     sql 1 "$manifest_sql" > "$RUN/node_1.schema_manifest.tsv"
@@ -1057,6 +1237,8 @@ group_settings() (
 )
 accounts() {
     log 'XCom/incremental recovery uses REPLICATION SLAVE and CONNECTION_ADMIN; no GRANT ALL.'
+    log '  create  : create dedicated minimum-privilege recovery accounts on the members.'
+    log '  existing: reuse pre-created recovery accounts after grant/TLS verification.'
     action=$(required 'Recovery accounts (create/existing)' create)
     case $action in create|existing) :;; *) die 'Invalid account action';; esac
     ru=$(required 'Dedicated recovery user' '')
@@ -1230,6 +1412,7 @@ status() {
     connected
     for i in $(ids); do
         log "--- Node $i ---"
+        [ ! -f "$ROOT/$i/state" ] || log "Initialization state: $(get "$i" state)"
         sql "$i" 'SELECT @@server_uuid,@@read_only,@@super_read_only,@@event_scheduler,@@gtid_executed; SELECT * FROM performance_schema.replication_group_members; SELECT CHANNEL_NAME,SERVICE_STATE,LAST_ERROR_NUMBER,LAST_ERROR_MESSAGE FROM performance_schema.replication_connection_status; SELECT CHANNEL_NAME,SERVICE_STATE,LAST_ERROR_NUMBER,LAST_ERROR_MESSAGE FROM performance_schema.replication_applier_status_by_worker;' | tee "$RUN/node_$i.status.tsv"
     done
 }
@@ -1252,6 +1435,7 @@ main() {
 
 
 # v1.0.4: automatic discovery/configuration overrides.
+# v1.0.5: state-based member initialization, GTID diagnostics, safer prompts and concise option guidance.
 safe_host() { case $1 in ''|*[!a-zA-Z0-9_.-]*) die "Use an IPv4 address or DNS name (IPv6 is not supported in v$VERSION).";; esac; }
 
 host_is_local() (
@@ -1550,7 +1734,8 @@ discover() {
     PHASE=discover
     prepare_discovery
     mkdir -p "$ROOT/meta"
-    log '1) Existing GTID replication -> GR'; log '2) Standalone -> GR'
+    log '1) Existing GTID replication -> GR : reuse an existing GTID source/replica topology; replicas catch up before cutover.'
+    log '2) Standalone -> GR                 : build GR from standalone/new members; each non-source member is inspected before provisioning.'
     legacy_state=${MYSQL_GR_GTID_STATE_FILE:-${MYSQL_GTID_STATE_FILE:-"$(pwd)/.mysql_gtid_replication.state"}}
     default_migration=2; [ -r "$legacy_state" ] && [ "${MYSQL_GR_IGNORE_GTID_STATE:-0}" != 1 ] && default_migration=1
     choice=$(required 'Migration mode (1/2)' "$default_migration")
@@ -1558,6 +1743,8 @@ discover() {
     count=$(required 'Member count (2..9)' 3)
     uint "$count" && [ "$count" -ge 2 ] && [ "$count" -le 9 ] || die 'Member count must be 2..9'
     put meta count "$count"
+    log '  single: one writable PRIMARY; secondaries remain read-only.'
+    log '  multi : all members can accept writes; application conflict handling is required.'
     topology=$(required 'GR primary mode (single/multi)' single)
     case $topology in single|multi) :;; *) die 'Choose single or multi';; esac
     put meta primary_mode "$topology"
@@ -1578,6 +1765,8 @@ discover() {
         else
             socket_total=$(awk 'END{print NR+0}' "$RUN/socket_candidates")
             default_mode=tcp; [ "$socket_total" -gt 0 ] && default_mode=socket
+            log '  socket: local Unix socket; useful for multiple local MySQL instances.'
+            log '  tcp   : network connection; use for remote hosts or TCP-only administration.'
             mode=$(required 'Management connection (socket/tcp)' "$default_mode")
             case $mode in socket|tcp) :;; *) die 'Invalid connection mode';; esac
             put "$i" mode "$mode"
@@ -1592,6 +1781,8 @@ discover() {
             fi
         fi
         if [ "$mode" = tcp ]; then
+            log '  VERIFY_IDENTITY: encrypted connection with CA/host identity verification (recommended).'
+            log '  REQUIRED       : encrypted connection without server identity verification.'
             tls=$(required 'Management TLS (VERIFY_IDENTITY/REQUIRED)' VERIFY_IDENTITY)
             case $tls in VERIFY_IDENTITY|REQUIRED) :;; *) die 'Invalid TLS mode';; esac
             put "$i" admin_tls "$tls"
@@ -1650,6 +1841,8 @@ discover() {
     group=$(sql 1 'SELECT UUID();'); put meta group "$group"
     put meta allowlist "$(required 'XCom IP allowlist (member IPs/CIDRs, comma-separated; no spaces)' '')"
     case "$(get meta allowlist)" in *[!A-Za-z0-9_.,:/-]*) die 'Invalid allowlist';; esac
+    log '  VERIFY_IDENTITY: verify the distributed-recovery server certificate identity (recommended).'
+    log '  REQUIRED       : require TLS but do not verify server identity.'
     tls=$(required 'GR TLS (VERIFY_IDENTITY/REQUIRED)' VERIFY_IDENTITY)
     case $tls in VERIFY_IDENTITY|REQUIRED) :;; *) die 'Invalid GR TLS';; esac
     [ "$tls" != REQUIRED ] || confirm 'ALLOW UNVERIFIED GR TLS'
@@ -1668,6 +1861,7 @@ discover() {
     put meta complete yes
     PHASE=registered
     log "Discovery complete: $ROOT"
+    [ "$STEP" = all ] || log "NEXT: sh mysql_gr_migrate.sh configure"
 }
 
 ssh_options() (
@@ -1744,8 +1938,16 @@ configure() {
     PHASE=configure
     put meta mutation_started configure
     connected; no_group; endpoints_check
+    while :; do
+    log '  minimum   : GR-required settings only; preserves existing durability policy where possible.'
+    log '  production: minimum + sync_binlog=1, innodb_flush_log_at_trx_commit=1 and FULL row image.'
     profile=$(required 'Configuration profile (minimum/production)' minimum)
-    case $profile in minimum|production) :;; *) die 'Invalid profile';; esac
+    case $profile in
+        minimum|min) profile=minimum; break;;
+        production|prod) profile=production; break;;
+        *) log 'Invalid profile. Enter minimum/min or production/prod.';;
+    esac
+done
     put meta profile "$profile"
     if [ "$profile" = production ]; then
         log 'Production profile adds sync_binlog=1, innodb_flush_log_at_trx_commit=1 and FULL row image; storage I/O can increase.'
@@ -1803,7 +2005,7 @@ configure() {
         if ! "$exe" --defaults-file="$candidate" --validate-config > "$RUN/node_$i.config_validation.log" 2>&1; then
             rm -f "$candidate"; die "Configuration validation failed: $RUN/node_$i.config_validation.log"
         fi
-        backup="${cnf}.before_gr_v${VERSION}_$(date +%Y%m%d_%H%M%S)_$$"
+        backup="${cnf}.before_gr_$(date +%Y%m%d_%H%M%S)_$$"
         cp -p "$cnf" "$backup"; cmp -s "$cnf" "$backup" || die 'Config backup verification failed'
         cat "$candidate" > "$cnf"; rm -f "$candidate"
         log "Saved backup: $backup"
@@ -1816,6 +2018,7 @@ configure() {
         fi
     done
     log 'Configuration generation finished. Runtime precheck is mandatory before initialization.'
+    [ "$STEP" = all ] || log 'NEXT: sh mysql_gr_migrate.sh precheck'
 }
 
 
