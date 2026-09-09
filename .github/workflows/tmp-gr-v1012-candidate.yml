@@ -53,7 +53,7 @@ jobs:
           set -euo pipefail
           cat > /tmp/test_reprovision.sh <<'TEST'
           #!/bin/sh
-          set -eu
+          set -eux
           . /tmp/gr.nom.sh
           ROOT=$(mktemp -d)
           RUN="$ROOT/run"; TEMP="$ROOT/temp"
@@ -91,9 +91,10 @@ jobs:
           write_mysql_readonly_command() { printf '#!/bin/sh\n' > "$3"; chmod 700 "$3"; }
           local_pid() { printf '%s\n' "$$"; }
           divergence_abort_snapshot 2 >/dev/null 2>&1
-          test "$(head -n1 "$RUN/divergence_abort_state.tsv")" = 'NODE\tSERVER_UUID\tREAD_ONLY\tSUPER_READ_ONLY\tEVENT_SCHEDULER\tGTID_EXECUTED'
+          expected_header=$(printf 'NODE\tSERVER_UUID\tREAD_ONLY\tSUPER_READ_ONLY\tEVENT_SCHEDULER\tGTID_EXECUTED')
+          test "$(head -n1 "$RUN/divergence_abort_state.tsv")" = "$expected_header"
           test "$(wc -l < "$RUN/divergence_abort_state.tsv")" -eq 3
-          printf '#!/bin/sh\nprintf %s\\n fake-dump\n' "'-- fake dump'" > "$ROOT/fake_mysqldump"
+          printf '#!/bin/sh\nprintf "%s\\n" "-- fake dump"\n' > "$ROOT/fake_mysqldump"
           chmod 700 "$ROOT/fake_mysqldump"; DUMP="$ROOT/fake_mysqldump"
           rdir="$RUN/node_2.reprovision"; mkdir -p "$rdir"
           dump=$(prepare_reprovision_dump 2 "$target" "$rdir")
