@@ -1,0 +1,41 @@
+name: Temporary MySQL GR v1.0.8 update
+on:
+  push:
+    paths:
+      - '.github/workflows/tmp-gr-v108.yml'
+permissions:
+  contents: write
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Apply and validate v1.0.8
+        shell: bash
+        run: |
+          python3 .github/tmp_patch_gr_v108.py
+          python3 .github/tmp_patch_gr_v108_remote.py
+          target='MySQL/Group-Replication/mysql_gr_migrate.sh'
+          sh -n "$target"
+          test "$(sh "$target" --version)" = '1.0.8'
+          grep -Fq '[mysql]' "$target"
+          grep -Fq 'connect-timeout=10' "$target"
+          grep -Fq 'preflight_client_utilities' "$target"
+          grep -Fq 'server_streaming_guidance' "$target"
+          grep -Fq 'SERVER-STREAMING PREREQUISITES' "$target"
+          grep -Fq 'external_manual_guidance' "$target"
+          grep -Fq 'NEXT CHECKS:' "$target"
+          grep -Fq 'Inspection path                  : local readable unencrypted binlog files' "$target"
+          grep -Fq 'Required privilege             : REPLICATION SLAVE' "$target"
+          ! grep -Fq 'RESET BINARY LOGS AND GTIDS;' "$target"
+          ! grep -E 'mysqlbinlog[^|]*\|[[:space:]]*mysql([[:space:]]|$)' "$target"
+          git diff --check
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add "$target"
+          git rm .github/workflows/tmp-gr-v108.yml .github/tmp_patch_gr_v108.py .github/tmp_patch_gr_v108_remote.py
+          git commit -m 'MySQL GR v1.0.8: harden client tools and remote guidance'
+          git push origin HEAD:main
