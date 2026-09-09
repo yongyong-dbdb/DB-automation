@@ -1,11 +1,11 @@
 #!/bin/sh
-# mysql_gr_migrate.sh v1.0.8
+# mysql_gr_migrate.sh v1.0.9
 # POSIX sh; OS utilities and MySQL clients only. No external language packages.
 # Supported: Oracle MySQL 8.0.27+, 8.4.x, 9.7.x; homogeneous exact versions.
 # Single-primary or multi-primary / XCom. Never resets GTID or binary logs.
 set -eu
 umask 077
-VERSION=1.0.8
+VERSION=1.0.9
 ROOT=${MYSQL_GR_WORK_ROOT:-"$(pwd)/mysql_gr_work"}
 MYSQL=${MYSQL_GR_MYSQL:-mysql}
 DUMP=${MYSQL_GR_MYSQLDUMP:-mysqldump}
@@ -1214,6 +1214,180 @@ external_manual_guidance() {
     log "  GTID/fence check command           : $gtid_cmd"
 }
 
+safe_mysql_object_name() {
+    name=$1
+    case $name in ''|*[!A-Za-z0-9_$]*) return 1;; *) return 0;; esac
+}
+
+show_create_statement() {
+    kind=$1; object=$2
+    case $kind in
+        DATABASE|SCHEMA)
+            safe_mysql_object_name "$object" || return 1
+            printf 'SHOW CREATE DATABASE `%s`;' "$object"
+            ;;
+        TABLE|VIEW|EVENT|PROCEDURE|FUNCTION|TRIGGER)
+            case $object in *.*) db=${object%%.*}; obj=${object#*.};; *) return 1;; esac
+            safe_mysql_object_name "$db" || return 1
+            safe_mysql_object_name "$obj" || return 1
+            printf 'SHOW CREATE %s `%s`.`%s`;' "$kind" "$db" "$obj"
+            ;;
+        *) return 1;;
+    esac
+}
+
+summarize_mysqlbinlog_evidence() {
+    i=$1; evidence=$2
+    summary="$RUN/node_${i}.errant_gtid_summary.tsv"
+    awk -v OFS='\t' '
+        BEGIN {
+            gtid="UNKNOWN"; db=""
+            print "GTID","CATEGORY","OPERATION","OBJECT","DETAIL"
+        }
+        function emit(cat,op,obj,detail, key) {
+            gsub(/\t/," ",detail)
+            key=gtid SUBSEP cat SUBSEP op SUBSEP obj SUBSEP detail
+            if (!seen[key]++) print gtid,cat,op,obj,detail
+        }
+        /^use `/ {
+            line=$0
+            sub(/^use `/,"",line)
+            sub(/`.*/,"",line)
+            db=line
+            next
+        }
+        /GTID_NEXT[[:space:]]*=/ {
+            line=$0
+            p=index(line,"\047")
+            if (p>0) {
+                tail=substr(line,p+1)
+                q=index(tail,"\047")
+                if (q>0) {
+                    x=substr(tail,1,q-1)
+                    if (x!="AUTOMATIC") gtid=x
+                }
+            }
+            next
+        }
+        /^### INSERT INTO / {
+            obj=$0; sub(/^### INSERT INTO /,"",obj); sub(/[[:space:]].*$/,"",obj); gsub(/`/,"",obj)
+            if (obj !~ /\./ && db!="") obj=db "." obj
+            emit("DML","INSERT",obj,"")
+            next
+        }
+        /^### UPDATE / {
+            obj=$0; sub(/^### UPDATE /,"",obj); sub(/[[:space:]].*$/,"",obj); gsub(/`/,"",obj)
+            if (obj !~ /\./ && db!="") obj=db "." obj
+            emit("DML","UPDATE",obj,"")
+            next
+        }
+        /^### DELETE FROM / {
+            obj=$0; sub(/^### DELETE FROM /,"",obj); sub(/[[:space:]].*$/,"",obj); gsub(/`/,"",obj)
+            if (obj !~ /\./ && db!="") obj=db "." obj
+            emit("DML","DELETE",obj,"")
+            next
+        }
+        /^### REPLACE INTO / {
+            obj=$0; sub(/^### REPLACE INTO /,"",obj); sub(/[[:space:]].*$/,"",obj); gsub(/`/,"",obj)
+            if (obj !~ /\./ && db!="") obj=db "." obj
+            emit("DML","REPLACE",obj,"")
+            next
+        }
+        {
+            raw=$0
+            line=raw
+            sub(/^[[:space:]]+/,"",line)
+            upper=toupper(line)
+            if (upper ~ /^(CREATE|ALTER|DROP|RENAME|TRUNCATE)[[:space:]]+/) {
+                split(upper,a,/[[:space:]]+/)
+                op=a[1]
+                if (match(upper,/(TABLE|EVENT|VIEW|PROCEDURE|FUNCTION|TRIGGER|DATABASE|SCHEMA)[[:space:]]+/)) {
+                    kind=substr(upper,RSTART,RLENGTH)
+                    gsub(/[[:space:]]/,"",kind)
+                    obj=substr(line,RSTART+RLENGTH)
+                    sub(/^[[:space:]]+/,"",obj)
+                    sub(/^[Ii][Ff][[:space:]]+[Nn][Oo][Tt][[:space:]]+[Ee][Xx][Ii][Ss][Tt][Ss][[:space:]]+/,"",obj)
+                    sub(/^[Ii][Ff][[:space:]]+[Ee][Xx][Ii][Ss][Tt][Ss][[:space:]]+/,"",obj)
+                    sub(/[[:space:](;,].*$/,"",obj)
+                    gsub(/`/,"",obj)
+                    if (kind!="DATABASE" && kind!="SCHEMA" && obj !~ /\./ && db!="") obj=db "." obj
+                    if (obj=="") obj="UNKNOWN"
+                    emit("DDL",op " " kind,obj,line)
+                } else {
+                    emit("DDL",op " OBJECT","UNKNOWN",line)
+                }
+            }
+        }
+    ' "$evidence" > "$summary"
+    chmod 600 "$summary"
+
+    dml_count=$(awk -F '\t' 'NR>1 && $2=="DML" {n++} END{print n+0}' "$summary")
+    ddl_count=$(awk -F '\t' 'NR>1 && $2=="DDL" {n++} END{print n+0}' "$summary")
+    total=$(awk 'END{print NR>0?NR-1:0}' "$summary")
+    log '[ Extra GTID Summary ]'
+    if [ "$total" -eq 0 ]; then
+        log '  No DML/DDL operation could be summarized automatically. Review the raw mysqlbinlog evidence.'
+    else
+        awk -F '\t' 'NR>1 && shown<80 {printf "  %s | %s | %s | %s\n",$1,$2,$3,$4; shown++} END{if (NR-1>80) printf "  ... %d additional summary rows saved in the TSV file\n",(NR-1)-80}' "$summary" >&2
+    fi
+    log "  DML summary rows : $dml_count"
+    log "  DDL summary rows : $ddl_count"
+    log "  Summary evidence : $summary"
+    [ "$dml_count" -eq 0 ] || log '  NOTE: INSERT/UPDATE/DELETE/REPLACE combinations are NOT treated as compensating changes; current row equality is not inferred.'
+    [ "$ddl_count" -eq 0 ] || log '  NOTE: DDL objects are compared read-only against authoritative node 1 when the object name/type is safely parseable.'
+}
+
+compare_ddl_metadata() {
+    i=$1
+    summary="$RUN/node_${i}.errant_gtid_summary.tsv"
+    [ -s "$summary" ] || return 0
+    list="$RUN/node_${i}.ddl_objects.tsv"
+    awk -F '\t' 'NR>1 && $2=="DDL" {print $3 "\t" $4}' "$summary" | sort -u > "$list"
+    [ -s "$list" ] || return 0
+    dir="$RUN/node_${i}.ddl_metadata"
+    mkdir -p "$dir"; chmod 700 "$dir"
+    log '[ DDL Current Metadata Comparison ]'
+    tab=$(printf '\t')
+    while IFS="$tab" read -r operation object; do
+        [ -n "$operation" ] || continue
+        kind=${operation#* }
+        if ! stmt=$(show_create_statement "$kind" "$object"); then
+            log "  SKIP  : $operation $object (name/type not safe for automatic SHOW CREATE)"
+            continue
+        fi
+        safe=$(printf '%s_%s' "$kind" "$object" | tr './` ' '____')
+        src="$dir/${safe}.source.tsv"
+        mem="$dir/${safe}.node_${i}.tsv"
+        src_ok=yes; mem_ok=yes
+        if ! sql 1 "$stmt" > "$src" 2> "$src.err"; then src_ok=no; fi
+        if ! sql "$i" "$stmt" > "$mem" 2> "$mem.err"; then mem_ok=no; fi
+        if [ "$src_ok" = yes ] && [ "$mem_ok" = yes ]; then
+            if cmp -s "$src" "$mem"; then
+                log "  MATCH : $kind $object"
+            else
+                diff -u "$src" "$mem" > "$dir/${safe}.diff" || :
+                log "  DIFF  : $kind $object -> $dir/${safe}.diff"
+            fi
+        else
+            src_cmd="$dir/${safe}.source_check.sh"
+            mem_cmd="$dir/${safe}.node_${i}_check.sh"
+            write_mysql_readonly_command 1 "$stmt" "$src_cmd"
+            write_mysql_readonly_command "$i" "$stmt" "$mem_cmd"
+            log "  MANUAL: $kind $object metadata could not be read automatically."
+            log "          Source check: $src_cmd"
+            log "          Node check  : $mem_cmd"
+        fi
+    done < "$list"
+    log "  Metadata evidence directory: $dir"
+}
+
+postprocess_mysqlbinlog_evidence() {
+    i=$1; evidence=$2
+    summarize_mysqlbinlog_evidence "$i" "$evidence"
+    compare_ddl_metadata "$i"
+    log 'Decision rule: extra GTIDs still block GR join even when current metadata appears equal; reconcile/reprovision or abort after review.'
+}
+
 inspect_extra_gtids() {
     i=$1; target=$2
     gtid_compare "$i" "$target"
@@ -1287,6 +1461,7 @@ inspect_extra_gtids() {
             rm -f "$error_file"
             log "  mysqlbinlog evidence              : $output_file"
             log '  WARNING: The evidence can contain SQL and row values; the file is stored under the protected run directory.'
+            postprocess_mysqlbinlog_evidence "$i" "$output_file"
             return 0
         fi
         # A local file may become inaccessible/rotated between SHOW BINARY LOGS and read.
@@ -1311,6 +1486,7 @@ inspect_extra_gtids() {
         rm -f "$error_file"
         log "  mysqlbinlog evidence              : $output_file"
         log '  WARNING: The evidence can contain SQL and row values; the file is stored under the protected run directory.'
+        postprocess_mysqlbinlog_evidence "$i" "$output_file"
     else
         chmod 600 "$error_file" 2>/dev/null || :
         log 'Automatic mysqlbinlog decoding failed. No server data was changed.'
@@ -1335,17 +1511,20 @@ divergence_abort_snapshot() {
     chmod 600 "$snapshot"
     log "Abort state snapshot: $snapshot"
     log 'NEXT CHECKS:'
-    if [ -s "$RUN/node_${i}.errant_gtid.mysqlbinlog.txt" ]; then
-        log "  1) Review decoded extra-GTID evidence: $RUN/node_${i}.errant_gtid.mysqlbinlog.txt"
+    if [ -s "$RUN/node_${i}.errant_gtid_summary.tsv" ]; then
+        log "  1) Review automatic per-GTID DML/DDL summary: $RUN/node_${i}.errant_gtid_summary.tsv"
+        [ ! -d "$RUN/node_${i}.ddl_metadata" ] || log "  2) Review Source/Node DDL metadata comparisons: $RUN/node_${i}.ddl_metadata"
+        log "  3) Review raw decoded evidence if needed: $RUN/node_${i}.errant_gtid.mysqlbinlog.txt"
     elif [ -s "$RUN/node_${i}.errant_gtid.mysqlbinlog.err" ]; then
         log "  1) Review mysqlbinlog error: $RUN/node_${i}.errant_gtid.mysqlbinlog.err"
         [ ! -f "$RUN/node_${i}.mysqlbinlog_command.sh" ] || log "     Read-only retry command: $RUN/node_${i}.mysqlbinlog_command.sh"
+        log "  2) Review GTID comparison: $RUN/node_${i}.gtid_compare.tsv"
     else
         log "  1) Review GTID evidence: $RUN/node_${i}.gtid_compare.tsv"
     fi
-    log "  2) Review inspection summary: $RUN/node_${i}.errant_gtid_inspection.tsv"
-    log '  3) Keep the migration stopped; do not run cutover while extra GTIDs remain.'
-    log '  4) After reviewed reconciliation/reprovisioning, rerun precheck and initialize if instance identity is unchanged.'
+    log "  4) Review inspection summary: $RUN/node_${i}.errant_gtid_inspection.tsv"
+    log '  5) Keep the migration stopped; do not run cutover while extra GTIDs remain.'
+    log '  6) After reviewed reconciliation/reprovisioning, rerun precheck and initialize if instance identity is unchanged.'
     log '     If server_uuid/instance identity changed, use a fresh MYSQL_GR_WORK_ROOT and run discover again.'
 }
 
@@ -1797,6 +1976,7 @@ main() {
 # v1.0.4: automatic discovery/configuration overrides.
 # v1.0.5: state-based member initialization, GTID diagnostics, safer prompts and concise option guidance.
 # v1.0.8: client option-group compatibility, preflight checks, local-first binlog inspection and abort guidance.
+# v1.0.9: generic per-GTID DML/DDL summaries and safe current-metadata comparison for divergent members.
 safe_host() { case $1 in ''|*[!a-zA-Z0-9_.-]*) die "Use an IPv4 address or DNS name (IPv6 is not supported in v$VERSION).";; esac; }
 
 host_is_local() (
