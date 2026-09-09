@@ -1,7 +1,7 @@
 #!/bin/sh
 set -u
 
-SCRIPT_VERSION="1.2.3"
+SCRIPT_VERSION="1.2.4"
 SCRIPT_DIR=$(CDPATH='' cd "$(dirname "$0")" && pwd)
 DEFAULT_OUTPUT_DIR="$SCRIPT_DIR/results"
 PSQL_BIN=${PSQL_BIN:-}
@@ -403,7 +403,17 @@ result_database=$(printf '%s' "$PGDATABASE" | tr -c '[:alnum:]_.-' '_'); RESULT_
 
 emit_plan() {
     opts=$1
-    if [ "$BIND" = yes ]; then cat "$prepare_file"; printf 'SET plan_cache_mode = %s;\nEXPLAIN (%s)\n' "$BIND_PLAN_MODE" "$opts"; cat "$execute_file"; else printf 'EXPLAIN (%s)\n' "$opts"; cat "$SQL_FILE"; echo; fi
+    if [ "$BIND" = yes ]; then
+        cat "$prepare_file"
+        printf 'SET plan_cache_mode = %s;\nEXPLAIN (%s)\n' "$BIND_PLAN_MODE" "$opts"
+        cat "$execute_file"
+        printf '\n'
+    else
+        printf 'EXPLAIN (%s)\n' "$opts"
+        cat "$SQL_FILE"
+        # SQL 파일이 세미콜론 없이 끝나더라도 뒤의 ROLLBACK/다음 명령과 결합되지 않도록 강제 종료.
+        printf '\n;\n'
+    fi
 }
 
 emit_plan 'VERBOSE TRUE, COSTS FALSE, FORMAT JSON' | run_psql -X -qAt -v ON_ERROR_STOP=1 > "$precheck_json" 2>"$plan_error" || { cat "$plan_error" >&2; exit 1; }
@@ -427,8 +437,10 @@ if [ "$ANALYZE" = yes ]; then
     echo; echo "WARNING: EXPLAIN ANALYZE executes the statement."; echo "Safety     : BEGIN -> EXPLAIN ANALYZE FORMAT JSON -> ROLLBACK"; [ -z "$DML_OPERATION" ] || echo "DML detected: $DML_OPERATION"
     printf 'Type EXECUTE to continue: ' >&2; IFS= read -r confirm; [ "$confirm" = EXECUTE ] || { echo "Cancelled."; exit 1; }
     [ ! -s "$rel_file" ] || snapshot_stats "$table_before" "$index_before"
-    { echo 'BEGIN;'; emit_plan "$actual_json_opts"; echo 'ROLLBACK;'; } > "$tmp"
-else emit_plan "$actual_json_opts" > "$tmp"; fi
+    { printf 'BEGIN;\n'; emit_plan "$actual_json_opts"; printf 'ROLLBACK;\n'; } > "$tmp"
+else
+    emit_plan "$actual_json_opts" > "$tmp"
+fi
 
 {
  echo "PostgreSQL execution plan analysis"; echo "script_version=$SCRIPT_VERSION"; echo "database=$PGDATABASE"; echo "sql_file=$SQL_FILE"; echo "json_parser=PostgreSQL jsonb functions"; echo
