@@ -1,0 +1,37 @@
+name: Temporary MySQL GR v1.0.10 update
+on:
+  push:
+    paths:
+      - '.github/tmp_patch_gr_v1010.py'
+      - '.github/workflows/tmp-gr-v1010.yml'
+permissions:
+  contents: write
+jobs:
+  patch-validate-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Apply exact patch
+        run: python3 .github/tmp_patch_gr_v1010.py
+      - name: Validate shell and portability guards
+        run: |
+          sh -n 'MySQL/Group-Replication/mysql_gr_migrate.sh'
+          grep -F '# mysql_gr_migrate.sh v1.0.10' 'MySQL/Group-Replication/mysql_gr_migrate.sh'
+          grep -F 'VERSION=1.0.10' 'MySQL/Group-Replication/mysql_gr_migrate.sh'
+          grep -F "END{print (NR > 0 ? NR - 1 : 0)}" 'MySQL/Group-Replication/mysql_gr_migrate.sh'
+          grep -F 'platform_preflight()' 'MySQL/Group-Replication/mysql_gr_migrate.sh'
+          awk 'BEGIN { n=1; print (n > 0 ? n - 1 : 0) }' | grep -Fx 0
+          ! grep -F 'END{print NR>0?NR-1:0}' 'MySQL/Group-Replication/mysql_gr_migrate.sh'
+          ! grep -E 'RESET (MASTER|BINARY LOGS AND GTIDS)|mysqlbinlog.*\|.*mysql' 'MySQL/Group-Replication/mysql_gr_migrate.sh'
+      - name: Commit target and cleanup staging files
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add 'MySQL/Group-Replication/mysql_gr_migrate.sh'
+          git commit -m 'MySQL GR v1.0.10: fix awk portability and add platform preflight'
+          git rm -f .github/tmp_patch_gr_v1010.py .github/workflows/tmp-gr-v1010.yml
+          git commit -m 'chore: remove temporary GR v1.0.10 validation files'
+          git push origin main
