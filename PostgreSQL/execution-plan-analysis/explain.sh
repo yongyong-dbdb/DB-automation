@@ -1,7 +1,7 @@
 #!/bin/sh
 set -u
 
-SCRIPT_VERSION="1.2.20"
+SCRIPT_VERSION="1.2.21"
 SCRIPT_DIR=$(CDPATH='' cd "$(dirname "$0")" && pwd)
 DEFAULT_OUTPUT_DIR="$SCRIPT_DIR/results"
 PSQL_BIN=${PSQL_BIN:-}
@@ -181,24 +181,98 @@ confirm_database_switch() {
     done
 }
 
+confirm_continue_current_user() {
+    _reason=$1
+    echo
+    [ -z "$_reason" ] || printf '주의: %s\n' "$_reason" >&2
+    while :; do
+        printf '현재 사용자 %s로 계속 진행하시겠습니까? y/n [n]: ' "$PGUSER" >&2
+        IFS= read -r _ans || return 1
+        [ -n "$_ans" ] || _ans=n
+        _ans=$(printf '%s' "$_ans" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+        case $_ans in
+            y) return 0 ;;
+            n) return 1 ;;
+            *) echo "ERROR: y 또는 n을 입력하세요." >&2 ;;
+        esac
+    done
+}
+
 prepare_pgss_execution_user() {
     [ "$PGUSER" != postgres ] || return 0
     echo
     echo "안내: pg_stat_statements에는 다른 데이터베이스 사용자가 실행한 SQL도 포함될 수 있습니다."
-    echo "      운영 분석 안전성을 위해 SET ROLE 및 SET search_path는 수행하지 않습니다."
-    echo "      권한에 따른 query text 조회/EXPLAIN 실패를 줄이기 위해 postgres 사용자 사용을 권장합니다."
+    echo "      query text 조회 단계에서는 권한 문제를 줄이기 위해 postgres 사용자를 권장합니다."
+    echo "      query 정보를 확보한 뒤 실제 EXPLAIN 단계에서는 pg_stat_statements의 userid를 기준으로"
+    echo "      원본 로그인 사용자로 재접속할 수 있습니다. SET ROLE 및 SET search_path는 사용하지 않습니다."
     while :; do
-        printf 'Current user is %s. Switch analysis user to postgres? y/n [y]: ' "$PGUSER" >&2
+        printf 'Current user is %s. Switch query lookup user to postgres? y/n [y]: ' "$PGUSER" >&2
         IFS= read -r _ans || return 1
         [ -n "$_ans" ] || _ans=y
         _ans=$(printf '%s' "$_ans" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
         case $_ans in
-            y) switch_user postgres || return 1; return 0 ;;
+            y)
+                if switch_user postgres; then
+                    return 0
+                fi
+                confirm_continue_current_user "postgres 사용자로 재접속하지 못했습니다." || return 1
+                return 0
+                ;;
             n)
-                echo "주의: $PGUSER 사용자로 계속 진행합니다. 다른 사용자의 query text 또는 참조 객체에 접근하지 못할 수 있습니다."
+                echo "주의: $PGUSER 사용자로 pg_stat_statements 조회를 계속합니다. 다른 사용자의 query text가 보이지 않을 수 있습니다."
                 return 0
                 ;;
             *) echo "ERROR: enter y or n." >&2 ;;
+        esac
+    done
+}
+
+prepare_pgss_source_execution_user() {
+    _source_user=$1
+    _source_userid=$2
+    _source_canlogin=$3
+
+    if [ -z "$_source_user" ]; then
+        confirm_continue_current_user "pg_stat_statements의 userid=$_source_userid 에 해당하는 현재 role이 존재하지 않아 원본 사용자로 재접속할 수 없습니다." || return 1
+        return 0
+    fi
+
+    [ "$PGUSER" != "$_source_user" ] || return 0
+
+    if [ "$_source_canlogin" != yes ]; then
+        confirm_continue_current_user "원본 실행 사용자 $_source_user 는 LOGIN 속성이 없어 직접 재접속할 수 없습니다." || return 1
+        return 0
+    fi
+
+    echo
+    echo "실행 사용자 전환"
+    printf '  원본 실행 사용자 : %s (userid=%s)\n' "$_source_user" "$_source_userid"
+    printf '  현재 접속 사용자 : %s\n' "$PGUSER"
+    echo
+    echo "안내: 스키마가 생략된 객체, 함수, 타입 등의 해석은 로그인 사용자의 기본 search_path 영향을 받습니다."
+    echo "      원본 실행 사용자로 실제 재접속하면 ALTER ROLE / ALTER ROLE IN DATABASE 등에 설정된"
+    echo "      로그인 시점의 기본 설정을 적용할 수 있습니다."
+    echo "      단, 원본 세션에서 별도로 수행한 SET/SET LOCAL/search_path 변경은 pg_stat_statements에 저장되지 않습니다."
+    echo "      SET ROLE 및 SET search_path는 수행하지 않습니다."
+
+    while :; do
+        printf '원본 실행 사용자 %s로 실제 재접속하시겠습니까? y/n [y]: ' "$_source_user" >&2
+        IFS= read -r _ans || return 1
+        [ -n "$_ans" ] || _ans=y
+        _ans=$(printf '%s' "$_ans" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+        case $_ans in
+            y)
+                if switch_user "$_source_user"; then
+                    return 0
+                fi
+                confirm_continue_current_user "원본 실행 사용자 $_source_user 로 재접속하지 못했습니다." || return 1
+                return 0
+                ;;
+            n)
+                echo "주의: 현재 사용자 $PGUSER 로 EXPLAIN을 계속합니다. 원본 사용자와 객체 해석/권한/RLS 결과가 달라질 수 있습니다."
+                return 0
+                ;;
+            *) echo "ERROR: y 또는 n을 입력하세요." >&2 ;;
         esac
     done
 }
@@ -209,6 +283,9 @@ PGSS_QUERY_COUNT=0
 SQL_SOURCE_KIND=file
 ORIGINAL_QUERY_USER=
 ORIGINAL_QUERY_USERID=
+ORIGINAL_QUERY_USER_CAN_LOGIN=
+PGSS_LOOKUP_USER=
+PGSS_LOOKUP_DATABASE=
 PGSS_EXECUTE_USER=
 PGSS_SEARCH_PATH=
 PGSS_RAW_SQL_FILE=
@@ -235,6 +312,9 @@ SQL
 }
 
 load_pg_stat_statements_query() {
+    PGSS_LOOKUP_USER=$(run_psql -X -qAt -v ON_ERROR_STOP=1 -c 'SELECT current_user;' 2>/dev/null || printf '%s' "$PGUSER")
+    PGSS_LOOKUP_DATABASE=$PGDATABASE
+
     while :; do
         printf 'Query ID (signed bigint, empty to cancel): ' >&2
         IFS= read -r QUERYID || return 1
@@ -250,13 +330,18 @@ load_pg_stat_statements_query() {
 SELECT s.dbid,
        COALESCE(d.datname, ''),
        s.userid,
-       COALESCE(pg_get_userbyid(s.userid), '')
+       COALESCE(r.rolname, ''),
+       CASE WHEN r.rolname IS NULL THEN 'missing'
+            WHEN r.rolcanlogin THEN 'yes'
+            ELSE 'no'
+       END
 FROM $PGSS_RELATION s
 LEFT JOIN pg_database d ON d.oid=s.dbid
+LEFT JOIN pg_roles r ON r.oid=s.userid
 WHERE s.queryid=:'queryid'::bigint
   AND s.query IS NOT NULL
-GROUP BY s.dbid,d.datname,s.userid
-ORDER BY d.datname NULLS LAST, pg_get_userbyid(s.userid), s.dbid, s.userid;
+GROUP BY s.dbid,d.datname,s.userid,r.rolname,r.rolcanlogin
+ORDER BY d.datname NULLS LAST, r.rolname NULLS LAST, s.dbid, s.userid;
 SQL
         then
             cat "$work_dir/pgss.err" >&2
@@ -275,10 +360,11 @@ SQL
         else
             echo "Query ID found for multiple database/user entries:"
             _n=1
-            while IFS='|' read -r _dbid _dbname _userid _username; do
+            while IFS='|' read -r _dbid _dbname _userid _username _canlogin; do
                 [ -n "$_dbname" ] || _dbname="<database oid $_dbid no longer exists>"
-                [ -n "$_username" ] || _username="<user oid $_userid no longer exists>"
-                printf '  %s) database=%s (dbid=%s), user=%s (userid=%s)\n' "$_n" "$_dbname" "$_dbid" "$_username" "$_userid"
+                _display_user=$_username
+                [ -n "$_display_user" ] || _display_user="<user oid $_userid no longer exists>"
+                printf '  %s) database=%s (dbid=%s), user=%s (userid=%s, login=%s)\n' "$_n" "$_dbname" "$_dbid" "$_display_user" "$_userid" "$_canlogin"
                 _n=$((_n+1))
             done < "$_pgss_source_file"
             while :; do
@@ -292,14 +378,15 @@ SQL
             done
         fi
 
-        IFS='|' read -r _source_dbid _source_database _source_userid _source_user <<EOF
+        IFS='|' read -r _source_dbid _source_database _source_userid _source_user _source_canlogin <<EOF
 $_source_line
 EOF
         if [ -z "$_source_database" ]; then
             echo "ERROR: pg_stat_statements entry refers to database oid $_source_dbid, but that database no longer exists." >&2
             continue
         fi
-        [ -n "$_source_user" ] || _source_user="<user oid $_source_userid no longer exists>"
+        _source_user_display=$_source_user
+        [ -n "$_source_user_display" ] || _source_user_display="<user oid $_source_userid no longer exists>"
 
         _count=$(run_psql -X -qAt -v ON_ERROR_STOP=1 -v queryid="$QUERYID" -v dbid="$_source_dbid" -v userid="$_source_userid" <<SQL 2>"$work_dir/pgss.err" || true
 SELECT count(*)
@@ -324,7 +411,7 @@ SQL
             continue
         fi
         if [ "$_count" -gt 1 ]; then
-            echo "ERROR: multiple different query texts share this queryid for database $_source_database / user $_source_user; use a SQL file to avoid ambiguity." >&2
+            echo "ERROR: multiple different query texts share this queryid for database $_source_database / user $_source_user_display; use a SQL file to avoid ambiguity." >&2
             continue
         fi
 
@@ -351,6 +438,14 @@ SQL
             continue
         fi
 
+        ORIGINAL_QUERY_USER=$_source_user_display
+        ORIGINAL_QUERY_USERID=$_source_userid
+        ORIGINAL_QUERY_USER_CAN_LOGIN=$_source_canlogin
+        PGSS_RAW_SQL_FILE=$_pgss_sql
+        SQL_FILE=$_pgss_sql
+        SQL_SOURCE_KIND=pgss
+        SQL_SOURCE_DESC="pg_stat_statements queryid=$QUERYID"
+
         if [ "$_source_database" != "$PGDATABASE" ]; then
             if confirm_database_switch "$PGDATABASE" "$_source_database"; then
                 switch_database "$_source_database" || return 1
@@ -360,27 +455,29 @@ SQL
             fi
         fi
 
-        ORIGINAL_QUERY_USER=$_source_user
-        ORIGINAL_QUERY_USERID=$_source_userid
+        prepare_pgss_source_execution_user "$_source_user" "$_source_userid" "$_source_canlogin" || {
+            echo "Cancelled: execution user context was not accepted." >&2
+            return 1
+        }
+
         PGSS_EXECUTE_USER=$(run_psql -X -qAt -v ON_ERROR_STOP=1 -c 'SELECT current_user;' 2>/dev/null || printf '%s' "$PGUSER")
         PGSS_SEARCH_PATH=$(run_psql -X -qAt -v ON_ERROR_STOP=1 -c 'SHOW search_path;' 2>/dev/null || printf '<unavailable>')
-        PGSS_RAW_SQL_FILE=$_pgss_sql
-        SQL_FILE=$_pgss_sql
-        SQL_SOURCE_KIND=pgss
-        SQL_SOURCE_DESC="pg_stat_statements queryid=$QUERYID"
 
         echo
         echo "pg_stat_statements Query Information"
         printf '  queryid              : %s\n' "$QUERYID"
-        printf '  database             : %s\n' "$PGDATABASE"
-        printf '  original user        : %s (userid=%s)\n' "$ORIGINAL_QUERY_USER" "$ORIGINAL_QUERY_USERID"
+        printf '  lookup database      : %s\n' "$PGSS_LOOKUP_DATABASE"
+        printf '  lookup user          : %s\n' "$PGSS_LOOKUP_USER"
+        printf '  source database      : %s\n' "$PGDATABASE"
+        printf '  original user        : %s (userid=%s, login=%s)\n' "$ORIGINAL_QUERY_USER" "$ORIGINAL_QUERY_USERID" "$ORIGINAL_QUERY_USER_CAN_LOGIN"
         printf '  execute user         : %s\n' "$PGSS_EXECUTE_USER"
         printf '  current search_path  : %s\n' "$PGSS_SEARCH_PATH"
-        printf '  original search_path : unavailable in pg_stat_statements\n'
+        printf '  historical search_path : unavailable in pg_stat_statements\n'
         echo
-        echo "안내: EXPLAIN은 위에 표시된 현재 접속 사용자로 수행합니다."
+        echo "안내: pg_stat_statements의 query/dbid/userid 조회는 lookup 환경에서 먼저 완료했습니다."
+        echo "      이후 EXPLAIN은 source database와 위 execute user의 실제 로그인 연결로 수행합니다."
         echo "      SET ROLE 및 SET search_path는 수행하지 않습니다."
-        echo "      스키마가 생략된 객체명은 원본 세션과 다른 객체로 해석될 수 있습니다."
+        echo "      원본 세션에서 별도로 변경된 search_path/세션 GUC/임시 객체 등은 pg_stat_statements만으로 복원할 수 없습니다."
         echo "      pg_stat_statements의 query는 정규화된 대표 SQL이며 원래 literal 값은 저장되지 않습니다."
         echo
         return 0
@@ -1182,8 +1279,10 @@ if [ "$BIND" = yes ]; then
     { printf 'SET standard_conforming_strings = on;\nPREPARE pg_explain_target'; [ -z "$bind_types" ] || printf ' (%s)' "$bind_types"; printf ' AS\n'; cat "$SQL_FILE"; printf '\n;\n'; } > "$prepare_file"
     if ! BIND_COUNT=$({ cat "$prepare_file"; echo "SELECT cardinality(parameter_types) FROM pg_prepared_statements WHERE name='pg_explain_target';"; } | run_psql -X -qAt -v ON_ERROR_STOP=1); then
         if [ "$SQL_SOURCE_KIND" = pgss ]; then
-            echo "안내: pg_stat_statements에는 원본 bind의 데이터 타입이 저장되지 않습니다." >&2
-            echo "      정규화 상수는 복원했지만 남은 bind의 타입을 문맥만으로 추론할 수 없는 SQL일 수 있습니다." >&2
+            echo "안내: 현재 실행 사용자/DB/search_path 환경에서 SQL PREPARE에 실패했습니다." >&2
+            echo "      원본 사용자로 전환한 상태라면 원본 세션의 별도 SET search_path, 세션 GUC, 임시 객체 등은" >&2
+            echo "      pg_stat_statements만으로 복원할 수 없습니다." >&2
+            echo "      또한 pg_stat_statements에는 원본 bind의 데이터 타입이 저장되지 않습니다." >&2
             echo "      필요한 경우 Parameter types에 원본 bind 타입을 쉼표로 직접 지정하세요." >&2
         fi
         echo "ERROR: Could not prepare SQL." >&2
@@ -1441,8 +1540,11 @@ fi
  echo "sql_source=$SQL_SOURCE_DESC"
  echo "sql_file=$SQL_FILE"
  if [ "$SQL_SOURCE_KIND" = pgss ]; then
+     echo "pgss_lookup_database=$PGSS_LOOKUP_DATABASE"
+     echo "pgss_lookup_user=$PGSS_LOOKUP_USER"
      echo "original_query_user=$ORIGINAL_QUERY_USER"
      echo "original_query_userid=$ORIGINAL_QUERY_USERID"
+     echo "original_query_user_can_login=$ORIGINAL_QUERY_USER_CAN_LOGIN"
      echo "execute_user=$PGSS_EXECUTE_USER"
      echo "execute_search_path=$PGSS_SEARCH_PATH"
      echo "original_search_path=unavailable"
