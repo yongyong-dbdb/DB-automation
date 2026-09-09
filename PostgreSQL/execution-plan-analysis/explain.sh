@@ -1,7 +1,7 @@
 #!/bin/sh
 set -u
 
-SCRIPT_VERSION="1.2.16"
+SCRIPT_VERSION="1.2.17"
 SCRIPT_DIR=$(CDPATH='' cd "$(dirname "$0")" && pwd)
 DEFAULT_OUTPUT_DIR="$SCRIPT_DIR/results"
 PSQL_BIN=${PSQL_BIN:-}
@@ -113,9 +113,56 @@ if ! check_connection; then
     check_connection || { echo "ERROR: PostgreSQL connection failed." >&2; exit 1; }
 fi
 
+switch_database() {
+    _new_database=$1
+    [ -n "$_new_database" ] || return 1
+    [ "$_new_database" = "$PGDATABASE" ] && return 0
+
+    _old_database=$PGDATABASE
+
+    # A temporary pgpass created by this script is database-specific.
+    # Remove it before reconnecting so the new database can authenticate cleanly.
+    if [ "${PGPASSFILE:-}" = "$work_dir/pgpass" ]; then
+        rm -f "$work_dir/pgpass"
+        unset PGPASSFILE
+        password_prompted=no
+    fi
+
+    PGDATABASE=$_new_database
+    export PGDATABASE
+    if check_connection; then
+        echo "Analysis database switched: $_old_database -> $PGDATABASE"
+        return 0
+    fi
+
+    echo "ERROR: could not connect to source database $_new_database." >&2
+    PGDATABASE=$_old_database
+    export PGDATABASE
+    password_prompted=no
+    check_connection >/dev/null 2>&1 || true
+    return 1
+}
+
+confirm_database_switch() {
+    _from=$1
+    _to=$2
+    while :; do
+        printf 'Query belongs to database %s. Switch analysis database from %s to %s? y/n [y]: ' "$_to" "$_from" "$_to" >&2
+        IFS= read -r _ans || return 1
+        [ -n "$_ans" ] || _ans=y
+        _ans=$(printf '%s' "$_ans" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+        case $_ans in
+            y) return 0 ;;
+            n) return 1 ;;
+            *) echo "ERROR: enter y or n." >&2 ;;
+        esac
+    done
+}
+
 PGSS_AVAILABLE=no
 PGSS_RELATION=
 PGSS_QUERY_COUNT=0
+SQL_SOURCE_KIND=file
 detect_pg_stat_statements() {
     PGSS_RELATION=$(run_psql -X -qAt -v ON_ERROR_STOP=1 <<'SQL' 2>/dev/null || true
 SELECT format('%I.pg_stat_statements', n.nspname)
@@ -129,8 +176,7 @@ SQL
     PGSS_QUERY_COUNT=$(run_psql -X -qAt -v ON_ERROR_STOP=1 <<SQL 2>/dev/null || true
 SELECT count(*)
 FROM $PGSS_RELATION
-WHERE dbid=(SELECT oid FROM pg_database WHERE datname=current_database())
-  AND query IS NOT NULL;
+WHERE query IS NOT NULL;
 SQL
     )
     case $PGSS_QUERY_COUNT in ''|*[!0-9]*) PGSS_QUERY_COUNT=0 ;; esac
@@ -147,12 +193,64 @@ load_pg_stat_statements_query() {
             continue
         fi
 
-        _count=$(run_psql -X -qAt -v ON_ERROR_STOP=1 -v queryid="$QUERYID" <<SQL 2>"$work_dir/pgss.err" || true
+        _pgss_db_file="$work_dir/pgss-databases.txt"
+        : > "$_pgss_db_file"
+        if ! run_psql -X -qAt -F '|' -v ON_ERROR_STOP=1 -v queryid="$QUERYID" <<SQL > "$_pgss_db_file" 2>"$work_dir/pgss.err"
+SELECT s.dbid,
+       COALESCE(d.datname, '')
+FROM $PGSS_RELATION s
+LEFT JOIN pg_database d ON d.oid=s.dbid
+WHERE s.queryid=:'queryid'::bigint
+  AND s.query IS NOT NULL
+GROUP BY s.dbid,d.datname
+ORDER BY d.datname NULLS LAST,s.dbid;
+SQL
+        then
+            cat "$work_dir/pgss.err" >&2
+            echo "ERROR: invalid queryid or pg_stat_statements query failed." >&2
+            continue
+        fi
+
+        _db_count=$(awk 'END{print NR+0}' "$_pgss_db_file")
+        if [ "$_db_count" -eq 0 ]; then
+            echo "ERROR: Query ID not found in pg_stat_statements." >&2
+            continue
+        fi
+
+        if [ "$_db_count" -eq 1 ]; then
+            _db_line=$(sed -n '1p' "$_pgss_db_file")
+        else
+            echo "Query ID found in multiple databases:"
+            _n=1
+            while IFS='|' read -r _dbid _dbname; do
+                [ -n "$_dbname" ] || _dbname="<database oid $_dbid no longer exists>"
+                printf '  %s) %s (dbid=%s)\n' "$_n" "$_dbname" "$_dbid"
+                _n=$((_n+1))
+            done < "$_pgss_db_file"
+            while :; do
+                printf 'Select database [1]: ' >&2
+                IFS= read -r _choice || return 1
+                [ -n "$_choice" ] || _choice=1
+                case $_choice in ''|*[!0-9]*) echo "ERROR: enter a valid number." >&2; continue ;; esac
+                [ "$_choice" -ge 1 ] && [ "$_choice" -le "$_db_count" ] || { echo "ERROR: selection out of range." >&2; continue; }
+                _db_line=$(sed -n "${_choice}p" "$_pgss_db_file")
+                break
+            done
+        fi
+
+        _source_dbid=${_db_line%%|*}
+        _source_database=${_db_line#*|}
+        if [ -z "$_source_database" ]; then
+            echo "ERROR: pg_stat_statements entry refers to database oid $_source_dbid, but that database no longer exists." >&2
+            continue
+        fi
+
+        _count=$(run_psql -X -qAt -v ON_ERROR_STOP=1 -v queryid="$QUERYID" -v dbid="$_source_dbid" <<SQL 2>"$work_dir/pgss.err" || true
 SELECT count(*)
 FROM (
     SELECT DISTINCT query
     FROM $PGSS_RELATION
-    WHERE dbid=(SELECT oid FROM pg_database WHERE datname=current_database())
+    WHERE dbid=:'dbid'::oid
       AND queryid=:'queryid'::bigint
       AND query IS NOT NULL
 ) q;
@@ -160,24 +258,24 @@ SQL
         )
         if [ -s "$work_dir/pgss.err" ]; then
             cat "$work_dir/pgss.err" >&2
-            echo "ERROR: invalid queryid or pg_stat_statements query failed." >&2
+            echo "ERROR: pg_stat_statements query lookup failed." >&2
             continue
         fi
         case $_count in ''|*[!0-9]*) echo "ERROR: could not validate queryid." >&2; continue ;; esac
         if [ "$_count" -eq 0 ]; then
-            echo "ERROR: Query ID not found in pg_stat_statements for database $PGDATABASE." >&2
+            echo "ERROR: Query ID disappeared from pg_stat_statements during lookup." >&2
             continue
         fi
         if [ "$_count" -gt 1 ]; then
-            echo "ERROR: multiple different query texts share this queryid; use a SQL file to avoid ambiguity." >&2
+            echo "ERROR: multiple different query texts share this queryid in database $_source_database; use a SQL file to avoid ambiguity." >&2
             continue
         fi
 
         _pgss_sql="$work_dir/pgss-query.sql"
-        if ! run_psql -X -qAt -v ON_ERROR_STOP=1 -v queryid="$QUERYID" <<SQL > "$_pgss_sql" 2>"$work_dir/pgss.err"
+        if ! run_psql -X -qAt -v ON_ERROR_STOP=1 -v queryid="$QUERYID" -v dbid="$_source_dbid" <<SQL > "$_pgss_sql" 2>"$work_dir/pgss.err"
 SELECT DISTINCT query
 FROM $PGSS_RELATION
-WHERE dbid=(SELECT oid FROM pg_database WHERE datname=current_database())
+WHERE dbid=:'dbid'::oid
   AND queryid=:'queryid'::bigint
   AND query IS NOT NULL
 LIMIT 1;
@@ -191,9 +289,22 @@ SQL
             echo "ERROR: insufficient privilege to read this pg_stat_statements query text." >&2
             continue
         fi
+
+        if [ "$_source_database" != "$PGDATABASE" ]; then
+            _current_database=$PGDATABASE
+            if ! confirm_database_switch "$_current_database" "$_source_database"; then
+                echo "Cancelled database switch. Use a SQL file or reconnect to $_source_database." >&2
+                continue
+            fi
+            switch_database "$_source_database" || continue
+        fi
+
         SQL_FILE=$_pgss_sql
-        SQL_SOURCE_DESC="pg_stat_statements queryid=$QUERYID"
-        echo "Loaded SQL from pg_stat_statements queryid=$QUERYID"
+        SQL_SOURCE_KIND=pg_stat_statements
+        SQL_SOURCE_DESC="pg_stat_statements queryid=$QUERYID database=$_source_database"
+        echo "Loaded SQL from pg_stat_statements queryid=$QUERYID (database=$_source_database)"
+        echo "NOTICE: pg_stat_statements stores normalized representative query text."
+        echo "        Literal constants and bind values are not retained; they may appear as \$1, \$2, ... and must be supplied for EXPLAIN."
         return 0
     done
 }
@@ -219,6 +330,7 @@ while :; do
         printf 'Target SQL file path (empty to cancel): ' >&2
         IFS= read -r SQL_FILE || exit 1
         [ -n "$SQL_FILE" ] || { echo "Cancelled."; exit 1; }
+        SQL_SOURCE_KIND=file
         SQL_SOURCE_DESC="SQL file"
     fi
     [ -f "$SQL_FILE" ] && [ -r "$SQL_FILE" ] && break
@@ -513,7 +625,11 @@ SQL
     echo 'Candidates are distinct current table values and do not apply the original SQL filters.'
 }
 
-BIND=$(ask 'Use bind parameters ($1, $2, ...)? y/n' n) || exit 1
+BIND_DEFAULT=n
+if [ "$SQL_SOURCE_KIND" = pg_stat_statements ] && grep -Eq '\$[1-9][0-9]*' "$SQL_FILE"; then
+    BIND_DEFAULT=y
+fi
+BIND=$(ask 'Use bind parameters ($1, $2, ...)? y/n' "$BIND_DEFAULT") || exit 1
 prepare_file="$work_dir/prepare.sql"; execute_file="$work_dir/execute.sql"; bind_values_file="$work_dir/bind-values-used.txt"; : > "$bind_values_file"; BIND_PLAN_MODE=auto
 if [ "$BIND" = yes ]; then
     printf 'Parameter types, comma-separated [auto infer]: ' >&2; IFS= read -r bind_types
