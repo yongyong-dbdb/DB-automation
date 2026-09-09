@@ -1,0 +1,49 @@
+name: Temporary GR v1.0.12 candidate
+
+on:
+  push:
+    branches: [gr-v1.0.12-reprovision]
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-validate:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: gr-v1.0.12-reprovision
+          fetch-depth: 0
+      - name: Apply candidate patch
+        run: python3 tools/tmp_patch_gr_v1012.py
+      - name: Syntax and safety checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          f='MySQL/Group-Replication/mysql_gr_migrate.sh'
+          /bin/sh -n "$f"
+          test "$(/bin/sh "$f" --version)" = '1.0.12'
+          ! grep -Eq 'RESET[[:space:]]+(MASTER|BINARY[[:space:]]+LOGS[[:space:]]+AND[[:space:]]+GTIDS)' "$f"
+          ! grep -Eq 'mysqlbinlog[^|]*\|[[:space:]]*mysql([[:space:]]|$)' "$f"
+          grep -F "NODE\\tSERVER_UUID\\tREAD_ONLY" "$f"
+          grep -F 'reprovision package' "$f"
+          grep -F 'before_gr_reprovision' "$f"
+          grep -F 'gr_reprovision_stage' "$f"
+      - name: Source functions and smoke-test pure helpers
+        shell: bash
+        run: |
+          set -euo pipefail
+          f='MySQL/Group-Replication/mysql_gr_migrate.sh'
+          t=/tmp/gr.nom.sh
+          cp "$f" "$t"
+          sed -i '${/^main$/d;}' "$t"
+          /bin/sh -c '. /tmp/gr.nom.sh; platform_preflight; echo platform_preflight_PASS'
+      - name: Commit candidate script
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add 'MySQL/Group-Replication/mysql_gr_migrate.sh'
+          git commit -m 'MySQL GR v1.0.12 candidate: prepare reversible reprovisioning' || exit 0
+          git push origin HEAD:gr-v1.0.12-reprovision
