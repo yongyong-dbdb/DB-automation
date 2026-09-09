@@ -1,7 +1,7 @@
 #!/bin/sh
 set -u
 
-SCRIPT_VERSION="1.2.10"
+SCRIPT_VERSION="1.2.11"
 SCRIPT_DIR=$(CDPATH='' cd "$(dirname "$0")" && pwd)
 DEFAULT_OUTPUT_DIR="$SCRIPT_DIR/results"
 PSQL_BIN=${PSQL_BIN:-}
@@ -194,8 +194,15 @@ render_plan_summary() {
     t=$0
     sub(/^[[:space:]]+/, "", t)
 
-    # Plan node: keep PostgreSQL cost/rows/width and ANALYZE actual time/rows/loops.
-    if ($0 ~ /\(cost=[^)]*\)/ && (t ~ /^->/ || $0 !~ /^[[:space:]]/)) {
+    # Keep the root plan node even when COSTS is disabled.
+    if (!root_seen && t != "") {
+        print $0
+        root_seen=1
+        next
+    }
+
+    # Keep child plan nodes. With COSTS off they may not contain (cost=...).
+    if (t ~ /^->/) {
         print $0
         next
     }
@@ -387,6 +394,36 @@ if [ "$SERVER_VERSION_NUM" -ge 170000 ]; then [ "$MEMORY" = yes ] && add_opt 'ME
 [ "$SUMMARY" = yes ] && add_opt 'SUMMARY TRUE' || add_opt 'SUMMARY FALSE'
 raw_text_opts="$base_plan_opts, FORMAT TEXT"
 
+option_tf() {
+    [ "$1" = yes ] && printf 'TRUE' || printf 'FALSE'
+}
+write_option_summary() {
+    echo "Selected EXPLAIN Options"
+    printf '  %-12s : %s\n' ANALYZE "$(option_tf "$ANALYZE")"
+    printf '  %-12s : %s\n' VERBOSE "$(option_tf "$VERBOSE")"
+    printf '  %-12s : %s\n' COSTS "$(option_tf "$COSTS")"
+    printf '  %-12s : %s\n' SETTINGS "$(option_tf "$SETTINGS")"
+    if [ "$ANALYZE" = yes ]; then
+        printf '  %-12s : %s\n' BUFFERS "$(option_tf "$BUFFERS")"
+        if [ "$SERVER_VERSION_NUM" -ge 130000 ]; then printf '  %-12s : %s\n' WAL "$(option_tf "$WAL")"; fi
+        printf '  %-12s : %s\n' TIMING "$(option_tf "$TIMING")"
+        if [ "$SERVER_VERSION_NUM" -ge 170000 ]; then
+            if [ "$SERIALIZE" = yes ]; then printf '  %-12s : TEXT\n' SERIALIZE; else printf '  %-12s : NONE\n' SERIALIZE; fi
+        fi
+    elif [ "$BIND" = no ] && [ "$SERVER_VERSION_NUM" -ge 160000 ]; then
+        printf '  %-12s : %s\n' GENERIC_PLAN "$(option_tf "$GENERIC_PLAN")"
+    fi
+    if [ "$SERVER_VERSION_NUM" -ge 170000 ]; then printf '  %-12s : %s\n' MEMORY "$(option_tf "$MEMORY")"; fi
+    printf '  %-12s : %s\n' SUMMARY "$(option_tf "$SUMMARY")"
+    printf '  %-12s : TEXT\n' FORMAT
+    if [ "$BIND" = yes ]; then printf '  %-12s : %s\n' PLAN_MODE "$BIND_PLAN_MODE"; fi
+}
+options_summary="$work_dir/explain-options.txt"
+write_option_summary > "$options_summary"
+echo
+cat "$options_summary"
+echo
+
 tree_plan_opts=""
 add_tree_opt() { [ -z "$tree_plan_opts" ] && tree_plan_opts="$1" || tree_plan_opts="$tree_plan_opts, $1"; }
 [ "$VERBOSE" = yes ] && add_tree_opt 'VERBOSE TRUE' || add_tree_opt 'VERBOSE FALSE'
@@ -457,6 +494,7 @@ fi
 
 {
  echo "PostgreSQL execution plan analysis"; echo "script_version=$SCRIPT_VERSION"; echo "database=$PGDATABASE"; echo "sql_file=$SQL_FILE"; echo
+ cat "$options_summary"; echo
 } > "$RESULT_FILE"
 
 if ! run_psql -X -qAt -P pager=off -v ON_ERROR_STOP=1 -f "$tmp" > "$raw_plan_output" 2>"$plan_error"; then
