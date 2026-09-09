@@ -1,7 +1,7 @@
 #!/bin/sh
 set -u
 
-SCRIPT_VERSION="1.2.7"
+SCRIPT_VERSION="1.2.8"
 SCRIPT_DIR=$(CDPATH='' cd "$(dirname "$0")" && pwd)
 DEFAULT_OUTPUT_DIR="$SCRIPT_DIR/results"
 PSQL_BIN=${PSQL_BIN:-}
@@ -205,10 +205,13 @@ nodes(path, node, is_last, depth) AS (
     CROSS JOIN LATERAL jsonb_array_elements(COALESCE(n.node->'Plans','[]'::jsonb)) WITH ORDINALITY AS c(child,ord)
 ), formatted AS (
     SELECT path,
-           repeat('   ', depth) || CASE WHEN depth=0 THEN '' WHEN is_last THEN '└─ ' ELSE '├─ ' END ||
-           (node->>'Node Type') ||
-           CASE WHEN node ? 'Index Name' THEN ' using ' || node->>'Index Name' ELSE '' END ||
-           CASE WHEN node ? 'Relation Name' THEN ' on ' || COALESCE((node->>'Schema') || '.', '') || node->>'Relation Name' ELSE '' END AS node_type,
+           concat(
+               repeat('   ', depth),
+               CASE WHEN depth=0 THEN '' WHEN is_last THEN '└─ ' ELSE '├─ ' END,
+               COALESCE(node->>'Node Type',''),
+               CASE WHEN node ? 'Index Name' THEN concat(' using ', node->>'Index Name') ELSE '' END,
+               CASE WHEN node ? 'Relation Name' THEN concat(' on ', CASE WHEN node ? 'Schema' THEN concat(node->>'Schema','.') ELSE '' END, node->>'Relation Name') ELSE '' END
+           ) AS node_type,
            COALESCE(array_to_string(ARRAY(SELECT jsonb_array_elements_text(COALESCE(node->'Sort Key','[]'::jsonb))), ', '), '') AS sort_key,
            COALESCE(node->>'Index Cond','') AS index_cond,
            COALESCE(node->>'Recheck Cond','') AS recheck_cond,
