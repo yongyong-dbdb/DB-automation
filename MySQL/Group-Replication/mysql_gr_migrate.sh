@@ -1,11 +1,11 @@
 #!/bin/sh
-# mysql_gr_migrate.sh v1.0.7
+# mysql_gr_migrate.sh v1.0.8
 # POSIX sh; OS utilities and MySQL clients only. No external language packages.
 # Supported: Oracle MySQL 8.0.27+, 8.4.x, 9.7.x; homogeneous exact versions.
 # Single-primary or multi-primary / XCom. Never resets GTID or binary logs.
 set -eu
 umask 077
-VERSION=1.0.7
+VERSION=1.0.8
 ROOT=${MYSQL_GR_WORK_ROOT:-"$(pwd)/mysql_gr_work"}
 MYSQL=${MYSQL_GR_MYSQL:-mysql}
 DUMP=${MYSQL_GR_MYSQLDUMP:-mysqldump}
@@ -106,6 +106,9 @@ credential() (
     [ ! -f "$TEMP/$i.cnf" ] || exit 0
     pw=$(secret "Node $i password for $(get "$i" user)")
     {
+        # Keep [client] limited to options shared by MySQL client programs.
+        # Program-specific options belong in their own group so mysqlbinlog/
+        # mysqldump do not abort on a mysql-only option.
         printf '[client]\nuser="%s"\npassword="%s"\n' "$(optq "$(get "$i" user)")" "$(optq "$pw")"
         if [ "$(get "$i" mode)" = socket ]; then
             printf 'protocol=SOCKET\nsocket="%s"\n' "$(optq "$(get "$i" socket)")"
@@ -113,9 +116,37 @@ credential() (
             printf 'protocol=TCP\nhost="%s"\nport=%s\nssl-mode=%s\n' "$(optq "$(get "$i" host)")" "$(get "$i" port)" "$(get "$i" admin_tls)"
             [ ! -s "$ROOT/$i/admin_ca" ] || printf 'ssl-ca="%s"\n' "$(optq "$(get "$i" admin_ca)")"
         fi
-        printf 'connect-timeout=10\n'
+        printf '\n[mysql]\nconnect-timeout=10\n'
     } > "$TEMP/$i.cnf"
 )
+tool_option_preflight() (
+    i=$1; tool=$2; label=$3
+    credential "$i"
+    command -v "$tool" >/dev/null 2>&1 || exit 2
+    err="$RUN/node_${i}.${label}_option_preflight.err"
+    if ! "$tool" --defaults-file="$TEMP/$i.cnf" --no-login-paths --help >/dev/null 2> "$err"; then
+        chmod 600 "$err" 2>/dev/null || :
+        log "ERROR: $label rejected the generated client option file for node $i."
+        log "Evidence: $err"
+        exit 1
+    fi
+    rm -f "$err"
+)
+
+preflight_client_utilities() {
+    # Run before initialize mutates/fences anything. Missing optional tools are
+    # handled later only if their workflow is actually selected.
+    for i in $(ids); do
+        tool_option_preflight "$i" "$MYSQL" mysql || die "mysql option-file compatibility check failed for node $i"
+        if command -v "$BINLOG" >/dev/null 2>&1; then
+            tool_option_preflight "$i" "$BINLOG" mysqlbinlog || die "mysqlbinlog option-file compatibility check failed for node $i"
+        fi
+    done
+    if command -v "$DUMP" >/dev/null 2>&1; then
+        tool_option_preflight 1 "$DUMP" mysqldump || die 'mysqldump option-file compatibility check failed for node 1'
+    fi
+}
+
 sql() (
     i=$1; stmt=$2
     credential "$i"
@@ -1050,14 +1081,72 @@ mysqlbinlog_tool() (
     printf '%s' "$tool"
 )
 
+prepare_direct_binlogs() {
+    i=$1; logs_file=$2; direct_file=$3
+    : > "$direct_file"
+    [ "$(get "$i" location)" = local ] || return 1
+    binlog_basename=$(val "$i" log_bin_basename)
+    [ -n "$binlog_basename" ] || return 1
+    binlog_dir=$(dirname "$binlog_basename")
+    tab=$(printf '\t')
+    while IFS="$tab" read -r log_name file_size encrypted; do
+        [ -n "$log_name" ] || continue
+        case $log_name in */*|*'..'*) return 1;; esac
+        case $encrypted in No|NO|no|0) :;; *) return 1;; esac
+        full="$binlog_dir/$log_name"
+        [ -f "$full" ] && [ ! -L "$full" ] && [ -r "$full" ] || return 1
+        printf '%s\n' "$full" >> "$direct_file"
+    done < "$logs_file"
+    [ -s "$direct_file" ]
+}
+
 write_mysqlbinlog_command() {
-    i=$1; include_gtids=$2; logs_file=$3
+    i=$1; include_gtids=$2; logs_file=$3; inspect_mode=$4; direct_file=$5
     cmd_file="$RUN/node_${i}.mysqlbinlog_command.sh"
     {
         printf '#!/bin/sh\n'
-        printf '# Read-only GTID inspection helper. It only reads binary logs; it never pipes output into mysql.\n'
+        printf '# Read-only GTID inspection helper. It never pipes mysqlbinlog output into mysql.\n'
         printf '# Use a mysqlbinlog client matching MySQL server version %s.\n' "$(get "$i" version)"
-        printf 'mysqlbinlog --read-from-remote-server --base64-output=DECODE-ROWS -vv '
+        printf 'mysqlbinlog --base64-output=DECODE-ROWS -vv '
+        if [ "$inspect_mode" = direct ]; then
+            shell_quote "--include-gtids=$include_gtids"; printf ' '
+            while IFS= read -r full; do
+                [ -n "$full" ] || continue
+                shell_quote "$full"; printf ' '
+            done < "$direct_file"
+        else
+            printf '%s ' '--read-from-remote-server'
+            if [ "$(get "$i" mode)" = socket ]; then
+                printf '%s ' '--protocol=SOCKET'
+                shell_quote "--socket=$(get "$i" socket)"; printf ' '
+            else
+                printf '%s ' '--protocol=TCP'
+                shell_quote "--host=$(get "$i" host)"; printf ' '
+                shell_quote "--port=$(get "$i" port)"; printf ' '
+                shell_quote "--ssl-mode=$(get "$i" admin_tls)"; printf ' '
+                if [ -s "$ROOT/$i/admin_ca" ]; then
+                    shell_quote "--ssl-ca=$(get "$i" admin_ca)"; printf ' '
+                fi
+            fi
+            shell_quote "--user=$(get "$i" user)"; printf ' '
+            printf '%s ' '--password'
+            shell_quote "--include-gtids=$include_gtids"; printf ' '
+            tab=$(printf '\t')
+            while IFS="$tab" read -r log_name rest; do
+                [ -n "$log_name" ] || continue
+                shell_quote "$log_name"; printf ' '
+            done < "$logs_file"
+        fi
+        printf '\n'
+    } > "$cmd_file"
+    chmod 700 "$cmd_file"
+    printf '%s' "$cmd_file"
+}
+
+write_mysql_readonly_command() {
+    i=$1; stmt=$2; out=$3
+    {
+        printf 'mysql '
         if [ "$(get "$i" mode)" = socket ]; then
             printf '%s ' '--protocol=SOCKET'
             shell_quote "--socket=$(get "$i" socket)"; printf ' '
@@ -1072,18 +1161,57 @@ write_mysqlbinlog_command() {
         fi
         shell_quote "--user=$(get "$i" user)"; printf ' '
         printf '%s ' '--password'
-        shell_quote "--include-gtids=$include_gtids"; printf '%s' ' '
-
-        tab=$(printf '\t')
-        while IFS="$tab" read -r log_name rest; do
-            [ -n "$log_name" ] || continue
-            shell_quote "$log_name"
-            printf ' '
-        done < "$logs_file"
+        printf '%s ' '-e'
+        shell_quote "$stmt"
         printf '\n'
-    } > "$cmd_file"
-    chmod 700 "$cmd_file"
-    printf '%s' "$cmd_file"
+    } > "$out"
+    chmod 700 "$out"
+}
+
+server_streaming_guidance() {
+    i=$1; cmd_file=$2
+    grants_file="$RUN/node_${i}.mysqlbinlog_streaming_grants.txt"
+    check_file="$RUN/node_${i}.mysqlbinlog_streaming_check.sh"
+    grant_file="$RUN/node_${i}.mysqlbinlog_streaming_grant.sql"
+    account=$(sql "$i" 'SELECT CURRENT_USER();')
+    sql "$i" 'SHOW GRANTS FOR CURRENT_USER;' > "$grants_file" 2>/dev/null || :
+    write_mysql_readonly_command "$i" 'SHOW GRANTS FOR CURRENT_USER;' "$check_file"
+    grant_stmt=$(sql "$i" "SELECT CONCAT('GRANT REPLICATION SLAVE ON *.* TO ',QUOTE(SUBSTRING_INDEX(CURRENT_USER(),'@',1)),'@',QUOTE(SUBSTRING_INDEX(CURRENT_USER(),'@',-1)),';');" 2>/dev/null || :)
+    {
+        printf '%s\n' '-- Run only through an authorized DBA account, and only if the streaming account lacks REPLICATION SLAVE.'
+        printf '%s\n' "${grant_stmt:-GRANT REPLICATION SLAVE ON *.* TO '<mysql_user>'@'<account_host>'; }"
+    } > "$grant_file"
+    chmod 600 "$grants_file" "$grant_file" 2>/dev/null || :
+    log 'SERVER-STREAMING PREREQUISITES (shown before automatic attempt):'
+    log "  MySQL account                  : ${account:-UNKNOWN}"
+    log '  Required privilege             : REPLICATION SLAVE'
+    log "  Check current grants           : $check_file"
+    log "  Captured grants                : $grants_file"
+    log "  Authorized DBA grant template  : $grant_file"
+    log "  Read-only mysqlbinlog command  : $cmd_file"
+    log '  The script does NOT grant privileges automatically and never pipes mysqlbinlog output into mysql.'
+}
+
+external_manual_guidance() {
+    i=$1; reason=$2
+    guide="$RUN/node_${i}.external_reprovision_guide.txt"
+    identity_cmd="$RUN/node_${i}.external_identity_check.sh"
+    gtid_cmd="$RUN/node_${i}.external_gtid_check.sh"
+    write_mysql_readonly_command "$i" 'SELECT @@hostname,@@port,@@socket,@@datadir,@@server_uuid,@@server_id;' "$identity_cmd"
+    write_mysql_readonly_command "$i" 'SELECT @@GLOBAL.gtid_executed,@@GLOBAL.gtid_purged,@@GLOBAL.read_only,@@GLOBAL.super_read_only;' "$gtid_cmd"
+    {
+        printf 'Node %s requires external provisioning/reconciliation.\n' "$i"
+        printf 'Reason: %s\n\n' "$reason"
+        printf 'Run these read-only checks on/from a host that can reach the target before changing anything:\n'
+        printf '  %s\n' "$identity_cmd"
+        printf '  %s\n' "$gtid_cmd"
+        printf '\nNo destructive restore/reset command is generated automatically. Select and validate the backup/provisioning method first.\n'
+        printf 'After provisioning, verify server_uuid/instance identity and GTID state before rerunning migration.\n'
+    } > "$guide"
+    chmod 600 "$guide"
+    log "Manual/external action guide          : $guide"
+    log "  Identity check command             : $identity_cmd"
+    log "  GTID/fence check command           : $gtid_cmd"
 }
 
 inspect_extra_gtids() {
@@ -1093,6 +1221,7 @@ inspect_extra_gtids() {
     [ -n "$extra" ] || { log "Node $i has no extra GTIDs to inspect."; return 0; }
 
     logs_file="$RUN/node_${i}.binary_logs.tsv"
+    direct_file="$RUN/node_${i}.binary_log_files.txt"
     summary_file="$RUN/node_${i}.errant_gtid_inspection.tsv"
     output_file="$RUN/node_${i}.errant_gtid.mysqlbinlog.txt"
     error_file="$RUN/node_${i}.errant_gtid.mysqlbinlog.err"
@@ -1102,6 +1231,8 @@ inspect_extra_gtids() {
     purged_extra=$(normalize_gtid "$(sql "$i" "SELECT GTID_SUBTRACT('$(q "$extra")',GTID_SUBTRACT(@@GLOBAL.gtid_executed,@@GLOBAL.gtid_purged));")")
     log_count=$(awk 'END{print NR+0}' "$logs_file")
     log_bytes=$(awk -F '\t' '{sum += $2} END{printf "%.0f",sum+0}' "$logs_file")
+    inspect_mode=remote
+    if prepare_direct_binlogs "$i" "$logs_file" "$direct_file"; then inspect_mode=direct; else rm -f "$direct_file"; fi
 
     {
         printf 'FIELD\tVALUE\n'
@@ -1113,6 +1244,7 @@ inspect_extra_gtids() {
         printf 'LOG_BIN_BASENAME\t%s\n' "$binlog_basename"
         printf 'BINARY_LOG_COUNT\t%s\n' "$log_count"
         printf 'BINARY_LOG_BYTES_TO_SCAN\t%s\n' "$log_bytes"
+        printf 'INSPECTION_MODE\t%s\n' "$inspect_mode"
     } > "$summary_file"
 
     log "Node $i read-only errant-GTID inspection:"
@@ -1120,6 +1252,11 @@ inspect_extra_gtids() {
     log "  Already purged from binary logs  : ${purged_extra:-NONE}"
     log "  Binary log list                  : $logs_file"
     log "  Current binary log bytes to scan : $log_bytes"
+    if [ "$inspect_mode" = direct ]; then
+        log '  Inspection path                  : local readable unencrypted binlog files (no replication privilege required)'
+    else
+        log '  Inspection path                  : server streaming (remote/inaccessible/encrypted binlog)'
+    fi
     log "  Inspection summary               : $summary_file"
     [ -z "$purged_extra" ] || log '  NOTE: Purged GTIDs cannot be reconstructed from the current binary logs; use retained backups/audit evidence if transaction contents must be reviewed.'
 
@@ -1128,11 +1265,37 @@ inspect_extra_gtids() {
         return 0
     }
 
-    cmd_file=$(write_mysqlbinlog_command "$i" "$available_extra" "$logs_file")
+    cmd_file=$(write_mysqlbinlog_command "$i" "$available_extra" "$logs_file" "$inspect_mode" "$direct_file")
     log "  Read-only fallback command        : $cmd_file"
+    if [ "$inspect_mode" = remote ]; then
+        server_streaming_guidance "$i" "$cmd_file"
+    fi
     if ! tool=$(mysqlbinlog_tool "$i"); then
         log 'Matching mysqlbinlog was not found on this controller. No package is installed automatically; use the generated read-only command with a matching MySQL client.'
         return 0
+    fi
+
+    set --
+    if [ "$inspect_mode" = direct ]; then
+        while IFS= read -r full; do
+            [ -n "$full" ] || continue
+            set -- "$@" "$full"
+        done < "$direct_file"
+        [ "$#" -gt 0 ] || { log "Node $i has no readable direct binary log files; automatic decoding skipped."; return 0; }
+        if "$tool" --base64-output=DECODE-ROWS -vv --include-gtids="$available_extra" "$@" > "$output_file" 2> "$error_file"; then
+            chmod 600 "$output_file" "$error_file"
+            rm -f "$error_file"
+            log "  mysqlbinlog evidence              : $output_file"
+            log '  WARNING: The evidence can contain SQL and row values; the file is stored under the protected run directory.'
+            return 0
+        fi
+        # A local file may become inaccessible/rotated between SHOW BINARY LOGS and read.
+        # Fall back to server streaming rather than changing any server state.
+        log 'Direct local mysqlbinlog read failed; server streaming is required for the fallback.'
+        inspect_mode=remote
+        printf 'INSPECTION_MODE_FALLBACK\tremote\n' >> "$summary_file"
+        cmd_file=$(write_mysqlbinlog_command "$i" "$available_extra" "$logs_file" remote "$direct_file")
+        server_streaming_guidance "$i" "$cmd_file"
     fi
 
     credential "$i"
@@ -1143,19 +1306,47 @@ inspect_extra_gtids() {
         set -- "$@" "$log_name"
     done < "$logs_file"
     [ "$#" -gt 0 ] || { log "Node $i returned no binary log files; automatic decoding skipped."; return 0; }
-
-    # Read through the server rather than opening OS files directly. This works for
-    # local/remote nodes and encrypted binary logs, and does not execute the output.
     if "$tool" --defaults-file="$TEMP/$i.cnf" --no-login-paths --read-from-remote-server --base64-output=DECODE-ROWS -vv --include-gtids="$available_extra" "$@" > "$output_file" 2> "$error_file"; then
         chmod 600 "$output_file" "$error_file"
+        rm -f "$error_file"
         log "  mysqlbinlog evidence              : $output_file"
         log '  WARNING: The evidence can contain SQL and row values; the file is stored under the protected run directory.'
     else
         chmod 600 "$error_file" 2>/dev/null || :
-        log 'Automatic mysqlbinlog decoding failed (for example, the account may lack REPLICATION SLAVE). No server data was changed.'
+        log 'Automatic mysqlbinlog decoding failed. No server data was changed.'
         log "  mysqlbinlog error                 : $error_file"
         log "  Use the generated command         : $cmd_file"
     fi
+}
+
+divergence_abort_snapshot() {
+    i=$1
+    snapshot="$RUN/divergence_abort_state.tsv"
+    {
+        printf 'NODE\tREAD_ONLY\tSUPER_READ_ONLY\tEVENT_SCHEDULER\tGTID_EXECUTED\n'
+        for j in $(ids); do
+            if row=$(sql "$j" 'SELECT @@server_uuid,@@read_only,@@super_read_only,@@event_scheduler,@@gtid_executed;' 2>/dev/null); then
+                printf '%s\t%s\n' "$j" "$row"
+            else
+                printf '%s\tUNAVAILABLE\n' "$j"
+            fi
+        done
+    } > "$snapshot"
+    chmod 600 "$snapshot"
+    log "Abort state snapshot: $snapshot"
+    log 'NEXT CHECKS:'
+    if [ -s "$RUN/node_${i}.errant_gtid.mysqlbinlog.txt" ]; then
+        log "  1) Review decoded extra-GTID evidence: $RUN/node_${i}.errant_gtid.mysqlbinlog.txt"
+    elif [ -s "$RUN/node_${i}.errant_gtid.mysqlbinlog.err" ]; then
+        log "  1) Review mysqlbinlog error: $RUN/node_${i}.errant_gtid.mysqlbinlog.err"
+        [ ! -f "$RUN/node_${i}.mysqlbinlog_command.sh" ] || log "     Read-only retry command: $RUN/node_${i}.mysqlbinlog_command.sh"
+    else
+        log "  1) Review GTID evidence: $RUN/node_${i}.gtid_compare.tsv"
+    fi
+    log "  2) Review inspection summary: $RUN/node_${i}.errant_gtid_inspection.tsv"
+    log '  3) Keep the migration stopped; do not run cutover while extra GTIDs remain.'
+    log '  4) After reviewed reconciliation/reprovisioning, rerun precheck and initialize if instance identity is unchanged.'
+    log '     If server_uuid/instance identity changed, use a fresh MYSQL_GR_WORK_ROOT and run discover again.'
 }
 
 divergence_workflow() {
@@ -1166,7 +1357,7 @@ divergence_workflow() {
     while :; do
         log '  inspect : read current binary logs and decode only the extra GTIDs; no SQL is applied (binary-log I/O/network reads may occur).'
         log '  external: stop here for reviewed reconciliation/reprovisioning from the authoritative source.'
-        log '  abort   : stop without changing GTID history; existing write fences/state remain preserved.'
+        log '  abort   : stop without changing GTID history; save a read-only state snapshot and print next checks.'
         action=$(required "Node $i divergent GTID action (inspect/external/abort)" inspect)
         case $action in
             inspect)
@@ -1174,23 +1365,29 @@ divergence_workflow() {
                 log 'Inspection complete. Review the saved evidence before deciding how to reconcile the member.'
                 while :; do
                     log '  external: reconcile/reprovision outside this script, then rerun after identity and GTID checks pass.'
-                    log '  abort   : stop now; no GTID reconciliation is attempted.'
+                    log '  abort   : save current state and print exactly what to review next; no GTID reconciliation is attempted.'
                     next_action=$(required "Node $i action after inspection (external/abort)" abort)
                     case $next_action in
                         external)
+                            divergence_abort_snapshot "$i"
+                            external_manual_guidance "$i" "divergent GTID history ($GTID_ORIGIN)"
                             log "Node $i must be reconciled or reprovisioned from authoritative node 1 using a separately validated procedure."
-                            log 'If server_uuid, channel, or instance identity changes during reprovisioning, use a fresh MYSQL_GR_WORK_ROOT and run discover again.'
                             die "Node $i external reconciliation/reprovisioning required before GR migration";;
-                        abort) die "Node $i divergence left unchanged after read-only inspection";;
+                        abort)
+                            divergence_abort_snapshot "$i"
+                            die "Node $i divergence left unchanged after read-only inspection";;
                         *) log 'Invalid action. Enter external or abort.';;
                     esac
                 done
                 ;;
             external)
+                divergence_abort_snapshot "$i"
+                external_manual_guidance "$i" "divergent GTID history ($GTID_ORIGIN)"
                 log "Node $i must be reconciled or reprovisioned from authoritative node 1 using a separately validated procedure."
-                log 'If server_uuid, channel, or instance identity changes during reprovisioning, use a fresh MYSQL_GR_WORK_ROOT and run discover again.'
                 die "Node $i external reconciliation/reprovisioning required before GR migration";;
-            abort) die "Node $i divergence left unchanged";;
+            abort)
+                divergence_abort_snapshot "$i"
+                die "Node $i divergence left unchanged";;
             *) log 'Invalid action. Enter inspect, external, or abort.';;
         esac
     done
@@ -1237,7 +1434,7 @@ classify_member() {
 initialize() {
     PHASE=initialize
     put meta mutation_started initialize
-    precheck; fence
+    precheck; preflight_client_utilities; fence
     target=$(normalize_gtid "$(val 1 gtid_executed)")
     put meta frozen_gtid "$target"
     for i in $(ids); do
@@ -1266,6 +1463,7 @@ initialize() {
                     case $method in dump|external) break;; *) log 'Invalid initialization method. Enter dump or external.';; esac
                 done
                 if [ "$method" = external ]; then
+                    external_manual_guidance "$i" "NEW_EMPTY member selected external provisioning"
                     log 'Restore the authoritative full data/GTID set, then rerun initialize. No GTID reset is performed by this script.'
                     die "Node $i external initialization pending"
                 fi
@@ -1307,6 +1505,7 @@ initialize() {
                     case $method in already|external) break;; *) log 'Invalid initialization method. Enter already or external.';; esac
                 done
                 if [ "$method" = external ]; then
+                    external_manual_guidance "$i" "PREPROVISIONED member selected external reprovisioning"
                     die "Node $i external re-provisioning pending"
                 fi
                 confirm "NODE $i DATA AND GTID VERIFIED"
@@ -1316,6 +1515,7 @@ initialize() {
             NEEDS_PROVISIONING)
                 log "Node $i state: NEEDS_PROVISIONING - it is not empty and does not exactly match the authoritative GTID/data starting point."
                 gtid_compare "$i" "$target"
+                external_manual_guidance "$i" "member is not empty and does not match the authoritative starting point"
                 die "Node $i requires external provisioning from node 1 before GR migration; automatic merge/reset is not performed"
                 ;;
             DIVERGED)
@@ -1596,6 +1796,7 @@ main() {
 
 # v1.0.4: automatic discovery/configuration overrides.
 # v1.0.5: state-based member initialization, GTID diagnostics, safer prompts and concise option guidance.
+# v1.0.8: client option-group compatibility, preflight checks, local-first binlog inspection and abort guidance.
 safe_host() { case $1 in ''|*[!a-zA-Z0-9_.-]*) die "Use an IPv4 address or DNS name (IPv6 is not supported in v$VERSION).";; esac; }
 
 host_is_local() (
