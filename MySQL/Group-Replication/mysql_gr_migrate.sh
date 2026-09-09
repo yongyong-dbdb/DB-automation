@@ -1546,17 +1546,63 @@ capture_reprovision_evidence() {
     printf '%s' "$dir"
 }
 
+
+export_source_accounts() {
+    dir=$1
+    account_list="$dir/source_accounts.list"
+    account_sql="$dir/source_accounts.sql"
+    default_roles="$dir/source_default_roles.sql"
+    sql 1 "SELECT CONCAT(QUOTE(u.User),'@',QUOTE(u.Host)) FROM mysql.user u LEFT JOIN (SELECT DISTINCT FROM_USER,FROM_HOST FROM mysql.role_edges) r ON r.FROM_USER=u.User AND r.FROM_HOST=u.Host WHERE u.User NOT IN ('mysql.infoschema','mysql.session','mysql.sys') ORDER BY CASE WHEN r.FROM_USER IS NULL THEN 1 ELSE 0 END,u.User,u.Host;" > "$account_list" || die 'Cannot enumerate Source accounts/roles for logical reprovisioning'
+    : > "$account_sql"
+    printf '%s\n' '-- Generated from authoritative node 1. Contains authentication hashes; protect this file.' >> "$account_sql"
+    printf '%s\n' 'SET SESSION sql_log_bin=0;' >> "$account_sql"
+    while IFS= read -r account; do
+        [ -n "$account" ] || continue
+        case $account in *';'*) die 'Unexpected account literal from Source';; esac
+        printf 'DROP USER IF EXISTS %s;\n' "$account" >> "$account_sql"
+        if hasvar 1 print_identified_with_as_hex; then
+            create=$(sql 1 "SET SESSION print_identified_with_as_hex=ON; SHOW CREATE USER $account;" | cut -f2-)
+        else
+            create=$(sql 1 "SHOW CREATE USER $account;" | cut -f2-)
+        fi
+        [ -n "$create" ] || die "SHOW CREATE USER returned no definition for $account"
+        printf '%s;\n' "${create%;}" >> "$account_sql"
+    done < "$account_list"
+    while IFS= read -r account; do
+        [ -n "$account" ] || continue
+        sql 1 "SHOW GRANTS FOR $account;" | while IFS= read -r grant_line; do
+            [ -n "$grant_line" ] || continue
+            printf '%s;\n' "${grant_line%;}" >> "$account_sql"
+        done
+    done < "$account_list"
+    : > "$default_roles"
+    if sql 1 "SELECT CONCAT('SET DEFAULT ROLE ',GROUP_CONCAT(CONCAT(QUOTE(DEFAULT_ROLE_USER),'@',QUOTE(DEFAULT_ROLE_HOST)) ORDER BY DEFAULT_ROLE_USER,DEFAULT_ROLE_HOST SEPARATOR ','),' TO ',QUOTE(USER),'@',QUOTE(HOST),';') FROM mysql.default_roles GROUP BY USER,HOST ORDER BY USER,HOST;" > "$default_roles" 2>/dev/null; then
+        cat "$default_roles" >> "$account_sql"
+    else
+        : > "$default_roles"
+        log 'WARNING: Source default-role metadata could not be exported automatically; logical reprovisioning must not be executed until roles are reviewed.'
+        printf '%s\n' '-- DEFAULT ROLE EXPORT UNAVAILABLE: REVIEW REQUIRED' >> "$account_sql"
+    fi
+    printf '%s\n' 'SET SESSION sql_log_bin=1;' >> "$account_sql"
+    chmod 600 "$account_list" "$account_sql" "$default_roles"
+    sha256sum "$account_sql" > "$account_sql.sha256"
+    printf '%s' "$account_sql"
+}
+
 prepare_reprovision_dump() {
     i=$1; target=$2; dir=$3
     dbs=$(sql 1 "SELECT schema_name FROM information_schema.schemata WHERE schema_name NOT IN ('mysql','sys','performance_schema','information_schema') ORDER BY schema_name;")
     [ -n "$dbs" ] || die 'Authoritative source has no application DBs; automatic logical reprovision package cannot be built'
     for db in $dbs; do case $db in *[!A-Za-z0-9_\$]*) die 'Database name requires external provisioning';; esac; done
     command -v "$DUMP" >/dev/null 2>&1 || die 'Matching mysqldump executable required for reprovision package'
+    accounts=$(export_source_accounts "$dir")
     dump="$dir/source_application.sql"
     set -f; set -- $dbs; set +f
     "$DUMP" --defaults-file="$TEMP/1.cnf" --no-login-paths --single-transaction --quick --skip-lock-tables --routines --events --triggers --hex-blob --set-gtid-purged=ON --databases "$@" > "$dump" 2> "$dir/source_dump.log"
     [ -s "$dump" ] || die 'Reprovision source dump is empty'
     sha256sum "$dump" > "$dump.sha256"
+    printf 'ACCOUNT_SQL\t%s\n' "$accounts" > "$dir/logical_reprovision_components.tsv"
+    printf 'APPLICATION_DUMP\t%s\n' "$dump" >> "$dir/logical_reprovision_components.tsv"
     [ "$(normalize_gtid "$(val 1 gtid_executed)")" = "$target" ] || die 'Authoritative source GTID changed while preparing reprovision package'
     printf '%s' "$dump"
 }
@@ -1593,8 +1639,10 @@ write_reprovision_plan() {
             printf '  2. Create STAGING as a sibling of the current datadir with the same owner/group/mode.\n'
             printf '  3. Initialize STAGING with the same mysqld version using --initialize-insecure and isolated socket/pid/log/binlog paths.\n'
             printf '  4. Start only the STAGING instance with --skip-networking and event_scheduler=OFF.\n'
-            printf '  5. Restore %s into STAGING and verify GTID exactly equals %s.\n' "$dump" "$target"
-            printf '  6. Recreate/verify an administrative account before final swap; never leave a passwordless root account exposed.\n'
+            printf '  5. Restore %s into STAGING. Then execute source_accounts.sql through the isolated local socket with binary logging disabled.\n' "$dump"
+            printf '     Account SQL contains authentication hashes and GRANT/role state; keep mode 600 and never print it to an unprotected terminal/log.\n'
+            printf '  6. Verify application objects, Source account/role state, and GTID exactly equals %s before final swap.\n' "$target"
+            printf '     If account/default-role export was incomplete, stop and use external/reviewed provisioning rather than marking all Source GTIDs executed.\n'
             printf '  7. Stop STAGING cleanly, stop the original instance using the proven launcher, then rename original datadir -> BACKUP and STAGING -> original datadir.\n'
             printf '  8. Start the original launcher, verify NEW server_uuid != %s, GTID == target, schema/data checks, and super_read_only=ON.\n' "$old_uuid"
             printf '  9. Keep BACKUP until GR validation and application smoke tests are complete.\n\n'
@@ -1607,7 +1655,8 @@ write_reprovision_plan() {
             printf 'Remote-node handling:\n'
             printf '  - Controller cannot assume filesystem access. Use SSH only after host/instance identity verification.\n'
             printf '  - If SSH/OS access is unavailable, run the generated remote_identity_check.sh on/from an authorized host and execute the same STAGING/BACKUP/swap procedure there.\n'
-            printf '  - Copy the dump and checksum to the target host before stopping the original instance, then verify checksum on that host.\n'
+            printf '  - Copy the application dump, source_accounts.sql, and both checksum files to the target host before stopping the original instance; verify every checksum there.\n'
+            printf '  - Restore both application data and Source account/role state in an isolated STAGING instance before any datadir swap.\n'
             printf '  - Do not infer a remote cnf/datadir path from the controller filesystem.\n'
         fi
         printf '\nAfter successful reprovision:\n'
@@ -2154,6 +2203,7 @@ main() {
 # v1.0.10: POSIX-awk conditional fix and controller utility/awk compatibility preflight before mutation.
 # v1.0.11: broader controller utility preflight and RENAME TABLE source/target metadata coverage.
 # v1.0.12: reversible reprovision package generation, staging/swap rollback plan, and stable abort TSV output.
+#           Logical reprovision package also exports Source users/roles/grants because partial mysqldump GTID metadata covers the full Source GTID set.
 safe_host() { case $1 in ''|*[!a-zA-Z0-9_.-]*) die "Use an IPv4 address or DNS name (IPv6 is not supported in v$VERSION).";; esac; }
 
 host_is_local() (
