@@ -1,11 +1,11 @@
 #!/bin/sh
-# mysql_gr_migrate.sh v1.0.13
+# mysql_gr_migrate.sh v1.0.14
 # POSIX sh; OS utilities and MySQL clients only. No external language packages.
 # Supported: Oracle MySQL 8.0.27+, 8.4.x, 9.7.x; homogeneous exact versions.
 # Single-primary or multi-primary / XCom. Never resets GTID or binary logs.
 set -eu
 umask 077
-VERSION=1.0.13
+VERSION=1.0.14
 ROOT=${MYSQL_GR_WORK_ROOT:-"$(pwd)/mysql_gr_work"}
 MYSQL=${MYSQL_GR_MYSQL:-mysql}
 DUMP=${MYSQL_GR_MYSQLDUMP:-mysqldump}
@@ -159,12 +159,56 @@ sql() (
 )
 val() { sql "$1" "SELECT @@GLOBAL.$2;"; }
 hasvar() { [ -n "$(sql "$1" "SHOW GLOBAL VARIABLES WHERE Variable_name='$(q "$2")';")" ]; }
+suggest_compatible_work_roots() {
+    parent=$(dirname "$ROOT")
+    current_count=$(get meta count 2>/dev/null || printf '0')
+    [ "$current_count" -gt 0 ] 2>/dev/null || return 0
+    found=no
+    for candidate in "$parent"/*; do
+        [ -d "$candidate" ] || continue
+        [ ! -L "$candidate" ] || continue
+        [ "$candidate" != "$ROOT" ] || continue
+        [ -f "$candidate/meta/count" ] || continue
+        [ "$(cat "$candidate/meta/count" 2>/dev/null || printf '')" = "$current_count" ] || continue
+        match=yes
+        n=1
+        while [ "$n" -le "$current_count" ]; do
+            [ -f "$candidate/$n/uuid" ] || { match=no; break; }
+            [ -f "$TEMP/live_uuid_$n" ] || { match=no; break; }
+            [ "$(cat "$candidate/$n/uuid")" = "$(cat "$TEMP/live_uuid_$n")" ] || { match=no; break; }
+            n=$((n+1))
+        done
+        [ "$match" = yes ] || continue
+        if [ "$found" = no ]; then
+            log 'Compatible migration work root detected for the current server UUIDs:'
+            found=yes
+        fi
+        log "  $candidate"
+    done
+    if [ "$found" = yes ]; then
+        log 'Use one of the paths above explicitly, for example:'
+        log "  export MYSQL_GR_WORK_ROOT=<compatible_path>"
+        log 'The stale work root was not modified or deleted.'
+    else
+        log 'No compatible sibling work root was found. Run discover with a NEW MYSQL_GR_WORK_ROOT; do not delete the stale project until reviewed.'
+    fi
+}
 connected() {
+    mismatch=''
     for ci in $(ids); do
         credential "$ci"
         [ "$(sql "$ci" 'SELECT 1;')" = 1 ] || die "Node $ci connection failed"
-        [ "$(val "$ci" server_uuid)" = "$(get "$ci" uuid)" ] || die "Node $ci UUID changed; rediscover before proceeding"
+        live_uuid=$(val "$ci" server_uuid)
+        printf '%s\n' "$live_uuid" > "$TEMP/live_uuid_$ci"
+        if [ "$live_uuid" != "$(get "$ci" uuid)" ]; then
+            mismatch="${mismatch}${mismatch:+ }$ci"
+        fi
     done
+    if [ -n "$mismatch" ]; then
+        log "ERROR: Server UUID changed for node(s): $mismatch. The selected MYSQL_GR_WORK_ROOT is stale."
+        suggest_compatible_work_roots
+        die 'Select the compatible work root shown above, or rediscover into a new work root before proceeding.'
+    fi
 }
 version_guard() (
     v=$1
