@@ -1,0 +1,73 @@
+--- a/MySQL/InnoDB-Cluster/mysql_innodb_cluster_migrate.sh
++++ b/MySQL/InnoDB-Cluster/mysql_innodb_cluster_migrate.sh
+@@ -1,10 +1,10 @@
+ #!/bin/sh
+-# mysql_innodb_cluster_migrate.sh v1.0.26
++# mysql_innodb_cluster_migrate.sh v1.0.28
+ # POSIX sh. Oracle MySQL GA 8.0+; runtime AdminAPI capability detection. Requires preinstalled mysql/mysqlsh; never installs packages.
+ # Safe automation for prepared MySQL instances / existing Group Replication -> InnoDB Cluster.
+ set -eu
+ umask 077
+-VERSION=1.0.26
++VERSION=1.0.28
+ ROOT=${MYSQL_IC_WORK_ROOT:-"$(pwd)/mysql_innodb_cluster_work"}
+ MYSQL=${MYSQL_IC_MYSQL:-mysql}
+ MYSQLSH=${MYSQL_IC_MYSQLSH:-mysqlsh}
+@@ -39,6 +39,14 @@
+ has_add_option(){ add_help | grep -q -- "--$1="; }
+ show_capabilities(){ out="$ROOT/capabilities.txt"; { printf 'mysqlsh='; "$MYSQLSH" --version | head -1; for o in adoptFromGR multiPrimary communicationStack localAddress memberSslMode ipAllowlist disableClone gtidSetIsComplete consistency exitStateAction expelTimeout autoRejoinTries memberWeight; do if has_create_option "$o"; then printf 'create.%s=yes\n' "$o"; else printf 'create.%s=no\n' "$o"; fi; done; for o in recoveryMethod localAddress cloneDonor waitRecovery timeout; do if has_add_option "$o"; then printf 'add.%s=yes\n' "$o"; else printf 'add.%s=no\n' "$o"; fi; done; } > "$out"; cat "$out"; }
+ choice(){ prompt=$1; def=$2; shift 2; while :; do v=$(ask "$prompt" "$def") || return 1; for x in "$@"; do [ "$v" = "$x" ] && { printf '%s' "$v"; return 0; }; done; log "Choose one of: $*"; done; }
++next_step(){
++    [ "${SUPPRESS_NEXT_STEP:-no}" = yes ] && return 0
++    step=$1
++    printf '\nNext step:\n  sh %s %s\n' "$0" "$step" >&2
++}
+ 
+ cleanup(){ rc=$?; trap - 0 1 2 15; [ -z "${TMP:-}" ] || rm -rf "$TMP"; [ -z "${LOCK:-}" ] || rmdir "$LOCK" 2>/dev/null || :; exit "$rc"; }
+ trap cleanup 0 1 2 15
+@@ -234,6 +242,7 @@
+     log "Discovery complete: count=$c gr_members=$g gr_mode=$(get meta gr_mode) metadata=$(get meta metadata)"
+     if [ -n "$candidate" ]; then log "Discovered clusterAdmin Host candidate: $candidate (derived from live GR MEMBER_HOST and local interface route)"; else log 'No safe clusterAdmin Host candidate was auto-derived; configure-admin will require explicit review.'; fi
+     log "Common user@host accounts across all registered nodes: $ROOT/common_accounts.txt"
++    next_step sql-precheck
+ }
+@@ -283,6 +292,7 @@
+     for i in $(ids); do gtids "$i" > "$ROOT/node_${i}.gtid.before"; done
+     : > "$ROOT/meta/sql_prechecked"
+     log "SQL PRECHECK PASSED: members=$total ONLINE=$online mode=$(get meta gr_mode). No configuration was changed."
++    next_step configure-admin
+ }
+@@ -369,7 +379,7 @@
+ configure_admin(){ require_discovery_schema;
+     [ -f "$ROOT/meta/complete" ] || die 'Run discover first'
+-    sql_precheck
++    SUPPRESS_NEXT_STEP=yes sql_precheck
+@@ -510,6 +520,7 @@
+             : > "$ROOT/meta/admin_configured"
+             unset ap
+             log 'Existing cluster admin validated successfully on all members.'
++            next_step precheck
+             return 0
+@@ -517,6 +528,7 @@
+     put meta admin_user "$au"; put meta admin_host_pattern "$ah"; : > "$ROOT/meta/admin_configured"
+     unset ap
+     log 'Cluster admin prepared. Re-run precheck; subsequent AdminAPI operations use this clusterAdmin.'
++    next_step precheck
+ }
+@@ -712,6 +724,7 @@
+     [ -f "$ROOT/meta/event_review_required" ] || return 0
+     [ -f "$ROOT/meta/event_review_ack" ] && return 0
+     log 'EVENT REVIEW REQUIRED before any create/adopt mutation.'
++    log 'Type the exact confirmation text shown below after reviewing the listed EVENT objects.'
+     confirm 'EVENT-POLICY-REVIEWED'
+@@ -736,8 +749,9 @@
+     [ "$mcount" -eq 0 ] || log 'NOTICE: InnoDB Cluster metadata already exists; create/adopt will refuse and validate/status should be used.'
+     : > "$ROOT/meta/prechecked"
+     log "PRECHECK PASSED: SQL checks + dba.checkInstanceConfiguration() as $(get meta admin_user)."
++    next_step plan
+ }
+-plan(){ require_discovery_schema; [ -f "$ROOT/meta/complete" ] || die 'Run discover first'; assert_identity; show_capabilities >/dev/null; gr=$(get meta gr_count); mode=$(get meta gr_mode); metadata=$(get meta metadata); log '--- InnoDB Cluster migration plan ---'; log "Instances: $(get meta count)"; log "Version policy: $(get meta version_policy)"; log "Existing GR members: $gr"; log "Existing GR mode: $mode"; log "Existing InnoDB Cluster metadata: $metadata"; if [ "$gr" -gt 0 ]; then log 'Recommended action: adopt'; log 'adoptFromGR preserves the existing single-primary or multi-primary topology.'; log 'Topology mode is not selectable during safe adoption; change topology later only with Cluster.switchTo* APIs if explicitly desired.'; else log 'Recommended action: create'; log 'Create options are selected interactively: single/multi-primary, communication stack when supported, member SSL mode, clone policy, and addInstance recovery method.'; fi; log "Capabilities: $ROOT/capabilities.txt"; }
++plan(){ require_discovery_schema; [ -f "$ROOT/meta/complete" ] || die 'Run discover first'; assert_identity; show_capabilities >/dev/null; gr=$(get meta gr_count); mode=$(get meta gr_mode); metadata=$(get meta metadata); log '--- InnoDB Cluster migration plan ---'; log "Instances: $(get meta count)"; log "Version policy: $(get meta version_policy)"; log "Existing GR members: $gr"; log "Existing GR mode: $mode"; log "Existing InnoDB Cluster metadata: $metadata"; if [ "$gr" -gt 0 ]; then log 'Recommended action: adopt'; log 'adoptFromGR preserves the existing single-primary or multi-primary topology.'; log 'Topology mode is not selectable during safe adoption; change topology later only with Cluster.switchTo* APIs if explicitly desired.'; next_step adopt; else log 'Recommended action: create'; log 'Create options are selected interactively: single/multi-primary, communication stack when supported, member SSL mode, clone policy, and addInstance recovery method.'; next_step create; fi; log "Capabilities: $ROOT/capabilities.txt"; }
+@@ -797,7 +811,7 @@
+-validate(){ require_discovery_schema; [ -f "$ROOT/meta/complete" ] || die 'Run discover first'; assert_identity; meta_exists 1 || die 'mysql_innodb_cluster_metadata is absent'; writeability_persistence_check; name=''; [ ! -f "$ROOT/meta/cluster_name" ] || name=$(get meta cluster_name); code='var c=dba.getCluster(); print("IC_CLUSTER_NAME="+c.name); print("IC_STATUS="+JSON.stringify(c.status({extended:2}))); print("IC_DESCRIBE="+JSON.stringify(c.describe()));'; out="$ROOT/validate.txt"; mysqlsh_admin_exec 1 "$code" "$out" || { cat "$out" >&2; die 'dba.getCluster/status failed'; }; members=$(grmembers 1); printf '%s\n' "$members" > "$ROOT/gr_members.after"; total=$(printf '%s\n' "$members" | awk 'NF{n++} END{print n+0}'); online=$(printf '%s\n' "$members" | awk '$4=="ONLINE"{n++} END{print n+0}'); [ "$online" -eq "$total" ] || die "Cluster GR members not fully ONLINE ($online/$total)"; [ "$total" -eq "$(get meta count)" ] || die 'Cluster member count changed unexpectedly'; primary=$(printf '%s\n' "$members" | awk '$5=="PRIMARY"{n++} END{print n+0}'); mode=$(gr_role_guard 1); all_node_gr_consistency_guard; gtid_convergence_guard; gr_writeability_guard; if [ -f "$ROOT/meta/adopted_gr_mode" ]; then [ "$mode" = "$(get meta adopted_gr_mode)" ] || die "Adopted GR topology changed unexpectedly: $(get meta adopted_gr_mode) -> $mode"; fi; for i in $(ids); do gtids "$i" > "$ROOT/node_${i}.gtid.after"; done; : > "$ROOT/meta/validated"; log "VALIDATION PASSED: metadata present, $online/$total ONLINE, mode=$mode primary_count=$primary. Evidence: $ROOT"; }
++validate(){ require_discovery_schema; [ -f "$ROOT/meta/complete" ] || die 'Run discover first'; assert_identity; meta_exists 1 || die 'mysql_innodb_cluster_metadata is absent'; writeability_persistence_check; name=''; [ ! -f "$ROOT/meta/cluster_name" ] || name=$(get meta cluster_name); code='var c=dba.getCluster(); print("IC_CLUSTER_NAME="+c.name); print("IC_STATUS="+JSON.stringify(c.status({extended:2}))); print("IC_DESCRIBE="+JSON.stringify(c.describe()));'; out="$ROOT/validate.txt"; mysqlsh_admin_exec 1 "$code" "$out" || { cat "$out" >&2; die 'dba.getCluster/status failed'; }; members=$(grmembers 1); printf '%s\n' "$members" > "$ROOT/gr_members.after"; total=$(printf '%s\n' "$members" | awk 'NF{n++} END{print n+0}'); online=$(printf '%s\n' "$members" | awk '$4=="ONLINE"{n++} END{print n+0}'); [ "$online" -eq "$total" ] || die "Cluster GR members not fully ONLINE ($online/$total)"; [ "$total" -eq "$(get meta count)" ] || die 'Cluster member count changed unexpectedly'; primary=$(printf '%s\n' "$members" | awk '$5=="PRIMARY"{n++} END{print n+0}'); mode=$(gr_role_guard 1); all_node_gr_consistency_guard; gtid_convergence_guard; gr_writeability_guard; if [ -f "$ROOT/meta/adopted_gr_mode" ]; then [ "$mode" = "$(get meta adopted_gr_mode)" ] || die "Adopted GR topology changed unexpectedly: $(get meta adopted_gr_mode) -> $mode"; fi; for i in $(ids); do gtids "$i" > "$ROOT/node_${i}.gtid.after"; done; : > "$ROOT/meta/validated"; log "VALIDATION PASSED: metadata present, $online/$total ONLINE, mode=$mode primary_count=$primary. Evidence: $ROOT"; next_step status; }
