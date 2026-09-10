@@ -1,10 +1,10 @@
 #!/bin/sh
-# mysql_innodb_cluster_migrate.sh v1.0.17
+# mysql_innodb_cluster_migrate.sh v1.0.18
 # POSIX sh. Oracle MySQL GA 8.0+; runtime AdminAPI capability detection. Requires preinstalled mysql/mysqlsh; never installs packages.
 # Safe automation for prepared MySQL instances / existing Group Replication -> InnoDB Cluster.
 set -eu
 umask 077
-VERSION=1.0.17
+VERSION=1.0.18
 ROOT=${MYSQL_IC_WORK_ROOT:-"$(pwd)/mysql_innodb_cluster_work"}
 MYSQL=${MYSQL_IC_MYSQL:-mysql}
 MYSQLSH=${MYSQL_IC_MYSQLSH:-mysqlsh}
@@ -227,10 +227,22 @@ configure_admin(){
 
     case $action in
         create)
+            existing_nodes=''
+            existing_count=0
             for i in $(ids); do
                 exists=$(sql "$i" "SELECT COUNT(*) FROM mysql.user WHERE User='$(q "$au")' AND Host='$(q "$ah")';")
-                [ "$exists" -eq 0 ] || die "Node $i already has '$au'@'$ah'; choose existing or another account."
+                if [ "$exists" -gt 0 ]; then
+                    existing_count=$((existing_count+1))
+                    existing_nodes="${existing_nodes}${existing_nodes:+,}$i"
+                fi
             done
+            total_nodes=$(get meta count)
+            if [ "$existing_count" -eq "$total_nodes" ]; then
+                die "'$au'@'$ah' already exists on every registered node. Re-run configure-admin and choose existing; the script will validate it without broadening privileges."
+            fi
+            if [ "$existing_count" -gt 0 ]; then
+                die "'$au'@'$ah' exists only on node(s) $existing_nodes. Account state is inconsistent; no CREATE/ALTER/GRANT was attempted. Review the partial account state before retrying."
+            fi
             log "New account requested on every member: '$au'@'$ah'"
             log 'No GRANT ALL is used. Privileges are delegated to dba.configureInstance() so the installed MySQL Shell grants the version-appropriate minimum set.'
             log 'dba.configureInstance() can change instance configuration. Existing GR state is snapshotted before/after and any unexpected topology/identity change is treated as failure.'
@@ -241,7 +253,7 @@ configure_admin(){
                 js="$TMP/configure_admin_$i.js"
                 cat > "$js" <<EOF
 var opts={clusterAdmin:"$(jsq "$au")@$(jsq "$ah")",clusterAdminPassword:"$(jsq "$ap")",restart:false};
-dba.configureInstance(opts);
+dba.configureInstance(undefined,opts);
 print("IC_ADMIN_CONFIGURED=ok");
 EOF
                 chmod 600 "$js"
