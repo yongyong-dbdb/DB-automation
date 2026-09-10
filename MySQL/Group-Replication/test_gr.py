@@ -51,9 +51,12 @@ hasvar() { return 1; }
 run('same host separate dynamic ports',base+'put 1 xcom localhost:43901; put 2 xcom localhost:43902; endpoints_check')
 run('same host duplicate XCom blocks',base+'put 1 xcom localhost:43901; put 2 xcom localhost:43901; endpoints_check',1)
 run('cross-instance SQL/XCom conflict blocks',base+'put 1 xcom localhost:43802; put 2 xcom localhost:43901; endpoints_check',1)
-run('GTID timeout stops migration','sql() { printf 1; }; catchup 2 abc',1)
-run('errant GTID stops migration','sql() { case "$2" in *WAIT*) printf 0;; *) printf extra;; esac; }; catchup 2 abc',1)
-run('GTID matched passes','sql() { case "$2" in *WAIT*) printf 0;; *) :;; esac; }; catchup 2 abc')
+gtid_base = """put 1 uuid source; put 2 uuid replica
+val() { :; }
+"""
+run('GTID timeout stops migration',gtid_base+'''sql() { case "$2" in *WAIT*) printf 1;; *"GTID_SUBTRACT('"*) printf missing;; *) :;; esac; }; catchup 2 abc''',1)
+run('errant GTID stops migration',gtid_base+'''sql() { case "$2" in *"GTID_SUBTRACT(@@GLOBAL.gtid_executed,'"*) printf extra;; *) :;; esac; }; catchup 2 abc''',1)
+run('GTID matched passes',gtid_base+'''sql() { :; }; catchup 2 abc''')
 run('existing group blocks rebootstrap','put meta count 2; sql() { printf 1; }; no_group',1)
 run('bootstrap attempt marker blocks retry','put meta initialized yes; put meta bootstrap_attempted yes; cutover',1)
 run('schema rejection','put meta primary_mode single; sql() { printf "db.bad engine=MyISAM"; }; schema_check 1',1)
@@ -175,7 +178,7 @@ DO_RESTART=no
 printf '[mysqld]\nport=45873\nlog_bin=/keep/binlog\n' > "$CNF"
 chmod 640 "$CNF"
 r_identity() {
-    RDEFAULT=$CNF; RPID=$$; REXE=/not-executed; RMETHOD=direct; RSERVICE=''
+    RDEFAULT=$CNF; RPID=$$; REXE=/not-executed; RMETHOD=direct; RSERVICE=''; RCWD=$ROOT
     printf '%s\n' "$CNF" > "$RTMP/candidates"
     printf '/not-executed\n--defaults-file=%s\n' "$CNF" > "$RTMP/argv"
 }
@@ -223,6 +226,16 @@ mkdir "$CNF.gr_lock"
 [ -d "$CNF.gr_lock" ]
 ! grep -F server_id "$CNF"
 """)
+run('remote changed include blocks config replacement',fixture+r"""
+ACTION=apply
+printf '!include %s/child.cnf\n' "$ROOT" >> "$CNF"
+printf '[mysqld]\nport=45873\n' > "$ROOT/child.cnf"
+cp "$CNF" "$ROOT/before"
+r_validate_candidate() { printf '# concurrent included-file edit\n' >> "$ROOT/child.cnf"; }
+(r_main) && exit 1
+cmp "$CNF" "$ROOT/before"
+! grep -F server_id "$CNF"
+""")
 run('manual user refusal leaves current cnf unchanged',fixture+r"""
 ACTION=manual
 cp "$CNF" "$ROOT/before"
@@ -261,8 +274,8 @@ server_id=72'
 r_sql() { printf 73; }
 r_runtime_check
 """, 1)
-report=['# Validation v1.0.2','',f'Total: {len(results)}; passed: {sum(x[1] for x in results)}','', 'These are shell/mocked SQL regression tests. No live MySQL server was available.','']
+report=['# Shell/mocked SQL regression results','',f'Total: {len(results)}; passed: {sum(x[1] for x in results)}','', 'These results cover mocked regressions only; live validation is documented separately in VALIDATION.md.','']
 for name,ok,rc,output in results: report.append(f'- {"PASS" if ok else "FAIL"}: {name}')
-(script.parent / 'VALIDATION.md').write_text('\n'.join(report)+'\n')
+if os.environ.get('MYSQL_GR_TEST_REPORT'):
+    Path(os.environ['MYSQL_GR_TEST_REPORT']).write_text('\n'.join(report)+'\n')
 if not all(x[1] for x in results): raise SystemExit(1)
-

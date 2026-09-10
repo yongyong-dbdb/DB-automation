@@ -1,183 +1,27 @@
-name: Temporary GR v1.0.12 candidate
-
+name: GR v1.0.12 candidate regressions
 on:
   push:
     branches: [gr-v1.0.12-reprovision]
-
+  workflow_dispatch:
 permissions:
-  contents: write
-
+  contents: read
 jobs:
   validate:
-    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: gr-v1.0.12-reprovision
-          fetch-depth: 0
-      - name: Apply candidate patches only when needed
+      - name: POSIX shell syntax and forbidden GTID reset check
         shell: bash
         run: |
           set -euo pipefail
-          f='MySQL/Group-Replication/mysql_gr_migrate.sh'
-          if ! grep -q '^VERSION=1.0.12$' "$f"; then python3 tools/tmp_patch_gr_v1012.py; fi
-          if ! grep -q '^export_source_accounts() {' "$f"; then python3 tools/tmp_patch_gr_v1012_accounts.py; fi
-          if ! grep -q 'v1.0.12-logical-safety2' "$f"; then python3 tools/tmp_patch_gr_v1012_logical_safety.py; fi
-      - name: Syntax and safety checks
-        shell: bash
-        run: |
-          set -euo pipefail
-          f='MySQL/Group-Replication/mysql_gr_migrate.sh'
-          /bin/sh -n "$f"
-          test "$(/bin/sh "$f" --version)" = '1.0.12'
-          reset_hits=$(grep -En 'RESET[[:space:]]+(MASTER|BINARY[[:space:]]+LOGS[[:space:]]+AND[[:space:]]+GTIDS)' "$f" | grep -v 'Do NOT run' || true)
-          if [ -n "$reset_hits" ]; then printf '%s\n' 'Forbidden GTID/binlog reset occurrence:' "$reset_hits" >&2; exit 1; fi
-          pipe_hits=$(grep -En 'mysqlbinlog[^|]*\|[[:space:]]*mysql([[:space:]]|$)' "$f" || true)
-          if [ -n "$pipe_hits" ]; then printf '%s\n' 'Forbidden mysqlbinlog-to-mysql pipe:' "$pipe_hits" >&2; exit 1; fi
-          grep -qF 'SERVER_UUID' "$f"
-          grep -qF 'before_gr_reprovision' "$f"
-          grep -qF 'gr_reprovision_stage' "$f"
-          grep -q '^export_source_accounts() {' "$f"
-          grep -q '^mysqldump_version_guard() {' "$f"
-          grep -q '^source_admin_target_credential() {' "$f"
-          grep -q 'SHOW CREATE USER failed' "$f"
-          grep -q 'SHOW GRANTS failed' "$f"
-          grep -q 'SELECT QUOTE(USER),QUOTE(HOST),QUOTE(DEFAULT_ROLE_USER),QUOTE(DEFAULT_ROLE_HOST)' "$f"
-          grep -q 'source_accounts.sql.sha256' "$f"
-          grep -q 'node_${i}.new_empty_provision' "$f"
-          grep -q 'Source account/role restore failed' "$f"
-          export_body=$(sed -n '/^export_source_accounts() {/,/^prepare_reprovision_dump() {/p' "$f")
-          if printf '%s\n' "$export_body" | grep -q 'GROUP_CONCAT'; then
-            echo 'GROUP_CONCAT remains in account/default-role export' >&2
-            exit 1
-          fi
-          ansi_hits=$(grep -nF "\$'" "$f" || true)
-          if [ -n "$ansi_hits" ]; then printf '%s\n' 'ANSI-C-like token hits for review:' "$ansi_hits"; fi
-          echo syntax_and_safety_PASS
-      - name: Platform preflight
-        shell: bash
-        run: |
-          set -euo pipefail
-          f='MySQL/Group-Replication/mysql_gr_migrate.sh'
-          cp "$f" /tmp/gr.nom.sh
-          sed -i '${/^main$/d;}' /tmp/gr.nom.sh
-          /bin/sh -c '. /tmp/gr.nom.sh; platform_preflight; echo platform_preflight_PASS'
-      - name: Synthetic reprovision function tests
-        shell: bash
-        run: |
-          set -euo pipefail
-          cat > /tmp/test_reprovision.sh <<'TEST'
-          #!/bin/sh
-          set -eux
-          . /tmp/gr.nom.sh
-          ROOT=$(mktemp -d)
-          RUN="$ROOT/run"; TEMP="$ROOT/temp"
-          mkdir -p "$RUN" "$TEMP" "$ROOT/meta" "$ROOT/1" "$ROOT/2"
-          printf '2\n' > "$ROOT/meta/count"
-          printf 'uuid-source\n' > "$ROOT/1/uuid"
-          printf 'uuid-node2\n' > "$ROOT/2/uuid"
-          printf '9.7.2\n' > "$ROOT/1/version"
-          printf '9.7.2\n' > "$ROOT/2/version"
-          printf 'remote\n' > "$ROOT/2/location"
-          printf '/etc/fake2.cnf\n' > "$ROOT/2/cnf"
-          printf 'root\n' > "$ROOT/1/user"
-          printf 'root\n' > "$ROOT/2/user"
-          printf 'socket\n' > "$ROOT/1/mode"
-          printf 'socket\n' > "$ROOT/2/mode"
-          printf '/fake1.sock\n' > "$ROOT/1/socket"
-          printf '/fake2.sock\n' > "$ROOT/2/socket"
-          printf '[client]\nuser="root"\npassword="fake"\n' > "$TEMP/1.cnf"
-          printf '[client]\nuser="root"\npassword="fake"\n' > "$TEMP/2.cnf"
-          FAKE_DATA="$ROOT/data2"; mkdir "$FAKE_DATA"
-          FAKE_CNF="$ROOT/my2.cnf"; printf '[mysqld]\ndatadir=%s\n' "$FAKE_DATA" > "$FAKE_CNF"
-          printf '%s\n' "$FAKE_CNF" > "$ROOT/2/cnf"
-          target='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:1-7'
-          sql() {
-              node=$1; stmt=$2
-              case $stmt in
-                  *"schema_name FROM information_schema.schemata"*) printf 'app1\napp2\n';;
-                  *"CONCAT(QUOTE(u.User)"*) printf "'role1'@'%%'\n'role2'@'%%'\n'app1'@'%%'\n";;
-                  *"WHERE CONCAT(User,'@',Host)=CURRENT_USER()"*) printf "'app1'@'%%'\n";;
-                  *"SHOW CREATE USER 'role1'@'%'"*) printf "role1@%%\tCREATE USER 'role1'@'%%' IDENTIFIED WITH 'caching_sha2_password' AS 'fakehash'\n";;
-                  *"SHOW CREATE USER 'role2'@'%'"*) printf "role2@%%\tCREATE USER 'role2'@'%%' IDENTIFIED WITH 'caching_sha2_password' AS 'fakehashx'\n";;
-                  *"SHOW CREATE USER 'app1'@'%'"*) printf "app1@%%\tCREATE USER 'app1'@'%%' IDENTIFIED WITH 'caching_sha2_password' AS 'fakehash2'\n";;
-                  *"SHOW GRANTS FOR 'role1'@'%'"*) printf "GRANT SELECT ON app1.* TO 'role1'@'%%'\n";;
-                  *"SHOW GRANTS FOR 'role2'@'%'"*) printf "GRANT INSERT ON app1.* TO 'role2'@'%%'\n";;
-                  *"SHOW GRANTS FOR 'app1'@'%'"*)
-                      [ "${FAIL_GRANTS:-no}" != yes ] || return 1
-                      printf "GRANT 'role1'@'%%','role2'@'%%' TO 'app1'@'%%'\n";;
-                  *"SELECT QUOTE(USER),QUOTE(HOST),QUOTE(DEFAULT_ROLE_USER),QUOTE(DEFAULT_ROLE_HOST)"*)
-                      printf "'app1'\t'%%'\t'role1'\t'%%'\n"
-                      printf "'app1'\t'%%'\t'role2'\t'%%'\n";;
-                  *"SHOW GLOBAL VARIABLES WHERE Variable_name='print_identified_with_as_hex'"*) printf 'print_identified_with_as_hex\tON\n';;
-                  *"SELECT CURRENT_USER()"*) printf 'app1@%%\n';;
-                  *"SELECT @@server_uuid,@@read_only"*) printf 'uuid-%s\t1\t1\tOFF\t%s\n' "$node" "$target";;
-                  *"SELECT @@server_uuid,@@hostname"*) printf 'uuid-%s\thost\t3307\t/fake.sock\t%s\t/fake.pid\t2\t%s\t\t1\t1\tOFF\n' "$node" "$FAKE_DATA" "$target";;
-                  *) printf 'stub\n';;
-              esac
-          }
-          val() {
-              node=$1; key=$2
-              case $key in
-                  datadir) printf '%s\n' "$FAKE_DATA";;
-                  pid_file) printf '%s\n' "$ROOT/fake.pid";;
-                  socket) printf '%s\n' "$ROOT/fake.sock";;
-                  gtid_executed) printf '%s\n' "$target";;
-                  *) printf 'stub\n';;
-              esac
-          }
-          write_mysql_readonly_command() { printf '#!/bin/sh\n' > "$3"; chmod 700 "$3"; }
-          local_pid() { printf '%s\n' "$$"; }
-          divergence_abort_snapshot 2 >/dev/null 2>&1
-          expected_header=$(printf 'NODE\tSERVER_UUID\tREAD_ONLY\tSUPER_READ_ONLY\tEVENT_SCHEDULER\tGTID_EXECUTED')
-          test "$(head -n1 "$RUN/divergence_abort_state.tsv")" = "$expected_header"
-          test "$(wc -l < "$RUN/divergence_abort_state.tsv")" -eq 3
-          cat > "$ROOT/fake_mysqldump" <<'DUMP'
-          #!/bin/sh
-          case " $* " in
-            *' --version '*) printf '%s\n' 'mysqldump  Ver 9.7.2 for Linux on x86_64'; exit 0;;
-          esac
-          printf '%s\n' '-- fake dump'
-          DUMP
-          chmod 700 "$ROOT/fake_mysqldump"; DUMP="$ROOT/fake_mysqldump"
-          rdir="$RUN/node_2.reprovision"; mkdir -p "$rdir"
-          dump=$(prepare_reprovision_dump 2 "$target" "$rdir")
-          test -s "$dump"; test -s "$dump.sha256"
-          test -s "$rdir/source_accounts.sql"
-          test -s "$rdir/source_accounts.sql.sha256"
-          grep -q "DROP USER IF EXISTS 'app1'@'%'" "$rdir/source_accounts.sql"
-          grep -q "GRANT 'role1'@'%','role2'@'%' TO 'app1'@'%'" "$rdir/source_accounts.sql"
-          grep -q "SET DEFAULT ROLE 'role1'@'%','role2'@'%' TO 'app1'@'%'" "$rdir/source_accounts.sql"
-          grep -q '^ACCOUNT_SQL' "$rdir/logical_reprovision_components.tsv"
-          grep -q '  source_accounts.sql$' "$rdir/source_accounts.sql.sha256"
-          grep -q '  source_application.sql$' "$rdir/source_application.sql.sha256"
-          (cd "$rdir" && sha256sum -c source_accounts.sql.sha256 source_application.sql.sha256)
-          faildir="$RUN/fail_accounts"; mkdir -p "$faildir"
-          if (FAIL_GRANTS=yes export_source_accounts "$faildir") >/dev/null 2>&1; then
-              echo 'SHOW GRANTS failure was incorrectly accepted' >&2
-              exit 1
-          fi
-          plan=$(write_reprovision_plan 2 "$target" "$rdir" "$dump")
-          grep -q 'Remote-node handling' "$plan"
-          grep -q 'source_accounts.sql' "$plan"
-          grep -q 'auto.cnf' "$plan"
-          printf 'local\n' > "$ROOT/2/location"
-          evidence=$(capture_reprovision_evidence 2 "$target")
-          test -s "$evidence/runtime_before.tsv"
-          test -s "$evidence/cnf.sha256"
-          plan=$(write_reprovision_plan 2 "$target" "$evidence" "$dump")
-          grep -q 'Local runtime evidence' "$plan"
-          grep -q 'Rollback sequence' "$plan"
-          grep -q 'before_gr_reprovision' "$plan"
-          echo synthetic_reprovision_PASS
-          TEST
-          /bin/sh /tmp/test_reprovision.sh
-      - name: Commit candidate script if changed
-        run: |
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add 'MySQL/Group-Replication/mysql_gr_migrate.sh'
-          git diff --cached --quiet && exit 0
-          git commit -m 'MySQL GR v1.0.12 candidate: harden logical provisioning safety'
-          git push origin HEAD:gr-v1.0.12-reprovision
+          base=MySQL/Group-Replication
+          sh -n "$base/mysql_gr_migrate.sh"
+          sh -n "$base/reprovision_helper.sh"
+          test "$(sh "$base/mysql_gr_migrate.sh" --version)" = 1.0.12
+          reset_hits=$(grep -En 'RESET[[:space:]]+(MASTER|BINARY[[:space:]]+LOGS[[:space:]]+AND[[:space:]]+GTIDS)' "$base/mysql_gr_migrate.sh" "$base/reprovision_helper.sh" | grep -v 'Do NOT run' || true)
+          test -z "$reset_hits" || { printf '%s\n' "$reset_hits"; exit 1; }
+          ! grep -En 'mysqlbinlog[^|]*\|[[:space:]]*mysql([[:space:]]|$)' "$base/mysql_gr_migrate.sh"
+      - name: Existing regression suite
+        run: python3 MySQL/Group-Replication/test_gr.py
+      - name: Candidate safety regression suite
+        run: python3 MySQL/Group-Replication/test_gr_safety.py

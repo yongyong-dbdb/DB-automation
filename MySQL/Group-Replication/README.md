@@ -1,4 +1,33 @@
-# MySQL GR 전환 자동화 v1.0.2
+# MySQL GR 전환 자동화 v1.0.12 검증 후보
+
+`gr-v1.0.12-reprovision`은 **main merge 금지 / production-ready 아님**.
+실서버 결과와 남은 작업은 [VALIDATION.md](VALIDATION.md), 재개 기준은 [HANDOFF.md](HANDOFF.md) 참조.
+
+이번 후보에는 DEFINER 계정을 삭제하지 않는 계정 선복원, 객체 복원 후 GRANT/default role 적용,
+전체 객체·계정 비교, bootstrap 전 SET PERSIST/recovery 변경 롤백, TLS CA/SAN 검사,
+GTID 양방향 집합 비교, `xa_detach_on_prepare` 확인, include chain 변경 검사가 추가되었다.
+
+`reprovision_helper.sh`를 main script와 같은 디렉터리에 둔다.
+생성된 패키지 **전체**를 대상 서버에 복사하면 SSH 없이 아래 명령을 실행할 수 있다.
+
+```sh
+sh reprovision_helper.sh stage /absolute/package /absolute/target-client.cnf /absolute/source-client.cnf
+sh reprovision_helper.sh swap /absolute/package /absolute/target-client.cnf /absolute/source-client.cnf
+sh reprovision_helper.sh rollback /absolute/package /absolute/target-client.cnf /absolute/source-client.cnf
+```
+
+인증 인자는 기존 `login-path:NAME`도 지원한다. 비밀번호를 명령행에 입력하지 않는다.
+`stage`는 별도 datadir에서 계정·전체 객체·데이터·GTID를 검증한다.
+`swap`은 원본을 같은 파일시스템의 backup 경로에 보존한다.
+`rollback`은 새 datadir도 failed 경로에 남기고 원본 및 이전 async thread 실행 상태를 복원한다.
+새 인스턴스가 GR에 참가했거나 추가 GTID가 생기면 자동 rollback을 거부한다.
+
+현재 executor는 **direct mysqld + 명시적 --defaults-file** 범위다.
+systemd MainPID 관리, 미지원 launcher 옵션, 기존 persisted 설정, 외부 로그/스토리지,
+datadir symlink는 사전 중단한다. 접속 불능 인스턴스의 offline rollback 및
+kill/power-loss/rename 중간 상태 복구는 미완료다. 원격 TLS 검증도 별도 host-side 증명이 필요하다.
+
+아래 기존 사용법 전체가 production 검증을 받은 것은 아니다.
 
 작성 기준: 2026-09-09. 전체 실행 코드: `mysql_gr_migrate.sh`.
 
