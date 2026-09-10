@@ -64,3 +64,8 @@ TLS 실서버 적용은 자동 승인 검토가 명시적 승인 부족으로 �
 - 적용 시 3306/3307/3308 ssl_ca/ssl_cert/ssl_key 및 cnf를 변경하고 ALTER INSTANCE RELOAD TLS 수행. 실패 시 원본 cnf/runtime 복원. 기존 연결은 유지되며 새 연결부터 새 인증서 사용.
 - 실행 중인 3개 인스턴스는 아직 기존 server-cert.pem을 사용한다. 원래 UUID/GTID 유지.
 - `tls` 기본 동작은 plan-only. 승인 후 MYSQL_GR_TLS_ACTION=apply로 **저장된 계획**을 검증/적용하며 새 인증서를 다시 발급하지 않는다.
+
+
+## Approved TLS reload attempt (2026-09-10)
+
+User explicitly authorized applying/reloading the prepared certificates on ports 3306/3307/3308. Application failed on Node1 with ERROR 29 (HY000), OS errno 13 reading the new server-cert.pem. Automatic rollback restored the old configuration; all three active TLS contexts still report server-cert.pem. UUID/GTID and super_read_only=1 were unchanged; Node2 replication receiver/applier remained ON with connection error 0. New files have appropriate Unix ownership/modes, but SELinux is Enforcing and the new certificate directory/files have user_home_t labels. SELinux is a suspected cause, pending AVC and existing certificate label comparison. No security policy was disabled or relaxed. Next: diagnose labels, implement an appropriate persistent file placement/label fix, then retry the already-authorized reload and verify active contexts. Server evidence: /home/mysql/gr_v1012_review/tls_apply_result.log. TLS deployment is NOT complete; main remains unmerged.
