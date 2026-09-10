@@ -1,10 +1,10 @@
 #!/bin/sh
-# mysql_innodb_cluster_migrate.sh v1.0.19
+# mysql_innodb_cluster_migrate.sh v1.0.20
 # POSIX sh. Oracle MySQL GA 8.0+; runtime AdminAPI capability detection. Requires preinstalled mysql/mysqlsh; never installs packages.
 # Safe automation for prepared MySQL instances / existing Group Replication -> InnoDB Cluster.
 set -eu
 umask 077
-VERSION=1.0.19
+VERSION=1.0.20
 ROOT=${MYSQL_IC_WORK_ROOT:-"$(pwd)/mysql_innodb_cluster_work"}
 MYSQL=${MYSQL_IC_MYSQL:-mysql}
 MYSQLSH=${MYSQL_IC_MYSQLSH:-mysqlsh}
@@ -198,39 +198,36 @@ EOF
     case $first in localhost|127.0.0.1|::1) printf '';; *) printf '%s' "$first";; esac
 }
 
+
 password_policy_report(){
     i=$1
     log "Current validate_password policy on node $i:"
     sql "$i" "SHOW VARIABLES LIKE 'validate_password%';" 2>/dev/null | sed 's/^/  /' >&2 || log '  validate_password variables are unavailable on this server.'
     log 'The script does not weaken or change password policy.'
 }
+admin_account_presence_count(){
+    u=$1; h=$2; count=0
+    for j in $(ids); do
+        c=$(sql "$j" "SELECT COUNT(*) FROM mysql.user WHERE User='$(q "$u")' AND Host='$(q "$h")';" 2>/dev/null || printf '0')
+        [ "$c" -gt 0 ] && count=$((count+1))
+    done
+    printf '%s' "$count"
+}
 admin_account_presence_report(){
     u=$1; h=$2; present=''; count=0
-    for i in $(ids); do
-        c=$(sql "$i" "SELECT COUNT(*) FROM mysql.user WHERE User='$(q "$u")' AND Host='$(q "$h")';" 2>/dev/null || printf '0')
-        if [ "$c" -gt 0 ]; then present="${present}${present:+ }$i"; count=$((count+1)); fi
+    for j in $(ids); do
+        c=$(sql "$j" "SELECT COUNT(*) FROM mysql.user WHERE User='$(q "$u")' AND Host='$(q "$h")';" 2>/dev/null || printf '0')
+        if [ "$c" -gt 0 ]; then present="${present}${present:+ }$j"; count=$((count+1)); fi
     done
     total=$(get meta count)
     if [ "$count" -eq 0 ]; then
         log "Account state after failure: '$u'@'$h' was not created on any registered node."
     elif [ "$count" -eq "$total" ]; then
-        log "Account state after failure: '$u'@'$h' exists on every registered node. Re-run configure-admin with action=existing after reviewing the account."
+        log "Account state after failure: '$u'@'$h' exists on every registered node."
     else
         log "Account state after failure: '$u'@'$h' exists only on node(s): $present."
-        log 'Partial account creation detected; review the affected nodes before retrying. The script will not auto-drop or alter the account.'
+        log 'Partial account creation detected; automatic password retry is disabled until the account state is reviewed.'
     fi
-}
-cluster_admin_create_fail(){
-    i=$1; out=$2; u=$3; h=$4
-    cat "$out" >&2
-    if grep -Eq 'MYSQLSH 1819|does not satisfy the current policy requirements' "$out"; then
-        log 'ERROR: clusterAdmin password does not satisfy the server password policy.'
-        password_policy_report "$i"
-    else
-        log "ERROR: clusterAdmin creation failed on node $i."
-    fi
-    admin_account_presence_report "$u" "$h"
-    exit 1
 }
 
 configure_admin(){
@@ -292,12 +289,38 @@ dba.configureInstance(undefined,opts);
 print("IC_ADMIN_CONFIGURED=ok");
 EOF
                 chmod 600 "$js"
-                if [ "$(get "$i" auth_mode)" = login-path ]; then
-                    MYSQL_TEST_LOGIN_FILE="$(get "$i" login_file)" "$MYSQLSH" --login-path="$(get "$i" login_path)" --no-wizard --js -f "$js" >"$out" 2>&1 || cluster_admin_create_fail "$i" "$out" "$au" "$ah"
-                else
-                    cred "$i"; uri="$(get "$i" user)@$(get "$i" host):$(get "$i" port)"
-                    cat "$TMP/$i.pw" | "$MYSQLSH" --no-wizard --uri "$uri" --passwords-from-stdin --js -f "$js" >"$out" 2>&1 || cluster_admin_create_fail "$i" "$out" "$au" "$ah"
-                fi
+                while :; do
+                    rc=0
+                    if [ "$(get "$i" auth_mode)" = login-path ]; then
+                        MYSQL_TEST_LOGIN_FILE="$(get "$i" login_file)" "$MYSQLSH" --login-path="$(get "$i" login_path)" --no-wizard --js -f "$js" >"$out" 2>&1 || rc=$?
+                    else
+                        cred "$i"; uri="$(get "$i" user)@$(get "$i" host):$(get "$i" port)"
+                        cat "$TMP/$i.pw" | "$MYSQLSH" --no-wizard --uri "$uri" --passwords-from-stdin --js -f "$js" >"$out" 2>&1 || rc=$?
+                    fi
+                    [ "$rc" -eq 0 ] && break
+                    cat "$out" >&2
+                    if grep -Eq 'MYSQLSH 1819|does not satisfy the current policy requirements' "$out"; then
+                        log 'Password rejected by the server password policy.'
+                        password_policy_report "$i"
+                        admin_account_presence_report "$au" "$ah"
+                        present_count=$(admin_account_presence_count "$au" "$ah")
+                        [ "$present_count" -eq 0 ] || die 'clusterAdmin account state changed during the failed attempt; review it before retrying.'
+                        log 'Enter a new password that satisfies the policy. Only the password entry is retried; the migration does not restart.'
+                        ap=$(secret 'Cluster admin password (re-enter)')
+                        [ -n "$ap" ] || die 'Cluster admin password cannot be empty'
+                        printf '%s\n' "$ap" > "$TMP/admin.pw"; chmod 600 "$TMP/admin.pw"
+                        cat > "$js" <<EOF
+var opts={clusterAdmin:"$(jsq "$au")@$(jsq "$ah")",clusterAdminPassword:"$(jsq "$ap")",restart:false};
+dba.configureInstance(undefined,opts);
+print("IC_ADMIN_CONFIGURED=ok");
+EOF
+                        chmod 600 "$js"
+                        log 'Retrying clusterAdmin creation with the newly entered password.'
+                        continue
+                    fi
+                    admin_account_presence_report "$au" "$ah"
+                    die "clusterAdmin creation failed on node $i"
+                done
                 rm -f "$js"
             done
             state_snapshot after_configure_admin
