@@ -1,10 +1,10 @@
 #!/bin/sh
-# mysql_innodb_cluster_migrate.sh v1.0.18
+# mysql_innodb_cluster_migrate.sh v1.0.19
 # POSIX sh. Oracle MySQL GA 8.0+; runtime AdminAPI capability detection. Requires preinstalled mysql/mysqlsh; never installs packages.
 # Safe automation for prepared MySQL instances / existing Group Replication -> InnoDB Cluster.
 set -eu
 umask 077
-VERSION=1.0.18
+VERSION=1.0.19
 ROOT=${MYSQL_IC_WORK_ROOT:-"$(pwd)/mysql_innodb_cluster_work"}
 MYSQL=${MYSQL_IC_MYSQL:-mysql}
 MYSQLSH=${MYSQL_IC_MYSQLSH:-mysqlsh}
@@ -198,6 +198,41 @@ EOF
     case $first in localhost|127.0.0.1|::1) printf '';; *) printf '%s' "$first";; esac
 }
 
+password_policy_report(){
+    i=$1
+    log "Current validate_password policy on node $i:"
+    sql "$i" "SHOW VARIABLES LIKE 'validate_password%';" 2>/dev/null | sed 's/^/  /' >&2 || log '  validate_password variables are unavailable on this server.'
+    log 'The script does not weaken or change password policy.'
+}
+admin_account_presence_report(){
+    u=$1; h=$2; present=''; count=0
+    for i in $(ids); do
+        c=$(sql "$i" "SELECT COUNT(*) FROM mysql.user WHERE User='$(q "$u")' AND Host='$(q "$h")';" 2>/dev/null || printf '0')
+        if [ "$c" -gt 0 ]; then present="${present}${present:+ }$i"; count=$((count+1)); fi
+    done
+    total=$(get meta count)
+    if [ "$count" -eq 0 ]; then
+        log "Account state after failure: '$u'@'$h' was not created on any registered node."
+    elif [ "$count" -eq "$total" ]; then
+        log "Account state after failure: '$u'@'$h' exists on every registered node. Re-run configure-admin with action=existing after reviewing the account."
+    else
+        log "Account state after failure: '$u'@'$h' exists only on node(s): $present."
+        log 'Partial account creation detected; review the affected nodes before retrying. The script will not auto-drop or alter the account.'
+    fi
+}
+cluster_admin_create_fail(){
+    i=$1; out=$2; u=$3; h=$4
+    cat "$out" >&2
+    if grep -Eq 'MYSQLSH 1819|does not satisfy the current policy requirements' "$out"; then
+        log 'ERROR: clusterAdmin password does not satisfy the server password policy.'
+        password_policy_report "$i"
+    else
+        log "ERROR: clusterAdmin creation failed on node $i."
+    fi
+    admin_account_presence_report "$u" "$h"
+    exit 1
+}
+
 configure_admin(){
     [ -f "$ROOT/meta/complete" ] || die 'Run discover first'
     sql_precheck
@@ -258,10 +293,10 @@ print("IC_ADMIN_CONFIGURED=ok");
 EOF
                 chmod 600 "$js"
                 if [ "$(get "$i" auth_mode)" = login-path ]; then
-                    MYSQL_TEST_LOGIN_FILE="$(get "$i" login_file)" "$MYSQLSH" --login-path="$(get "$i" login_path)" --no-wizard --js -f "$js" >"$out" 2>&1 || { cat "$out" >&2; die "clusterAdmin creation failed on node $i"; }
+                    MYSQL_TEST_LOGIN_FILE="$(get "$i" login_file)" "$MYSQLSH" --login-path="$(get "$i" login_path)" --no-wizard --js -f "$js" >"$out" 2>&1 || cluster_admin_create_fail "$i" "$out" "$au" "$ah"
                 else
                     cred "$i"; uri="$(get "$i" user)@$(get "$i" host):$(get "$i" port)"
-                    cat "$TMP/$i.pw" | "$MYSQLSH" --no-wizard --uri "$uri" --passwords-from-stdin --js -f "$js" >"$out" 2>&1 || { cat "$out" >&2; die "clusterAdmin creation failed on node $i"; }
+                    cat "$TMP/$i.pw" | "$MYSQLSH" --no-wizard --uri "$uri" --passwords-from-stdin --js -f "$js" >"$out" 2>&1 || cluster_admin_create_fail "$i" "$out" "$au" "$ah"
                 fi
                 rm -f "$js"
             done
