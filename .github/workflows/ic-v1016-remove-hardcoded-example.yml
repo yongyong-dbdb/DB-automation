@@ -1,0 +1,41 @@
+name: Remove hardcoded network example from InnoDB Cluster v1.0.16
+on:
+  push:
+    branches: [ main ]
+    paths: [ '.github/workflows/ic-v1016-remove-hardcoded-example.yml' ]
+permissions:
+  contents: write
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Remove fixed network example and validate
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('MySQL/InnoDB-Cluster/mysql_innodb_cluster_migrate.sh')
+          s=p.read_text()
+          old="Examples: exact management IP for same-host multi-instance; 10.0.0.% or an appropriate subnet pattern for distributed members. '%' is broad and requires extra confirmation."
+          new="Examples: exact management IP for same-host multi-instance; use the narrowest appropriate subnet pattern for distributed members. '%' is broad and requires extra confirmation."
+          if old not in s:
+              raise SystemExit('expected example text not found')
+          p.write_text(s.replace(old,new,1))
+          PY
+          sh -n MySQL/InnoDB-Cluster/mysql_innodb_cluster_migrate.sh
+          grep -q '^VERSION=1.0.16$' MySQL/InnoDB-Cluster/mysql_innodb_cluster_migrate.sh
+          ! grep -q '10\.0\.0\.%' MySQL/InnoDB-Cluster/mysql_innodb_cluster_migrate.sh
+      - name: Commit and cleanup
+        shell: bash
+        run: |
+          rm -f .github/workflows/ic-v1016-remove-hardcoded-example.yml
+          rmdir .github/workflows 2>/dev/null || true
+          rmdir .github 2>/dev/null || true
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'Remove fixed network example from InnoDB Cluster v1.0.16'
+          git push origin HEAD:main
