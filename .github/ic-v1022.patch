@@ -1,0 +1,61 @@
+--- a/MySQL/InnoDB-Cluster/mysql_innodb_cluster_migrate.sh
++++ b/MySQL/InnoDB-Cluster/mysql_innodb_cluster_migrate.sh
+@@ -1,10 +1,10 @@
+ #!/bin/sh
+-# mysql_innodb_cluster_migrate.sh v1.0.21
++# mysql_innodb_cluster_migrate.sh v1.0.22
+ # POSIX sh. Oracle MySQL GA 8.0+; runtime AdminAPI capability detection. Requires preinstalled mysql/mysqlsh; never installs packages.
+ # Safe automation for prepared MySQL instances / existing Group Replication -> InnoDB Cluster.
+ set -eu
+ umask 077
+-VERSION=1.0.21
++VERSION=1.0.22
+ ROOT=${MYSQL_IC_WORK_ROOT:-"$(pwd)/mysql_innodb_cluster_work"}
+ MYSQL=${MYSQL_IC_MYSQL:-mysql}
+ MYSQLSH=${MYSQL_IC_MYSQLSH:-mysqlsh}
+@@ -195,7 +195,14 @@
+ $(printf '%s\n' "$members" | awk 'NF{print $2}')
+ EOF
+     [ "$same" = yes ] || { printf ''; return 0; }
+-    case $first in localhost|127.0.0.1|::1) printf '';; *) printf '%s' "$first";; esac
++    case $first in localhost|127.0.0.1|::1|*:* ) printf ''; return 0;; esac
++    command -v ip >/dev/null 2>&1 || { printf ''; return 0; }
++    iface_line=$(ip -o -4 addr show scope global 2>/dev/null | awk -v h="$first" '$4 ~ ("^" h "/") {print; exit}')
++    [ -n "$iface_line" ] || { printf ''; return 0; }
++    iface=$(printf '%s\n' "$iface_line" | awk '{print $2}')
++    cidr=$(ip -4 route show dev "$iface" scope link 2>/dev/null | awk -v h="$first" '$1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+$/ {print $1; exit}')
++    [ -n "$cidr" ] || { printf ''; return 0; }
++    printf '%s' "$cidr"
+ }
+ 
+ 
+@@ -247,9 +254,9 @@
+     au=$(ask 'Cluster admin account name' 'icadmin')
+     case $au in ''|*[!A-Za-z0-9_.-]*) die 'Invalid cluster admin user';; esac
+     log 'Cluster admin Host must allow connections from every cluster member while remaining as narrow as your network permits.'
+-    log "Examples: exact management IP for same-host multi-instance; use the narrowest appropriate subnet pattern for distributed members. '%' is broad and requires extra confirmation."
++    log "Use the narrowest source-address range that covers every cluster member. A local NIC CIDR is suggested only when all current GR members advertise the same local IPv4 address. '%' is broad and requires extra confirmation."
+     rec_ah=$(recommended_admin_host_pattern)
+-    if [ -n "$rec_ah" ]; then log "Auto-detected narrow Host candidate from current GR MEMBER_HOST: $rec_ah"; fi
++    if [ -n "$rec_ah" ]; then log "Auto-detected narrow Host candidate from the local interface network matching current GR MEMBER_HOST: $rec_ah"; fi
+     ah=$(ask 'Cluster admin account host pattern' "$rec_ah")
+     [ -n "$ah" ] || die 'Cluster admin host pattern cannot be empty'
+     [ "$ah" != '%' ] || { log "WARNING: '$au'@'%' accepts authentication attempts from any source address allowed by network controls."; confirm "ALLOW-BROAD-ADMIN-HOST-$au"; }
+@@ -325,6 +332,17 @@
+             done
+             state_snapshot after_configure_admin
+             if [ "$(get meta gr_count)" -gt 0 ]; then snapshot_critical_equal before_configure_admin after_configure_admin; all_node_gr_consistency_guard; gr_writeability_guard; writeability_persistence_check; fi
++            log 'Validating the newly created clusterAdmin with dba.checkInstanceConfiguration() on every registered node.'
++            for i in $(ids); do
++                uri="$au@$(admin_host_for "$i"):$(admin_port_for "$i")"
++                out="$ROOT/node_${i}.new_admin_check.txt"
++                if ! cat "$TMP/admin.pw" | "$MYSQLSH" --uri "$uri" --passwords-from-stdin --js --execute='var r=dba.checkInstanceConfiguration(); print("IC_CHECK_STATUS="+r.status);' >"$out" 2>&1; then
++                    cat "$out" >&2
++                    admin_account_presence_report "$au" "$ah"
++                    die "New clusterAdmin failed AdminAPI validation on node $i. The account remains unchanged; choose a Host pattern accepted from every member before retrying."
++                fi
++                grep -q 'IC_CHECK_STATUS=ok' "$out" || { cat "$out" >&2; admin_account_presence_report "$au" "$ah"; die "New clusterAdmin is not accepted by AdminAPI on node $i."; }
++            done
+             ;;
+         existing)
+             log "Existing account will be reused: '$au'@'$ah'"
