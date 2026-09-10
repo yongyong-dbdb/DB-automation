@@ -1,0 +1,35 @@
+name: Apply InnoDB Cluster v1.0.22
+on:
+  push:
+    paths:
+      - '.github/workflows/ic-v1022.yml'
+      - '.github/ic-v1022.patch'
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Validate and apply patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git apply --check .github/ic-v1022.patch
+          git apply .github/ic-v1022.patch
+          sh -n MySQL/InnoDB-Cluster/mysql_innodb_cluster_migrate.sh
+          grep -q 'v1.0.22' MySQL/InnoDB-Cluster/mysql_innodb_cluster_migrate.sh
+          grep -q 'local interface network matching current GR MEMBER_HOST' MySQL/InnoDB-Cluster/mysql_innodb_cluster_migrate.sh
+          grep -q 'Validating the newly created clusterAdmin' MySQL/InnoDB-Cluster/mysql_innodb_cluster_migrate.sh
+      - name: Commit product file and remove temporary files
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          rm -f .github/ic-v1022.patch .github/workflows/ic-v1022.yml
+          git add MySQL/InnoDB-Cluster/mysql_innodb_cluster_migrate.sh .github/ic-v1022.patch .github/workflows/ic-v1022.yml
+          git commit -m 'Fix InnoDB Cluster admin Host validation v1.0.22'
+          git push origin main
