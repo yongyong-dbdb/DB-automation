@@ -1,0 +1,43 @@
+name: Apply validated InnoDB Cluster v1.0.17 minimal patch
+on:
+  push:
+    branches: [ main ]
+    paths: [ '.github/workflows/ic-v1017-minimal.yml' ]
+permissions:
+  contents: write
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Apply minimal validated patch
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('MySQL/InnoDB-Cluster/mysql_innodb_cluster_migrate.sh')
+          s=p.read_text()
+          s=s.replace('# mysql_innodb_cluster_migrate.sh v1.0.16','# mysql_innodb_cluster_migrate.sh v1.0.17',1)
+          s=s.replace('VERSION=1.0.16','VERSION=1.0.17',1)
+          s=s.replace("            h=$(ask \"Node $i connection host/IP\" '127.0.0.1')\n            p=$(ask \"Node $i SQL port\" '3306')", "            h=$(ask \"Node $i connection host/IP\" \"${MYSQL_HOST:-}\")\n            [ -n \"$h\" ] || die \"Node $i connection host/IP is required when password authentication is used\"\n            p=$(ask \"Node $i SQL port\" \"${MYSQL_TCP_PORT:-}\")\n            case $p in ''|*[!0-9]*) die \"Node $i SQL port must be entered as a number\";; esac", 1)
+          s=s.replace("    # AdminAPI must use an address reachable by every member. Runtime GR MEMBER_HOST is preferred for existing GR.\n    connect_host=$(ask \"Node $i member-reachable host/IP for AdminAPI\" '127.0.0.1')", "    # AdminAPI must use an address reachable by every member. Prefer live GR MEMBER_HOST, then report_host, then the explicit bootstrap host.\n    detected_member_host=$(sql \"$i\" \"SELECT COALESCE((SELECT MEMBER_HOST FROM performance_schema.replication_group_members WHERE MEMBER_ID='$(q \"$uuid\")' LIMIT 1),'');\")\n    if [ -z \"$detected_member_host\" ]; then detected_member_host=$(sql \"$i\" \"SELECT COALESCE(@@report_host,'');\"); fi\n    if [ -z \"$detected_member_host\" ] && [ \"$(get \"$i\" auth_mode)\" = password ]; then detected_member_host=$(get \"$i\" host); fi\n    connect_host=$(ask \"Node $i member-reachable host/IP for AdminAPI\" \"$detected_member_host\")\n    [ -n \"$connect_host\" ] || die \"Node $i AdminAPI reachable host/IP could not be auto-detected; enter it explicitly\"", 1)
+          p.write_text(s)
+          PY
+          f=MySQL/InnoDB-Cluster/mysql_innodb_cluster_migrate.sh
+          sh -n "$f"
+          grep -q '^VERSION=1.0.17$' "$f"
+          ! grep -Eq '128\.10\.50\.221|3306|3307|3308|63132|63133|63134' "$f"
+          ! grep -Eq '(^|[[:space:];|&])(yum|dnf|apt|apt-get|pip|npm|python|python3|perl|jq)([[:space:]]|$)' "$f"
+      - name: Commit and cleanup
+        shell: bash
+        run: |
+          rm -f .github/workflows/ic-v1017-minimal.yml .github/workflows/ic-v1017-final.yml
+          rmdir .github/workflows 2>/dev/null || true
+          rmdir .github 2>/dev/null || true
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'InnoDB Cluster v1.0.17 remove environment hardcoding'
+          git push origin HEAD:main
