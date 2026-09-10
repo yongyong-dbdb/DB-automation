@@ -1,11 +1,11 @@
 #!/bin/sh
-# mysql_gr_migrate.sh v1.0.12
+# mysql_gr_migrate.sh v1.0.13
 # POSIX sh; OS utilities and MySQL clients only. No external language packages.
 # Supported: Oracle MySQL 8.0.27+, 8.4.x, 9.7.x; homogeneous exact versions.
 # Single-primary or multi-primary / XCom. Never resets GTID or binary logs.
 set -eu
 umask 077
-VERSION=1.0.12
+VERSION=1.0.13
 ROOT=${MYSQL_GR_WORK_ROOT:-"$(pwd)/mysql_gr_work"}
 MYSQL=${MYSQL_GR_MYSQL:-mysql}
 DUMP=${MYSQL_GR_MYSQLDUMP:-mysqldump}
@@ -512,6 +512,21 @@ remote_call() (
         printf 'SNIPPET=%s\n' "$(shell_quote "$(if [ -n "$snippet" ]; then cat "$snippet"; fi)")"
         printf 'DO_RESTART=%s\n' "$(shell_quote "$restart")"
         printf 'VERSION=%s\n' "$(shell_quote "$VERSION")"
+        printf 'ADVERTISE=%s\n' "$(shell_quote "$(get "$i" advertise)")"
+        printf 'SQL_PORT=%s\n' "$(shell_quote "$(get "$i" sql_port)")"
+        xcom_value=$(get "$i" xcom); printf 'XCOM_PORT=%s\n' "$(shell_quote "${xcom_value##*:}")"
+        printf 'GR_TLS_MODE=%s\n' "$(shell_quote "$(get meta tls)")"
+        printf 'RECOVERY_CA=%s\n' "$(shell_quote "$(get "$i" recovery_ca)")"
+        if [ "$action" = tls-apply ] || [ "$action" = tls-rollback ]; then
+            printf 'TLS_OUTPUT=%s\n' "$(shell_quote "$(cat "$RUN/tls_change/$i.output")")"
+        fi
+        if [ "$action" = tls-apply ]; then
+            material="$RUN/tls_change/$i.material"
+            [ -r "$material/ca.pem" ] && [ -r "$material/server-cert.pem" ] && [ -r "$material/server-key.pem" ] || die "Node $i prepared TLS material missing"
+            printf 'TLS_CA_PEM=%s\n' "$(shell_quote "$(cat "$material/ca.pem")")"
+            printf 'TLS_CERT_PEM=%s\n' "$(shell_quote "$(cat "$material/server-cert.pem")")"
+            printf 'TLS_KEY_PEM=%s\n' "$(shell_quote "$(cat "$material/server-key.pem")")"
+        fi
         remote_agent
     } > "$payload"
     # Capture the SSH exit status directly; a pipeline/tee must not hide failure.
@@ -705,6 +720,192 @@ r_restart() {
     done
     r_die 'Restarted instance did not reconnect; preserve backup and inspect server logs'
 }
+r_tls_paths() {
+    RTLS_DATA=${EXPECTED_DATA%/}
+    RTLS_CA=$(r_sql 'SELECT @@GLOBAL.ssl_ca;')
+    RTLS_CERT=$(r_sql 'SELECT @@GLOBAL.ssl_cert;')
+    RTLS_KEY=$(r_sql 'SELECT @@GLOBAL.ssl_key;')
+    case $RTLS_CA in /*) :;; '') r_die 'Runtime ssl_ca is empty';; *) RTLS_CA="$RTLS_DATA/$RTLS_CA";; esac
+    case $RTLS_CERT in /*) :;; '') r_die 'Runtime ssl_cert is empty';; *) RTLS_CERT="$RTLS_DATA/$RTLS_CERT";; esac
+    case $RTLS_KEY in /*) :;; '') r_die 'Runtime ssl_key is empty';; *) RTLS_KEY="$RTLS_DATA/$RTLS_KEY";; esac
+}
+r_tls_selinux_report() {
+    mode=Disabled
+    if command -v getenforce >/dev/null 2>&1; then mode=$(getenforce 2>/dev/null || printf 'Unknown'); fi
+    printf 'SELINUX_MODE\t%s\n' "$mode"
+    for f in "$RTLS_CA" "$RTLS_CERT" "$RTLS_KEY"; do
+        [ -e "$f" ] || continue
+        printf 'SELINUX_CONTEXT\t%s\t%s\n' "$f" "$(stat -c %C "$f" 2>/dev/null || printf '?')"
+    done
+}
+r_selinux_port_contains() {
+    wanted=$1
+    command -v semanage >/dev/null 2>&1 || return 2
+    semanage port -l > "$RTMP/semanage_ports" 2>/dev/null || return 2
+    awk '$1=="mysqld_port_t" && $2=="tcp" {for(i=3;i<=NF;i++) print $i}' "$RTMP/semanage_ports" | tr ',' '\n' | tr -d ' ' > "$RTMP/mysqld_ports" || return 2
+    while IFS= read -r spec; do
+        [ -n "$spec" ] || continue
+        case $spec in
+            *-*) lo=${spec%-*}; hi=${spec#*-}; case $lo:$hi in *[!0-9:]*|:*) continue;; esac; [ "$wanted" -ge "$lo" ] && [ "$wanted" -le "$hi" ] && return 0;;
+            *) [ "$wanted" = "$spec" ] && return 0;;
+        esac
+    done < "$RTMP/mysqld_ports"
+    return 1
+}
+r_selinux_gr_port_preflight() {
+    mode=Disabled
+    if command -v getenforce >/dev/null 2>&1; then mode=$(getenforce 2>/dev/null || printf 'Unknown'); fi
+    domain=$(tr -d '\000' < "/proc/$RPID/attr/current" 2>/dev/null || :)
+    printf 'SELINUX_PROCESS_DOMAIN\t%s\n' "$domain"
+    case $mode in Enforcing|Permissive) :;; *) return 0;; esac
+    case $domain in *:mysqld_t:*) :;; *) printf 'SELINUX_PORT_CHECK\tSKIPPED_NON_MYSQLD_T\n'; return 0;; esac
+    case $XCOM_PORT in ''|*[!0-9]*) r_die 'Invalid XCom port for SELinux preflight';; esac
+    if r_selinux_port_contains "$XCOM_PORT"; then
+        printf 'SELINUX_XCOM_PORT\t%s\tmysqld_port_t\n' "$XCOM_PORT"
+        return 0
+    else
+        rc=$?
+    fi
+    if [ "$rc" -eq 2 ]; then
+        r_die "SELinux is $mode and mysqld runs in mysqld_t, but semanage is unavailable for read-only XCom port verification. No package is installed automatically; verify the existing host SELinux port policy manually before GR."
+    fi
+    r_die "SELinux XCom port $XCOM_PORT is not registered as mysqld_port_t. No semanage/policy change is performed automatically; register/review it on this host before GR."
+}
+r_tls_inspect() {
+    command -v openssl >/dev/null 2>&1 || r_die 'Existing openssl is required; no package will be installed automatically'
+    r_tls_paths
+    [ "$ACTION" = tls-export ] || r_selinux_gr_port_preflight
+    [ -r "$RTLS_CA" ] && [ -r "$RTLS_CERT" ] && [ -r "$RTLS_KEY" ] || r_die 'Runtime TLS CA/certificate/key is not readable on this host'
+    openssl x509 -in "$RTLS_CERT" -noout -checkend 0 >/dev/null 2>&1 || r_die 'Runtime TLS certificate is invalid or expired'
+    openssl x509 -in "$RTLS_CERT" -pubkey -noout > "$RTMP/tls.cert.pub" 2>/dev/null || r_die 'Cannot read TLS certificate public key'
+    openssl pkey -in "$RTLS_KEY" -pubout > "$RTMP/tls.key.pub" 2>/dev/null || r_die 'Cannot read TLS private key'
+    cmp -s "$RTMP/tls.cert.pub" "$RTMP/tls.key.pub" || r_die 'Runtime TLS certificate/key mismatch'
+    set -- -CAfile "$RTLS_CA" -purpose sslserver
+    if [ "$GR_TLS_MODE" = VERIFY_IDENTITY ] && [ "$ACTION" != tls-export ]; then
+        case $ADVERTISE in *[!0-9.]*) set -- "$@" -verify_hostname "$ADVERTISE";; *) set -- "$@" -verify_ip "$ADVERTISE";; esac
+    fi
+    openssl verify "$@" "$RTLS_CERT" >/dev/null 2>&1 || r_die 'Runtime TLS certificate fails local CA/identity validation'
+    RRECOVERY_CA=$RECOVERY_CA
+    case $RRECOVERY_CA in /*) :;; '') RRECOVERY_CA=$RTLS_CA;; *) RRECOVERY_CA="$RTLS_DATA/$RRECOVERY_CA";; esac
+    [ -r "$RRECOVERY_CA" ] || r_die 'Configured GR recovery CA is not readable on this host'
+    printf 'TLS_CA_PATH\t%s\nTLS_CERT_PATH\t%s\nTLS_KEY_PATH\t%s\nTLS_RECOVERY_CA_PATH\t%s\n' "$RTLS_CA" "$RTLS_CERT" "$RTLS_KEY" "$RRECOVERY_CA"
+    r_tls_selinux_report
+    openssl x509 -in "$RTLS_CERT" -noout -fingerprint -sha256 | sed 's/^/TLS_CERT_FINGERPRINT\t/'
+    openssl x509 -in "$RTLS_CA" -noout -fingerprint -sha256 | sed 's/^/TLS_CA_FINGERPRINT\t/'
+    openssl x509 -in "$RRECOVERY_CA" -noout -fingerprint -sha256 | sed 's/^/TLS_RECOVERY_CA_FINGERPRINT\t/'
+    tr -d '\000' < "$RTLS_CA" | awk '{print "TLS_CA_PEM\t" $0}'
+    tr -d '\000' < "$RRECOVERY_CA" | awk '{print "TLS_RECOVERY_CA_PEM\t" $0}'
+    tr -d '\000' < "$RTLS_CERT" | awk '{print "TLS_CERT_PEM\t" $0}'
+    printf 'TLS_INSPECT\tPASSED\n'
+}
+
+r_tls_capture_avc() {
+    out="$TLS_OUTPUT/tls_reload_avc.log"
+    if command -v ausearch >/dev/null 2>&1; then
+        ausearch -m AVC,USER_AVC -ts recent > "$out" 2>&1 || :
+    elif [ -r /var/log/audit/audit.log ]; then
+        grep -i 'avc:.*denied' /var/log/audit/audit.log | tail -100 > "$out" 2>/dev/null || :
+    else
+        printf '%s\n' 'AVC evidence unavailable; no package was installed.' > "$out"
+    fi
+}
+r_tls_prepare_files() {
+    [ "$(id -u)" = 0 ] || r_die 'TLS apply requires root on the MySQL host; no privilege escalation/package installation is attempted by the helper'
+    command -v openssl >/dev/null 2>&1 || r_die 'Existing openssl is required; no package will be installed automatically'
+    RTLS_DATA=${EXPECTED_DATA%/}
+    case $TLS_OUTPUT in "$RTLS_DATA"/*) :;; *) r_die 'TLS output must be below the proven active datadir';; esac
+    [ ! -e "$TLS_OUTPUT" ] || r_die 'TLS output path already exists; preserve it and review before retrying'
+    r_tls_paths
+    [ -r "$RTLS_CERT" ] || r_die 'Cannot read active certificate for rollback/SELinux comparison'
+    old_ctx=$(stat -c %C "$RTLS_CERT" 2>/dev/null || :)
+    old_type=$(printf '%s' "$old_ctx" | awk -F: 'NF>=3 {print $3}')
+    mkdir "$TLS_OUTPUT" || r_die 'Cannot create TLS output directory'
+    chmod 700 "$TLS_OUTPUT"
+    printf '%s\n' "$TLS_CA_PEM" > "$TLS_OUTPUT/ca.pem"
+    printf '%s\n' "$TLS_CERT_PEM" > "$TLS_OUTPUT/server-cert.pem"
+    printf '%s\n' "$TLS_KEY_PEM" > "$TLS_OUTPUT/server-key.pem"
+    chmod 644 "$TLS_OUTPUT/ca.pem" "$TLS_OUTPUT/server-cert.pem"
+    chmod 600 "$TLS_OUTPUT/server-key.pem"
+    chown -R "$(stat -c %u "$RTLS_DATA"):$(stat -c %g "$RTLS_DATA")" "$TLS_OUTPUT"
+    openssl x509 -in "$TLS_OUTPUT/server-cert.pem" -noout -checkend 0 >/dev/null 2>&1 || r_die 'Prepared TLS certificate invalid/expired'
+    openssl x509 -in "$TLS_OUTPUT/server-cert.pem" -pubkey -noout > "$RTMP/new.cert.pub" 2>/dev/null || r_die 'Cannot read prepared TLS certificate public key'
+    openssl pkey -in "$TLS_OUTPUT/server-key.pem" -pubout > "$RTMP/new.key.pub" 2>/dev/null || r_die 'Cannot read prepared TLS key'
+    cmp -s "$RTMP/new.cert.pub" "$RTMP/new.key.pub" || r_die 'Prepared TLS certificate/key mismatch'
+    set -- -CAfile "$TLS_OUTPUT/ca.pem" -purpose sslserver
+    if [ "$GR_TLS_MODE" = VERIFY_IDENTITY ]; then
+        case $ADVERTISE in *[!0-9.]*) set -- "$@" -verify_hostname "$ADVERTISE";; *) set -- "$@" -verify_ip "$ADVERTISE";; esac
+    fi
+    openssl verify "$@" "$TLS_OUTPUT/server-cert.pem" >/dev/null 2>&1 || r_die 'Prepared TLS certificate fails CA/SAN validation'
+    mode=Disabled
+    if command -v getenforce >/dev/null 2>&1; then mode=$(getenforce 2>/dev/null || printf 'Unknown'); fi
+    printf '%s\n' "$mode" > "$TLS_OUTPUT/selinux_mode.before"
+    case $mode in Enforcing|Permissive)
+        command -v restorecon >/dev/null 2>&1 || r_die "SELinux is $mode but restorecon is unavailable. No package will be installed; configure the existing host SELinux tooling/policy manually."
+        restorecon -R "$TLS_OUTPUT" > "$TLS_OUTPUT/restorecon.log" 2>&1 || r_die 'restorecon failed for prepared TLS files'
+        new_ctx=$(stat -c %C "$TLS_OUTPUT/server-cert.pem" 2>/dev/null || :)
+        new_type=$(printf '%s' "$new_ctx" | awk -F: 'NF>=3 {print $3}')
+        printf 'ACTIVE\t%s\t%s\nNEW\t%s\t%s\n' "$RTLS_CERT" "$old_ctx" "$TLS_OUTPUT/server-cert.pem" "$new_ctx" > "$TLS_OUTPUT/selinux_context.tsv"
+        [ -n "$old_type" ] && [ "$old_type" != '?' ] || r_die 'Cannot determine active TLS SELinux type'
+        [ "$new_type" = "$old_type" ] || r_die 'Prepared TLS SELinux type differs from active certificate type; no semanage/chcon/policy installation is performed automatically'
+        ;;
+    esac
+}
+r_tls_apply() {
+    r_config_guard
+    r_tls_prepare_files
+    CFGLOCK="${CNF}.gr_tls_lock"; mkdir "$CFGLOCK" || { CFGLOCK=''; r_die 'TLS configuration is locked by another operation'; }
+    stamp="$(date +%Y%m%d_%H%M%S)_$$"
+    VALIDATE_LOG="$TLS_OUTPUT/config_validation.log"
+    START_LOG="$TLS_OUTPUT/start_unused.log"
+    CANDIDATE=$(mktemp "${CNF}.gr_tls_candidate.XXXXXX")
+    cp -a "$CNF" "$CANDIDATE"
+    r_chain_snapshot "$CNF" "$TLS_OUTPUT/include.before" "$RCWD"
+    cp -a "$CNF" "$TLS_OUTPUT/cnf.before"
+    r_sql "SELECT CONCAT('SET GLOBAL ssl_ca=',QUOTE(@@ssl_ca),'; SET GLOBAL ssl_cert=',QUOTE(@@ssl_cert),'; SET GLOBAL ssl_key=',QUOTE(@@ssl_key),'; ALTER INSTANCE RELOAD TLS;');" > "$TLS_OUTPUT/runtime_restore.sql"
+    sed '/^# BEGIN mysql_gr_tls$/,/^# END mysql_gr_tls$/d' "$CNF" > "$RTMP/tls.cnf"
+    printf '\n# BEGIN mysql_gr_tls\n[mysqld]\nssl_ca=%s/ca.pem\nssl_cert=%s/server-cert.pem\nssl_key=%s/server-key.pem\n# END mysql_gr_tls\n' "$TLS_OUTPUT" "$TLS_OUTPUT" "$TLS_OUTPUT" >> "$RTMP/tls.cnf"
+    cat "$RTMP/tls.cnf" > "$CANDIDATE"
+    r_validate_candidate
+    r_same_process
+    r_chain_snapshot "$CNF" "$TLS_OUTPUT/include.current" "$RCWD"
+    cmp -s "$TLS_OUTPUT/include.before" "$TLS_OUTPUT/include.current" || r_die 'TLS configuration include chain changed concurrently'
+    cmp -s "$CNF" "$TLS_OUTPUT/cnf.before" || r_die 'TLS configuration changed concurrently'
+    BACKUP="${CNF}.before_gr_tls_${stamp}"
+    [ ! -e "$BACKUP" ] || r_die 'TLS config backup already exists'
+    cp -a "$CNF" "$BACKUP"; cmp -s "$CNF" "$BACKUP" || r_die 'TLS config backup verification failed'
+    printf '%s\n' "$BACKUP" > "$TLS_OUTPUT/cnf_backup_path"
+    cat "$CANDIDATE" > "$CNF"; rm -f "$CANDIDATE"; CANDIDATE=''
+    if ! r_sql "SET GLOBAL ssl_ca='$(printf '%s' "$TLS_OUTPUT/ca.pem" | sed "s/'/''/g")'; SET GLOBAL ssl_cert='$(printf '%s' "$TLS_OUTPUT/server-cert.pem" | sed "s/'/''/g")'; SET GLOBAL ssl_key='$(printf '%s' "$TLS_OUTPUT/server-key.pem" | sed "s/'/''/g")'; ALTER INSTANCE RELOAD TLS;" > "$TLS_OUTPUT/reload.log" 2>&1; then
+        r_tls_capture_avc
+        cat "$TLS_OUTPUT/cnf.before" > "$CNF" || :
+        r_sql "$(cat "$TLS_OUTPUT/runtime_restore.sql")" >> "$TLS_OUTPUT/reload.log" 2>&1 || :
+        r_die "TLS reload failed; previous cnf/runtime restore attempted. Inspect $TLS_OUTPUT/reload.log and $TLS_OUTPUT/tls_reload_avc.log"
+    fi
+    actual=$(r_sql "SELECT CONCAT(@@ssl_ca,'|',@@ssl_cert,'|',@@ssl_key);")
+    [ "$actual" = "$TLS_OUTPUT/ca.pem|$TLS_OUTPUT/server-cert.pem|$TLS_OUTPUT/server-key.pem" ] || {
+        cat "$TLS_OUTPUT/cnf.before" > "$CNF" || :
+        r_sql "$(cat "$TLS_OUTPUT/runtime_restore.sql")" >/dev/null 2>&1 || :
+        r_die 'Runtime TLS paths differ after reload; rollback attempted'
+    }
+    : > "$TLS_OUTPUT/APPLIED"
+    printf 'TLS_APPLIED\t%s\nTLS_BACKUP\t%s\n' "$TLS_OUTPUT" "$BACKUP"
+    # Emit host-side evidence so a no-SSH controller can later verify/adopt the
+    # exact manually applied plan without storing the DB password.
+    RECOVERY_CA="$TLS_OUTPUT/ca.pem"
+    r_tls_inspect
+}
+r_tls_rollback() {
+    [ "$(id -u)" = 0 ] || r_die 'TLS rollback requires root on the MySQL host'
+    [ -d "$TLS_OUTPUT" ] && [ -f "$TLS_OUTPUT/APPLIED" ] || r_die 'No applied TLS state found for rollback'
+    [ -r "$TLS_OUTPUT/cnf.before" ] && [ -r "$TLS_OUTPUT/runtime_restore.sql" ] || r_die 'TLS rollback evidence is incomplete'
+    r_config_guard
+    r_same_process
+    cat "$TLS_OUTPUT/cnf.before" > "$CNF" || r_die 'Cannot restore previous TLS cnf'
+    r_sql "$(cat "$TLS_OUTPUT/runtime_restore.sql")" > "$TLS_OUTPUT/rollback.log" 2>&1 || r_die 'Cannot restore previous runtime TLS settings'
+    mv "$TLS_OUTPUT/APPLIED" "$TLS_OUTPUT/ROLLED_BACK"
+    printf 'TLS_ROLLBACK\tPASSED\n'
+}
+
 r_main() {
     RTMP=$(mktemp -d "${TMPDIR:-/tmp}/mysql_gr_remote.XXXXXX")
     trap r_cleanup 0; trap 'exit 130' 2; trap 'exit 143' 1 15
@@ -718,6 +919,9 @@ r_main() {
     [ ! -r /etc/machine-id ] || printf 'HOST_ID\t%s\n' "$(cat /etc/machine-id)"
     printf 'DEFAULT_CNF\t%s\n' "$RDEFAULT"
     while IFS= read -r f; do printf 'CANDIDATE\t%s\n' "$f"; done < "$RTMP/candidates"
+    if [ "$ACTION" = tls-inspect ] || [ "$ACTION" = tls-export ]; then r_tls_inspect; return 0; fi
+    if [ "$ACTION" = tls-apply ]; then r_tls_apply; return 0; fi
+    if [ "$ACTION" = tls-rollback ]; then r_tls_rollback; return 0; fi
     [ "$ACTION" != inspect ] || return 0
     if [ "$ACTION" = manual ]; then
         [ -n "$CNF" ] || CNF=$RDEFAULT
@@ -2138,8 +2342,19 @@ accounts() {
     hosts=$(required 'Account host entries for member source IPs (space-separated)' '')
     for host in $hosts; do case $host in *[!A-Za-z0-9_.:%/-]*) die 'Invalid account host';; esac; done
     for i in $(ids); do sql "$i" "SHOW GLOBAL VARIABLES WHERE Variable_name LIKE 'validate_password%';" >&2; done
-    rp=$(secret 'Recovery password shared across these donor accounts')
-    [ -n "$rp" ] || die 'Recovery password cannot be empty'
+    if [ "$action" = create ]; then
+        rp=$(secret 'Recovery password shared across these donor accounts (blank = auto-generate in memory)')
+        if [ -z "$rp" ]; then
+            command -v openssl >/dev/null 2>&1 || die 'Existing openssl is required to auto-generate a recovery password; no package will be installed automatically'
+            random_part=$(openssl rand -hex 10 2>/dev/null) || die 'Recovery password generation failed'
+            rp="Aa9!$random_part"
+            unset random_part
+            log 'Recovery password auto-generated in memory; it is not written to work files or logs.'
+        fi
+    else
+        rp=$(secret 'Existing recovery account password')
+        [ -n "$rp" ] || die 'Existing recovery account password cannot be empty'
+    fi
     [ "$(printf '%s' "$rp" | wc -c)" -le 32 ] || die 'Replication SOURCE_PASSWORD must not exceed 32 bytes; no recovery accounts have been created'
     for i in $(ids); do
         for host in $hosts; do
@@ -2360,6 +2575,9 @@ main() {
 # v1.0.12: reversible reprovision package generation, staging/swap rollback plan, and stable abort TSV output.
 #           Logical reprovision package also exports Source users/roles/grants because partial mysqldump GTID metadata covers the full Source GTID set.
 # v1.0.12-logical-safety2: NEW_EMPTY account restore + fail-fast grants/default roles + dump version guard.
+# v1.0.13: single-file deployment; embedded reprovision executor; active datadir-relative TLS preservation;
+#           local/remote TLS+SELinux host-side preflight; read-only mysqld_t XCom port validation;
+#           mixed existing GTID replication + standalone member migration into one GR.
 safe_host() { case $1 in ''|*[!a-zA-Z0-9_.-]*) die "Use an IPv4 address or DNS name (IPv6 is not supported in v$VERSION).";; esac; }
 
 host_is_local() (
@@ -2949,11 +3167,325 @@ done
 }
 
 
+emit_reprovision_helper() {
+    cat <<'MYSQL_GR_REPROVISION_HELPER'
+#!/bin/sh
+# Host-side reprovision executor. Copy the complete package to the target host.
+# No package installation, GTID reset, or original-directory deletion.
+set -eu
+umask 077
+fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+ACTION=${1:-help}
+case $ACTION in stage|swap|rollback) :;; *) printf 'Usage: sh reprovision_helper.sh stage|swap|rollback PACKAGE TARGET_AUTH SOURCE_AUTH\nAUTH: absolute client option file, or login-path:NAME\n'; exit 2;; esac
+PKG=$(readlink -f "${2:?Package directory required}")
+TARGET_AUTH=${3:?Target authentication required}
+SOURCE_AUTH=${4:?Source authentication required}
+MYSQL=${MYSQL_GR_MYSQL:-mysql}
+MYSQLDUMP=${MYSQL_GR_MYSQLDUMP:-mysqldump}
+for utility in "$MYSQL" "$MYSQLDUMP" sha256sum readlink stat awk sed cmp cp mv mkdir chmod chown id mktemp; do command -v "$utility" >/dev/null 2>&1 || fail "Missing existing utility $utility"; done
+[ -d "$PKG" ] && [ ! -L "$PKG" ] || fail 'Invalid package directory'
+[ "$(stat -c %u "$PKG")" = "$(id -u)" ] || fail 'Package must be owned by the executing OS account'
+LOCK="$PKG/.executor.lock"
+mkdir "$LOCK" || fail 'Executor lock exists; inspect previous operation before retry'
+WORK=$(mktemp -d "$PKG/.executor.XXXXXX")
+STAGED_RUNNING=no
+cleanup_executor() {
+    code=$?
+    trap - 0 1 2 15
+    if [ "$STAGED_RUNNING" = yes ]; then
+        # Both auth paths are needed if import failed during account restoration.
+        if ! db "$SOURCE_AUTH" "$STAGE_SOCKET" 'SHUTDOWN;' >/dev/null 2>&1; then
+            "$MYSQL" --no-defaults --no-login-paths --protocol=SOCKET --socket="$STAGE_SOCKET" -uroot -e 'SHUTDOWN;' >/dev/null 2>&1 || printf 'Staging may still be running at %s; inspect it.\n' "$STAGE_SOCKET" >&2
+        fi
+    fi
+    # Evidence and every datadir are retained, including failed staging directories.
+    rmdir "$LOCK" 2>/dev/null || :
+    exit "$code"
+}
+trap cleanup_executor 0
+trap 'exit 130' 2
+trap 'exit 143' 1 15
+db() (
+    auth=$1; socket=$2; statement=$3
+    case $auth in login-path:*) set -- "--login-path=${auth#login-path:}";; /*) [ -r "$auth" ] || fail 'Unreadable auth file'; set -- "--defaults-file=$auth" --no-login-paths;; *) fail 'AUTH must be an absolute option file or login-path:NAME';; esac
+    printf '%s\n' "$statement" | "$MYSQL" "$@" --protocol=SOCKET --socket="$socket" --connect-timeout=5 --batch --raw --skip-column-names
+)
+field() { [ -f "$PKG/$1" ] || fail "Missing package field $1"; cat "$PKG/$1"; }
+save() { printf '%s\n' "$2" > "$PKG/$1"; }
+OLD_UUID=$(field expected_uuid)
+SOCKET=$(field expected_socket)
+DATA=$(field expected_datadir); DATA=${DATA%/}
+VERSION=$(field source_version)
+GTID=$(field target_gtid)
+CNF=$(field expected_cnf)
+case $DATA in /*) :;; *) fail 'Datadir must be absolute';; esac
+[ "$DATA" != / ] && [ -n "$DATA" ] || fail 'Unsafe datadir'
+check_package() (
+    cd "$PKG"
+    sha256sum -c package.sha256 > "$WORK/checksums" 2>&1 || fail 'Package checksum mismatch'
+)
+selinux_mode() {
+    if command -v getenforce >/dev/null 2>&1; then getenforce 2>/dev/null || printf 'Unknown'; else printf 'Disabled'; fi
+}
+require_selinux_restore() {
+    case $(selinux_mode) in
+        Enforcing|Permissive) command -v restorecon >/dev/null 2>&1 || fail 'SELinux is active but restorecon is unavailable. No package or SELinux policy is installed automatically.';;
+    esac
+}
+restore_datadir_context() {
+    path=$1
+    case $(selinux_mode) in
+        Enforcing|Permissive) restorecon -R "$path" > "$WORK/restorecon.$$.log" 2>&1;;
+        *) return 0;;
+    esac
+}
+identity() (
+    expected=$1; auth=$2
+    actual=$(db "$auth" "$SOCKET" 'SELECT @@server_uuid;') || fail 'Cannot query target identity'
+    [ "$actual" = "$expected" ] || fail 'Server UUID changed'
+    current=$(db "$auth" "$SOCKET" 'SELECT @@datadir;')
+    [ "${current%/}" = "$DATA" ] || fail 'Target datadir changed'
+    [ "$(db "$auth" "$SOCKET" 'SELECT @@version;')" = "$VERSION" ] || fail 'Version differs from source'
+    [ "$(db "$auth" "$SOCKET" 'SELECT @@super_read_only;')" = 1 ] || fail 'Target must remain write fenced'
+    [ "$(db "$auth" "$SOCKET" "SELECT COUNT(*) FROM performance_schema.replication_group_members WHERE MEMBER_STATE IN ('ONLINE','RECOVERING');")" = 0 ] || fail 'Target is already a GR member'
+)
+wait_down() (
+    pid=$1; start=$2; attempt=0
+    while [ -r "/proc/$pid/stat" ] && [ "$(awk '{print $22}' "/proc/$pid/stat")" = "$start" ]; do
+        [ "$attempt" -lt 120 ] || fail 'Process did not stop; refusing duplicate startup or datadir move'
+        sleep 1; attempt=$((attempt+1))
+    done
+)
+capture_launcher() {
+    pidfile=$(db "$TARGET_AUTH" "$SOCKET" 'SELECT @@pid_file;')
+    PID=$(cat "$pidfile")
+    case $PID in ''|*[!0-9]*) fail 'Invalid server PID';; esac
+    EXE=$(readlink -f "/proc/$PID/exe")
+    case ${EXE##*/} in mysqld|mysqld-debug) :;; *) fail 'PID is not mysqld';; esac
+    CWD=$(readlink -f "/proc/$PID/cwd")
+    tr '\000' '\n' < "/proc/$PID/cmdline" > "$PKG/launcher.argv"
+    # Unknown command-line options could write outside staging or defeat fences.
+    first=yes
+    while IFS= read -r arg; do
+        if [ "$first" = yes ]; then first=no; continue; fi
+        case $arg in --defaults-file=*|--daemonize|--user=*|--skip-replica-start=ON|--event-scheduler=OFF|--super-read-only=ON) :;; *) fail "Launcher option needs explicit support before swap: $arg";; esac
+    done < "$PKG/launcher.argv"
+    grep -Fx -- "--defaults-file=$CNF" "$PKG/launcher.argv" >/dev/null || fail 'Explicit matching --defaults-file is required for this direct executor'
+    parent=$(awk '{print $4}' "/proc/$PID/stat")
+    parent_name=$(cat "/proc/$parent/comm")
+    case $parent_name in systemd|init|bash|sh|dash) :;; *) fail 'Unsupported supervisor; do not stop this instance automatically';; esac
+    service=$(sed -n 's#.*\/\([^/]*\.service\)$#\1#p' "/proc/$PID/cgroup" | head -n 1)
+    if [ -n "$service" ] && [ "$(systemctl show "$service" -p MainPID --value)" = "$PID" ]; then
+        fail 'Systemd-managed instance requires a separately reviewed launcher; direct executor will not bypass it'
+    fi
+    save expected_pid_file "$pidfile"
+    save launcher_exe "$EXE"; save launcher_cwd "$CWD"
+    save original_inode "$(stat -c '%d:%i' "$DATA")"
+    save original_gtid "$(db "$TARGET_AUTH" "$SOCKET" 'SELECT REPLACE(@@gtid_executed,CHAR(10),"");')"
+    db "$TARGET_AUTH" "$SOCKET" "SELECT CONCAT('START REPLICA IO_THREAD FOR CHANNEL ',QUOTE(CHANNEL_NAME),';') FROM performance_schema.replication_connection_status WHERE CHANNEL_NAME NOT LIKE 'group_replication_%' AND SERVICE_STATE='ON'; SELECT CONCAT('START REPLICA SQL_THREAD FOR CHANNEL ',QUOTE(CHANNEL_NAME),';') FROM performance_schema.replication_applier_status WHERE CHANNEL_NAME NOT LIKE 'group_replication_%' AND SERVICE_STATE='ON';" > "$PKG/original_async.sql"
+}
+start_original() (
+    exe=$(field launcher_exe); cwd=$(field launcher_cwd)
+    set --
+    first=yes
+    while IFS= read -r arg; do
+        if [ "$first" = yes ]; then first=no; continue; fi
+        case $arg in --daemonize) continue;; esac
+        set -- "$@" "$arg"
+    done < "$PKG/launcher.argv"
+    cd "$cwd"
+    "$exe" "$@" --daemonize --skip-replica-start=ON --event-scheduler=OFF --super-read-only=ON
+)
+wait_up() (
+    auth=$1; expected=$2; attempt=0
+    while [ "$attempt" -lt 120 ]; do
+        if uuid=$(db "$auth" "$SOCKET" 'SELECT @@server_uuid;' 2>/dev/null); then
+            [ "$uuid" = "$expected" ] || fail 'Unexpected UUID after startup'
+            exit 0
+        fi
+        sleep 1; attempt=$((attempt+1))
+    done
+    fail 'Instance did not reconnect'
+)
+stage_paths() {
+    STAGE=$(field stage_path)
+    STAGE_SOCKET=$(field stage_socket)
+    BACKUP=$(field backup_path)
+    FAILED=$(field failed_path)
+    for path in "$STAGE" "$BACKUP" "$FAILED"; do
+        case $path in "$DATA".gr_stage_*|"$DATA".gr_backup_*|"$DATA".gr_failed_*) :;; *) fail 'Invalid saved staging/backup path';; esac
+        [ ! -L "$path" ] || fail 'Staging/backup path is a symlink'
+    done
+}
+staging_validate() (
+    auth=$1; socket=$2
+    [ "$(db "$auth" "$socket" "SELECT GTID_SUBSET(@@gtid_executed,'$GTID') AND GTID_SUBSET('$GTID',@@gtid_executed);")" = 1 ] || fail 'GTID is not exactly equal to source snapshot'
+    [ "$(db "$auth" "$socket" 'SELECT @@super_read_only;')" = 1 ] || fail 'New instance is not write fenced'
+    [ "$(db "$auth" "$socket" 'SELECT @@event_scheduler;')" = OFF ] || fail 'Event scheduler must remain OFF'
+    case $auth in login-path:*) set -- "--login-path=${auth#login-path:}";; *) set -- "--defaults-file=$auth" --no-login-paths;; esac
+    # Canonical source dump includes rows ordered by primary key, full stored
+    # objects, schemas, indexes, constraints, and DEFINER clauses.
+    databases=$(cat "$PKG/databases")
+    set -f
+    for database in $databases; do case $database in *[!A-Za-z0-9_\$]*) fail 'Unsupported schema name';; esac; done
+    "$MYSQLDUMP" "$@" --protocol=SOCKET --socket="$socket" --skip-comments --skip-dump-date --no-tablespaces --set-gtid-purged=OFF --routines --events --triggers --hex-blob --order-by-primary --skip-extended-insert --databases $databases > "$WORK/actual.sql" 2> "$WORK/dump.err" || fail 'Full validation dump failed'
+    cmp -s "$PKG/source_validation.sql" "$WORK/actual.sql" || fail 'Full schema/stored-object/data validation differs; inspect protected executor evidence'
+    # Reuse the same export logic to compare account authentication, grants,
+    # role edges and default roles without printing authentication hashes.
+    (
+        MYSQL_GR_LIB_ONLY=1
+        . "$PKG/mysql_gr_migrate.sh"
+        RUN="$WORK/account_validation"; TEMP="$WORK"; mkdir -p "$RUN" "$RUN/actual"
+        sql() { db "$auth" "$socket" "$2"; }
+        export_source_accounts "$RUN/actual" 1 >/dev/null || fail "Account export failed during validation"
+        for file in source_accounts.list source_accounts.sql source_grants.sql source_default_roles.sql; do
+            cmp -s "$PKG/$file" "$RUN/actual/$file" || fail "Account validation differs: $file"
+        done
+    )
+)
+check_package
+case $ACTION in
+stage)
+    [ ! -e "$PKG/stage_path" ] || fail 'Staging already attempted; preserve evidence and build a new package to retry'
+    identity "$OLD_UUID" "$TARGET_AUTH"
+    require_selinux_restore
+    [ "$(db "$TARGET_AUTH" "$SOCKET" 'SELECT COUNT(*) FROM performance_schema.persisted_variables;')" = 0 ] || fail "Persisted target settings require explicit reprovision migration; original is unchanged"
+    [ -d "$DATA" ] && [ ! -L "$DATA" ] || fail 'Original datadir is not a plain directory'
+    capture_launcher
+    [ "$(id -u)" = 0 ] || [ "$(id -u)" = "$(stat -c %u "$DATA")" ] || fail 'Run as original datadir owner or root'
+    [ -z "$(find "$DATA" -type l -print -quit)" ] || fail 'Datadir symlinks require a reviewed storage executor'
+    for variable in log_bin_basename relay_log_basename; do
+        external=$(db "$TARGET_AUTH" "$SOCKET" "SELECT @@$variable;")
+        case $external in "$DATA"/*) :;; *) fail "External $variable requires an explicit retention/rollback plan";; esac
+    done
+    stamp=$(date +%Y%m%d_%H%M%S)_$$
+    STAGE="$DATA.gr_stage_$stamp"
+    STAGE_SOCKET="$STAGE/gr.sock"
+    [ "${#STAGE_SOCKET}" -lt 100 ] || fail 'Staging socket pathname is too long'
+    save stage_path "$STAGE"; save stage_socket "$STAGE_SOCKET"
+    save backup_path "$DATA.gr_backup_$stamp"; save failed_path "$DATA.gr_failed_$stamp"
+    owner=$(stat -c %U "$DATA"); group=$(stat -c %G "$DATA")
+    mkdir "$STAGE"
+    chmod "$(stat -c %a "$DATA")" "$STAGE"
+    chown "$owner:$group" "$STAGE"
+    # Reject external tablespaces and nondefault storage layouts. A fresh
+    # datadir cannot safely replace files living outside it.
+    [ "$(db "$TARGET_AUTH" "$SOCKET" "SELECT COUNT(*) FROM information_schema.INNODB_TABLESPACES WHERE SPACE_TYPE='General' AND NAME<>'mysql';")" = 0 ] || fail 'External/general tablespaces require a reviewed executor'
+    lower=$(db "$TARGET_AUTH" "$SOCKET" 'SELECT @@lower_case_table_names;')
+    "$EXE" --no-defaults --initialize-insecure --user="$owner" --datadir="$STAGE" --lower-case-table-names="$lower" > "$WORK/initialize.log" 2>&1
+    # Staging reads no original option files, has no network listener, and
+    # writes logs only inside its own directory.
+    "$EXE" --no-defaults --user="$owner" --datadir="$STAGE" --socket="$STAGE_SOCKET" --pid-file="$STAGE/gr.pid" --log-error="$STAGE/gr.log" --skip-networking --mysqlx=OFF --event-scheduler=OFF --skip-replica-start=ON --gtid-mode=ON --enforce-gtid-consistency=ON --log-bin=gr-stage-bin --server-id=4294967294 --lower-case-table-names="$lower" --daemonize
+    STAGED_RUNNING=yes
+    { printf 'SET SESSION sql_log_bin=0;\n'; cat "$PKG/source_accounts.sql" "$PKG/source_application.sql" "$PKG/source_grants.sql"; printf 'SET GLOBAL super_read_only=ON;\n'; } | "$MYSQL" --no-defaults --no-login-paths --protocol=SOCKET --socket="$STAGE_SOCKET" -uroot --binary-mode > "$WORK/restore.log" 2>&1
+    staging_validate "$SOURCE_AUTH" "$STAGE_SOCKET"
+    new_uuid=$(db "$SOURCE_AUTH" "$STAGE_SOCKET" 'SELECT @@server_uuid;')
+    [ "$new_uuid" != "$OLD_UUID" ] || fail 'Staging UUID unexpectedly equals original'
+    save new_uuid "$new_uuid"
+    pid=$(cat "$STAGE/gr.pid"); start=$(awk '{print $22}' "/proc/$pid/stat")
+    db "$SOURCE_AUTH" "$STAGE_SOCKET" 'SHUTDOWN;'
+    wait_down "$pid" "$start"
+    STAGED_RUNNING=no
+    # Preserve the exact active TLS files referenced by runtime/CNF. TLS paths
+    # below the datadir must survive the atomic datadir swap at the same relative
+    # path; external absolute TLS paths remain in place and are recorded only.
+    : > "$PKG/runtime_tls_paths.tsv"
+    for variable in ssl_ca ssl_cert ssl_key; do
+        tls_value=$(db "$TARGET_AUTH" "$SOCKET" "SELECT @@$variable;")
+        [ -n "$tls_value" ] || fail "Runtime $variable is empty; cannot preserve TLS across reprovision swap"
+        case $tls_value in /*) tls_path=$tls_value;; *) tls_path="$DATA/$tls_value";; esac
+        [ -f "$tls_path" ] && [ -r "$tls_path" ] || fail "Runtime $variable file is not readable: $tls_path"
+        case $tls_path in
+            "$DATA"/*)
+                rel=${tls_path#"$DATA"/}
+                case $rel in ''|../*|*/../*|*/..) fail "Unsafe TLS path below datadir: $tls_path";; esac
+                (cd "$DATA" && cp -a --parents "$rel" "$STAGE") || fail "Cannot preserve $variable inside staging datadir"
+                printf '%s\tDATADIR\t%s\n' "$variable" "$rel" >> "$PKG/runtime_tls_paths.tsv"
+                ;;
+            *)
+                printf '%s\tEXTERNAL\t%s\n' "$variable" "$tls_path" >> "$PKG/runtime_tls_paths.tsv"
+                ;;
+        esac
+    done
+    # Capture the entire include chain using the reviewed library parser.
+    ( MYSQL_GR_LIB_ONLY=1; . "$PKG/mysql_gr_migrate.sh"; TEMP="$WORK"; cnf_chain_snapshot "$CNF" "$PKG/include_chain.before" "$CWD" )
+    save state STAGED_VALIDATED
+    printf 'STAGED_VALIDATED: %s. Original instance and datadir unchanged.\n' "$STAGE"
+    ;;
+swap)
+    [ "$(field state)" = STAGED_VALIDATED ] || fail 'Validated staging is required'
+    stage_paths
+    identity "$OLD_UUID" "$TARGET_AUTH"
+    [ "$(stat -c '%d:%i' "$DATA")" = "$(field original_inode)" ] || fail 'Original directory identity changed'
+    [ "$(db "$TARGET_AUTH" "$SOCKET" 'SELECT REPLACE(@@gtid_executed,CHAR(10),"");')" = "$(field original_gtid)" ] || fail 'Original GTID changed after staging'
+    [ ! -e "$BACKUP" ] && [ ! -e "$FAILED" ] || fail 'Backup/failed path collision'
+    [ "$(stat -c %d "$DATA")" = "$(stat -c %d "$STAGE")" ] || fail 'Swap must stay on the same filesystem'
+    ( MYSQL_GR_LIB_ONLY=1; . "$PKG/mysql_gr_migrate.sh"; TEMP="$WORK"; cnf_chain_snapshot "$CNF" "$WORK/include_chain.current" "$(field launcher_cwd)" )
+    cmp -s "$PKG/include_chain.before" "$WORK/include_chain.current" || fail 'Configuration/include chain changed since staging'
+    # Refuse a live staging process before any rename.
+    if [ -S "$STAGE_SOCKET" ]; then fail 'Staging socket still exists; verify clean shutdown'; fi
+    pidfile=$(db "$TARGET_AUTH" "$SOCKET" 'SELECT @@pid_file;'); pid=$(cat "$pidfile")
+    [ "$(readlink -f "/proc/$pid/exe")" = "$(field launcher_exe)" ] || fail 'Launcher changed'
+    start=$(awk '{print $22}' "/proc/$pid/stat")
+    save state STOPPING_ORIGINAL
+    db "$TARGET_AUTH" "$SOCKET" 'SHUTDOWN;'
+    wait_down "$pid" "$start"
+    save state ORIGINAL_STOPPED
+    mv -T "$DATA" "$BACKUP"
+    save state ORIGINAL_BACKED_UP
+    if ! mv -T "$STAGE" "$DATA"; then mv -T "$BACKUP" "$DATA"; restore_datadir_context "$DATA" || :; start_original; fail 'Staging move failed; original directory restored'; fi
+    if ! restore_datadir_context "$DATA"; then
+        mv -T "$DATA" "$STAGE" || fail 'SELinux restore failed and staged datadir could not be moved back for rollback'
+        mv -T "$BACKUP" "$DATA" || fail 'SELinux restore failed and original datadir could not be restored'
+        restore_datadir_context "$DATA" || :
+        start_original || :
+        fail 'SELinux context restore failed on swapped datadir; original datadir restore/start attempted. No policy/package was changed.'
+    fi
+    save state SWAPPED
+    if start_original && wait_up "$SOURCE_AUTH" "$(field new_uuid)" && staging_validate "$SOURCE_AUTH" "$SOCKET"; then
+        save state SWAP_VALIDATED
+        printf 'SWAP_VALIDATED. Retained original: %s. New instance remains fenced.\n' "$BACKUP"
+    else
+        printf 'Post-swap validation failed. Run rollback using this same package; original is retained at %s.\n' "$BACKUP" >&2
+        exit 1
+    fi
+    ;;
+rollback)
+    stage_paths
+    case $(field state) in ORIGINAL_BACKED_UP|SWAPPED|SWAP_VALIDATED) :;; *) fail 'State requires manual inspection; no paths moved';; esac
+    [ -d "$BACKUP" ] && [ ! -e "$FAILED" ] || fail 'Rollback backup missing or failed path occupied'
+    [ "$(stat -c '%d:%i' "$BACKUP")" = "$(field original_inode)" ] || fail 'Backup directory identity mismatch'
+    if [ -d "$DATA" ]; then
+        # Never move an unverified or still-running current datadir.
+        identity "$(field new_uuid)" "$SOURCE_AUTH"
+        [ "$(db "$SOURCE_AUTH" "$SOCKET" "SELECT GTID_SUBSET(@@gtid_executed,'$GTID') AND GTID_SUBSET('$GTID',@@gtid_executed);")" = 1 ] || fail 'New transactions exist; rollback requires reconciliation'
+        pidfile=$(db "$SOURCE_AUTH" "$SOCKET" 'SELECT @@pid_file;'); pid=$(cat "$pidfile")
+        start=$(awk '{print $22}' "/proc/$pid/stat")
+        db "$SOURCE_AUTH" "$SOCKET" 'SHUTDOWN;'
+        wait_down "$pid" "$start"
+        mv -T "$DATA" "$FAILED"
+    fi
+    mv -T "$BACKUP" "$DATA"
+    restore_datadir_context "$DATA" || fail 'Original datadir restored but SELinux context restore failed; do not start until host policy/context is corrected'
+    start_original
+    wait_up "$TARGET_AUTH" "$OLD_UUID"
+    identity "$OLD_UUID" "$TARGET_AUTH"
+    [ "$(db "$TARGET_AUTH" "$SOCKET" 'SELECT REPLACE(@@gtid_executed,CHAR(10),"");')" = "$(field original_gtid)" ] || fail 'Original GTID changed during rollback'
+    [ ! -s "$PKG/original_async.sql" ] || db "$TARGET_AUTH" "$SOCKET" "$(cat "$PKG/original_async.sql")"
+    save state ROLLED_BACK
+    printf 'ROLLED_BACK. Original UUID restored; writes, replication auto-start and events remain fenced.\n'
+    ;;
+esac
+MYSQL_GR_REPROVISION_HELPER
+}
+
 build_reprovision_executor() (
     node=$1; expected=$2; directory=$3
     script_dir=${MYSQL_GR_SCRIPT_DIR:-$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)}
-    [ -f "$script_dir/reprovision_helper.sh" ] && [ -f "$script_dir/mysql_gr_migrate.sh" ] || die 'Keep reprovision_helper.sh beside mysql_gr_migrate.sh; set MYSQL_GR_SCRIPT_DIR when sourced'
-    cp "$script_dir/reprovision_helper.sh" "$script_dir/mysql_gr_migrate.sh" "$directory/"
+    [ -f "$script_dir/mysql_gr_migrate.sh" ] || die 'Cannot locate mysql_gr_migrate.sh; set MYSQL_GR_SCRIPT_DIR when sourced'
+    cp "$script_dir/mysql_gr_migrate.sh" "$directory/mysql_gr_migrate.sh"
+    emit_reprovision_helper > "$directory/reprovision_helper.sh"
+    chmod 700 "$directory/reprovision_helper.sh"
     printf '%s\n' "$(get "$node" uuid)" > "$directory/expected_uuid"
     printf '%s\n' "$(val "$node" socket)" > "$directory/expected_socket"
     printf '%s\n' "$(val "$node" datadir)" > "$directory/expected_datadir"
@@ -3004,14 +3536,74 @@ cnf_chain_snapshot() (
     rm -f "$2.unsorted"
 )
 
+tls_remote_apply_helper() (
+    i=$1
+    material=$(cat "$RUN/tls_change/$i.material_path")
+    output=$(cat "$RUN/tls_change/$i.output")
+    file="$RUN/tls_change/node_${i}_apply_tls.sh"
+    [ -r "$material/ca.pem" ] && [ -r "$material/server-cert.pem" ] && [ -r "$material/server-key.pem" ] || die "Node $i remote TLS material missing"
+    cnf=$(get "$i" cnf); case $cnf in /*) :;; *) die "Node $i remote TLS helper requires a proven absolute cnf path from configure";; esac
+    {
+        printf '#!/bin/sh\n# Generated MySQL GR remote TLS apply/rollback helper v%s.\n# Contains the prepared leaf private key, but NO DB password and NO CA private key.\n# Installs no packages and never disables/relaxes SELinux.\nset -eu\numask 077\n' "$VERSION"
+        cat <<'TLS_HELPER_ACTION'
+mode=${1:-apply}
+case $mode in apply) ACTION=tls-apply;; rollback) ACTION=tls-rollback;; *) printf 'Usage: sh %s apply|rollback\n' "$0" >&2; exit 2;; esac
+TLS_HELPER_ACTION
+        printf "DO_RESTART='no'\nSNIPPET=''\n"
+        printf 'VERSION=%s\n' "$(shell_quote "$VERSION")"
+        printf 'EXPECTED_UUID=%s\n' "$(shell_quote "$(get "$i" uuid)")"
+        printf 'EXPECTED_DATA=%s\n' "$(shell_quote "$(val "$i" datadir)")"
+        printf 'EXPECTED_SOCKET=%s\n' "$(shell_quote "$(val "$i" socket)")"
+        printf 'EXPECTED_PID_FILE=%s\n' "$(shell_quote "$(val "$i" pid_file)")"
+        printf 'BASEDIR=%s\n' "$(shell_quote "$(val "$i" basedir)")"
+        printf 'CNF=%s\n' "$(shell_quote "$cnf")"
+        printf 'ADVERTISE=%s\n' "$(shell_quote "$(get "$i" advertise)")"
+        printf 'SQL_PORT=%s\n' "$(shell_quote "$(get "$i" sql_port)")"
+        xcom_value=$(get "$i" xcom); printf 'XCOM_PORT=%s\n' "$(shell_quote "${xcom_value##*:}")"
+        printf 'GR_TLS_MODE=%s\n' "$(shell_quote "$(get meta tls)")"
+        printf 'RECOVERY_CA=%s\n' "$(shell_quote "$(get "$i" recovery_ca)")"
+        printf 'TLS_OUTPUT=%s\n' "$(shell_quote "$output")"
+        printf 'TLS_CA_PEM=%s\n' "$(shell_quote "$(cat "$material/ca.pem")")"
+        printf 'TLS_CERT_PEM=%s\n' "$(shell_quote "$(cat "$material/server-cert.pem")")"
+        printf 'TLS_KEY_PEM=%s\n' "$(shell_quote "$(cat "$material/server-key.pem")")"
+        printf 'DEFAULT_DB_USER=%s\n' "$(shell_quote "$(get "$i" user)")"
+        cat <<'TLS_APPLY_AUTH'
+printf 'Socket MySQL admin user [%s]: ' "$DEFAULT_DB_USER" >&2
+IFS= read -r db_user || exit 1; db_user=${db_user:-$DEFAULT_DB_USER}
+printf 'Socket MySQL admin password: ' >&2
+saved_tty=''
+if [ -t 0 ]; then saved_tty=$(stty -g); trap 'stty "$saved_tty"' 0; trap 'exit 1' 1 2 15; stty -echo; fi
+IFS= read -r db_password || exit 1
+[ -z "$saved_tty" ] || stty "$saved_tty"
+trap - 0 1 2 15
+printf '\n' >&2
+manual_option_quote() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+CLIENT_AUTH=$(printf 'user="%s"\npassword="%s"' "$(manual_option_quote "$db_user")" "$(manual_option_quote "$db_password")")
+unset db_password
+TLS_APPLY_AUTH
+        remote_agent
+    } > "$file"
+    chmod 700 "$file"
+    sh -n "$file" || die "Node $i generated remote TLS apply helper has invalid POSIX sh syntax"
+    log "Node $i remote TLS helper: $file"
+)
+
 tls_restore() (
     failed=0
     for node in $(ids); do
         [ -f "$RUN/tls_change/$node.applied" ] || continue
-        cnf=$(get "$node" cnf)
-        if [ -f "$RUN/tls_change/$node.cnf.before" ]; then
-            cat "$RUN/tls_change/$node.cnf.before" > "$cnf" || failed=1
+        if [ "$(get "$node" location)" = remote ]; then
+            if command -v ssh >/dev/null 2>&1; then
+                remote_call "$node" tls-rollback > "$RUN/tls_change/$node.rollback.log" 2>&1 || failed=1
+            else
+                log "URGENT: Node $node remote TLS was applied but OpenSSH is unavailable for automatic rollback. Run: sh $RUN/tls_change/node_${node}_apply_tls.sh rollback"
+                failed=1
+            fi
+            cat "$RUN/tls_change/$node.recovery_ca.before" > "$ROOT/$node/recovery_ca" || failed=1
+            continue
         fi
+        cnf=$(get "$node" cnf)
+        if [ -f "$RUN/tls_change/$node.cnf.before" ]; then cat "$RUN/tls_change/$node.cnf.before" > "$cnf" || failed=1; fi
         sql "$node" "$(cat "$RUN/tls_change/$node.runtime_restore.sql")" > "$RUN/tls_change/$node.rollback.log" 2>&1 || failed=1
         cat "$RUN/tls_change/$node.recovery_ca.before" > "$ROOT/$node/recovery_ca" || failed=1
     done
@@ -3022,9 +3614,108 @@ tls_plan_manifest() (
     manifest="$RUN/tls_change/manifest.sha256"
     : > "$manifest"
     for node in $(ids); do
-        directory=$(cat "$RUN/tls_change/$node.output")
-        sha256sum "$directory/ca.pem" "$directory/server-cert.pem" "$directory/server-key.pem" "$RUN/tls_change/$node.output" "$RUN/tls_change/$node.cnf.candidate" "$RUN/tls_change/$node.cnf.before" "$RUN/tls_change/$node.runtime_restore.sql" "$RUN/tls_change/$node.recovery_ca.before" "$RUN/tls_change/$node.include.before" >> "$manifest" || exit 1
+        material=$(cat "$RUN/tls_change/$node.material_path")
+        if [ "$(get "$node" location)" = remote ]; then
+            sha256sum "$material/ca.pem" "$material/server-cert.pem" "$material/server-key.pem" "$RUN/tls_change/$node.output" "$RUN/tls_change/$node.material_path" "$RUN/tls_change/$node.recovery_ca.before" "$RUN/tls_change/node_${node}_apply_tls.sh" >> "$manifest" || exit 1
+        else
+            sha256sum "$material/ca.pem" "$material/server-cert.pem" "$material/server-key.pem" "$RUN/tls_change/$node.output" "$RUN/tls_change/$node.material_path" "$RUN/tls_change/$node.cnf.candidate" "$RUN/tls_change/$node.cnf.before" "$RUN/tls_change/$node.runtime_restore.sql" "$RUN/tls_change/$node.recovery_ca.before" "$RUN/tls_change/$node.include.before" "$RUN/tls_change/node_${node}_apply_tls.sh" >> "$manifest" || exit 1
+        fi
     done
+)
+
+tls_selinux_prepare_local() (
+    node=$1; output=$2; datadir=$3
+    mode=Disabled
+    if command -v getenforce >/dev/null 2>&1; then mode=$(getenforce 2>/dev/null || printf 'Unknown'); fi
+    printf '%s\n' "$mode" > "$RUN/tls_change/$node.selinux_mode"
+    case $mode in Enforcing|Permissive)
+        command -v restorecon >/dev/null 2>&1 || die "Node $node SELinux is $mode but restorecon is unavailable. No package will be installed automatically; configure the existing OS SELinux tooling/policy manually."
+        old_cert=$(val "$node" ssl_cert)
+        case $old_cert in /*) :;; *) old_cert="$datadir/$old_cert";; esac
+        [ -r "$old_cert" ] || die "Node $node active TLS certificate is not readable for SELinux context comparison: $old_cert"
+        old_ctx=$(stat -c %C "$old_cert" 2>/dev/null || :)
+        old_type=$(printf '%s' "$old_ctx" | awk -F: 'NF>=3 {print $3}')
+        [ -n "$old_type" ] && [ "$old_type" != '?' ] || die "Node $node cannot determine the active TLS SELinux type; no policy change was attempted"
+        restorecon -R "$output" > "$RUN/tls_change/$node.restorecon.log" 2>&1 || die "Node $node restorecon failed; no package/policy is installed automatically. Evidence: $RUN/tls_change/$node.restorecon.log"
+        new_ctx=$(stat -c %C "$output/server-cert.pem" 2>/dev/null || :)
+        new_type=$(printf '%s' "$new_ctx" | awk -F: 'NF>=3 {print $3}')
+        {
+            printf 'active_cert\t%s\nactive_context\t%s\n' "$old_cert" "$old_ctx"
+            printf 'new_cert\t%s\nnew_context\t%s\n' "$output/server-cert.pem" "$new_ctx"
+        } > "$RUN/tls_change/$node.selinux_context"
+        [ "$new_type" = "$old_type" ] || die "Node $node new TLS SELinux type ($new_type) differs from the proven active certificate type ($old_type). No semanage/chcon/package installation is performed automatically; place/label the certificate according to the host's existing persistent SELinux policy. Evidence: $RUN/tls_change/$node.selinux_context"
+        ;;
+    esac
+)
+
+selinux_port_contains_local() (
+    wanted=$1
+    command -v semanage >/dev/null 2>&1 || exit 2
+    ports="$TEMP/mysqld_ports.$$"
+    raw="$TEMP/semanage_ports.$$"
+    semanage port -l > "$raw" 2>/dev/null || { rm -f "$raw" "$ports"; exit 2; }
+    awk '$1=="mysqld_port_t" && $2=="tcp" {for(i=3;i<=NF;i++) print $i}' "$raw" | tr ',' '\n' | tr -d ' ' > "$ports" || { rm -f "$raw" "$ports"; exit 2; }
+    rm -f "$raw"
+    while IFS= read -r spec; do
+        [ -n "$spec" ] || continue
+        case $spec in
+            *-*) lo=${spec%-*}; hi=${spec#*-}; case $lo:$hi in *[!0-9:]*|:*) continue;; esac; [ "$wanted" -ge "$lo" ] && [ "$wanted" -le "$hi" ] && { rm -f "$ports"; exit 0; };;
+            *) [ "$wanted" = "$spec" ] && { rm -f "$ports"; exit 0; };;
+        esac
+    done < "$ports"
+    rm -f "$ports"
+    exit 1
+)
+
+selinux_gr_port_preflight_local() (
+    node=$1
+    mode=Disabled
+    if command -v getenforce >/dev/null 2>&1; then mode=$(getenforce 2>/dev/null || printf 'Unknown'); fi
+    case $mode in Enforcing|Permissive) :;; *) exit 0;; esac
+    pid=$(local_pid "$node") || die "Node $node cannot prove local mysqld identity for SELinux port preflight"
+    domain=$(tr -d '\000' < "/proc/$pid/attr/current" 2>/dev/null || :)
+    printf '%s\n' "$domain" > "$RUN/tls/$node.selinux_process_domain"
+    case $domain in *:mysqld_t:*) :;; *) log "Node $node SELinux port preflight: mysqld is not in mysqld_t ($domain); no policy is changed."; exit 0;; esac
+    xcom=$(get "$node" xcom); xport=${xcom##*:}
+    case $xport in ''|*[!0-9]*) die "Node $node invalid XCom port for SELinux preflight";; esac
+    if selinux_port_contains_local "$xport"; then
+        printf 'XCOM_PORT\t%s\tmysqld_port_t\n' "$xport" > "$RUN/tls/$node.selinux_xcom_port"
+        exit 0
+    else
+        rc=$?
+    fi
+    if [ "$rc" -eq 2 ]; then
+        die "Node $node SELinux is $mode and mysqld runs in mysqld_t, but semanage is unavailable for read-only XCom port verification. No package is installed automatically; verify the existing host SELinux port policy manually before GR."
+    fi
+    die "Node $node XCom port $xport is not registered as mysqld_port_t. No semanage/policy change is performed automatically; register/review the port on that host before GR."
+)
+
+tls_capture_avc_local() (
+    node=$1
+    out="$RUN/tls_change/$node.avc.log"
+    if command -v ausearch >/dev/null 2>&1; then
+        ausearch -m AVC,USER_AVC -ts recent > "$out" 2>&1 || :
+    elif [ -r /var/log/audit/audit.log ]; then
+        grep -i 'avc:.*denied' /var/log/audit/audit.log | tail -100 > "$out" 2>/dev/null || :
+    else
+        printf '%s\n' 'AVC evidence unavailable: ausearch/audit.log not present. No package was installed.' > "$out"
+    fi
+)
+
+tls_prepare_local_files() (
+    node=$1; material=$2; output=$3; datadir=$4
+    case $output in "$datadir"/*) :;; *) die "Node $node TLS output must be below the proven active datadir";; esac
+    [ ! -e "$output" ] || die "Node $node TLS output already exists; preserve/review it before retrying: $output"
+    [ -r "$material/ca.pem" ] && [ -r "$material/server-cert.pem" ] && [ -r "$material/server-key.pem" ] || die "Node $node prepared TLS material is incomplete"
+    mkdir "$output" || die "Node $node cannot create TLS output directory"
+    chmod 700 "$output"
+    cp "$material/ca.pem" "$output/ca.pem"
+    cp "$material/server-cert.pem" "$output/server-cert.pem"
+    cp "$material/server-key.pem" "$output/server-key.pem"
+    chmod 644 "$output/ca.pem" "$output/server-cert.pem"
+    chmod 600 "$output/server-key.pem"
+    chown -R "$(stat -c %u "$datadir"):$(stat -c %g "$datadir")" "$output"
+    tls_selinux_prepare_local "$node" "$output" "$datadir"
 )
 
 tls_apply_plan() (
@@ -3033,23 +3724,81 @@ tls_apply_plan() (
     [ -d "$plan" ] && [ "$(basename "$plan")" = tls_change ] || die 'Invalid prepared TLS plan'
     RUN=$(dirname "$plan")
     sha256sum -c "$plan/manifest.sha256" > "$plan/apply_checksum.log" 2>&1 || die 'Prepared TLS plan/certificates changed; no settings applied'
+
+    # Prove every remote OS path before changing any node. If SSH is absent or
+    # unusable, stop before mutation and use the generated copyable helper.
+    manual_required=no
+    for node in $(ids); do
+        [ "$(get "$node" location)" = remote ] || continue
+        if ! command -v ssh >/dev/null 2>&1; then
+            manual_required=yes
+            log "Node $node: OpenSSH unavailable. Use: sh $plan/node_${node}_apply_tls.sh apply"
+            continue
+        fi
+        ssh_options "$node"
+        if ! remote_call "$node" inspect > "$plan/$node.remote_apply_preflight" 2>&1; then
+            manual_required=yes
+            log "Node $node: SSH/host identity preflight failed. Use copyable helper: $plan/node_${node}_apply_tls.sh"
+        fi
+    done
+    if [ "$manual_required" = yes ]; then
+        all_applied=yes
+        for node in $(ids); do
+            output=$(cat "$RUN/tls_change/$node.output")
+            actual=$(sql "$node" "SELECT CONCAT(@@ssl_ca,'|',@@ssl_cert,'|',@@ssl_key);")
+            [ "$actual" = "$output/ca.pem|$output/server-cert.pem|$output/server-key.pem" ] || all_applied=no
+        done
+        if [ "$all_applied" = yes ]; then
+            for node in $(ids); do output=$(cat "$RUN/tls_change/$node.output"); put "$node" recovery_ca "$output/ca.pem"; done
+            tls_preflight
+            log 'TLS MANUAL APPLY VERIFIED: every node runtime path and current certificate matches the prepared plan; controller metadata updated.'
+            return 0
+        fi
+        log 'At least one remote host cannot be managed over SSH. To avoid an unrollable mixed state, this invocation will change NO node.'
+        for node in $(ids); do
+            if [ "$(get "$node" location)" = remote ]; then
+                log "Node $node host: copy $plan/node_${node}_apply_tls.sh there and run: sh node_${node}_apply_tls.sh apply > node_${node}_tls_remote_evidence.tsv"
+                log "Then copy that stdout evidence to controller path: $ROOT/$node/tls_remote_evidence.tsv"
+            else
+                log "Node $node local host: sh $plan/node_${node}_apply_tls.sh apply"
+            fi
+        done
+        die 'Manual all-host TLS application required because at least one remote OS path is unavailable. No node was changed by this apply invocation; no package was installed.'
+    fi
+
     confirm 'APPLY VERIFIED TLS CERTIFICATES'
     tls_ok=no
     trap 'rc=$?; trap - 0 1 2 15; if [ "$tls_ok" != yes ]; then tls_restore || log "URGENT: TLS rollback incomplete; inspect $RUN/tls_change"; fi; exit "$rc"' 0
     trap 'exit 130' 2; trap 'exit 143' 1 15
     for node in $(ids); do
+        output=$(cat "$RUN/tls_change/$node.output")
+        if [ "$(get "$node" location)" = remote ]; then
+            if ! remote_call "$node" tls-apply > "$RUN/tls_change/$node.remote_apply.log" 2>&1; then
+                remote_call "$node" tls-rollback >> "$RUN/tls_change/$node.remote_apply.log" 2>&1 || :
+                die "Node $node remote TLS apply failed; host-side rollback was attempted. Evidence: $RUN/tls_change/$node.remote_apply.log"
+            fi
+            : > "$RUN/tls_change/$node.applied"
+            put "$node" recovery_ca "$output/ca.pem"
+            continue
+        fi
         pid=$(local_pid "$node") || die 'TLS target identity changed before apply'
-        cnf=$(get "$node" cnf); output=$(cat "$RUN/tls_change/$node.output")
+        cnf=$(get "$node" cnf)
         cnf_chain_snapshot "$cnf" "$RUN/tls_change/$node.include.current" "$(readlink -f "/proc/$pid/cwd")"
         cmp -s "$RUN/tls_change/$node.include.before" "$RUN/tls_change/$node.include.current" || die 'TLS configuration include chain changed concurrently'
+        datadir=$(val "$node" datadir); datadir=${datadir%/}
+        material=$(cat "$RUN/tls_change/$node.material_path")
+        tls_prepare_local_files "$node" "$material" "$output" "$datadir"
         : > "$RUN/tls_change/$node.applied"
         cat "$RUN/tls_change/$node.cnf.candidate" > "$cnf"
-        sql "$node" "SET GLOBAL ssl_ca='$(q "$output/ca.pem")'; SET GLOBAL ssl_cert='$(q "$output/server-cert.pem")'; SET GLOBAL ssl_key='$(q "$output/server-key.pem")'; ALTER INSTANCE RELOAD TLS;"
+        if ! sql "$node" "SET GLOBAL ssl_ca='$(q "$output/ca.pem")'; SET GLOBAL ssl_cert='$(q "$output/server-cert.pem")'; SET GLOBAL ssl_key='$(q "$output/server-key.pem")'; ALTER INSTANCE RELOAD TLS;"; then
+            tls_capture_avc_local "$node"
+            die "Node $node TLS reload failed. Automatic rollback will restore the previous cnf/runtime TLS settings. SELinux evidence (when available): $RUN/tls_change/$node.avc.log"
+        fi
         put "$node" recovery_ca "$output/ca.pem"
     done
     tls_preflight
     tls_ok=yes
-    log "TLS APPLIED: cross-member CA/SAN verified; existing connections retained. Evidence: $RUN/tls_change"
+    log "TLS APPLIED: local/remote cross-member CA/SAN verified; existing connections retained. Evidence: $RUN/tls_change"
 )
 
 tls() (
@@ -3058,97 +3807,236 @@ tls() (
     case $tls_action in plan) :;; apply) tls_apply_plan; exit $?;; *) die 'MYSQL_GR_TLS_ACTION must be plan or apply';; esac
     connected; no_group
     command -v openssl >/dev/null 2>&1 || die 'Existing openssl required; no packages will be installed'
-    mkdir -p "$RUN/tls_change"
+    mkdir -p "$RUN/tls_change" "$RUN/tls"
     ca_default=$(val 1 ssl_ca)
     case $ca_default in /*) :;; *) ca_default="$(val 1 datadir)/$ca_default";; esac
-    authority=$(required 'Existing signing CA certificate path' "$ca_default")
-    signing_key=$(required 'Existing signing CA private key path' "$(dirname "$authority")/ca-key.pem")
+    [ -r "$ca_default" ] || ca_default=''
+    authority=$(required 'Existing signing CA certificate path on this controller' "$ca_default")
+    signing_key=$(required 'Existing signing CA private key path on this controller' "$(dirname "$authority")/ca-key.pem")
     days=$(required 'Certificate validity in days' 365)
     uint "$days" && [ "$days" -gt 0 ] && [ "$days" -le 3650 ] || die 'Invalid certificate lifetime'
-    openssl x509 -in "$authority" -noout -checkend "$((days*86400))" > "$RUN/tls_change/ca_expiry.log" 2>&1 || die 'CA expires before the requested certificate lifetime'
-    openssl x509 -in "$authority" -pubkey -noout > "$RUN/tls_change/ca.pub" || die 'Cannot read signing CA'
+    authority_normalized="$RUN/tls_change/signing_ca.normalized.pem"
+    tr -d '\000' < "$authority" > "$authority_normalized" || die 'Cannot normalize signing CA PEM'
+    openssl x509 -in "$authority_normalized" -noout -checkend "$((days*86400))" > "$RUN/tls_change/ca_expiry.log" 2>&1 || die 'CA expires before the requested certificate lifetime'
+    openssl x509 -in "$authority_normalized" -pubkey -noout > "$RUN/tls_change/ca.pub" || die 'Cannot read signing CA'
     openssl pkey -in "$signing_key" -pubout > "$RUN/tls_change/ca_key.pub" 2>/dev/null || die 'Cannot access signing CA key'
     cmp -s "$RUN/tls_change/ca.pub" "$RUN/tls_change/ca_key.pub" || die 'CA certificate/key mismatch'
     stamp=$(date +%Y%m%d_%H%M%S)_$$
+
     for node in $(ids); do
-        [ "$(get "$node" location)" = local ] || die 'Remote certificate deployment requires running this preparation on the actual host; controller paths are not assumed'
-        pid=$(local_pid "$node") || die 'Cannot prove TLS target process identity'
-        cnf=$(get "$node" cnf)
-        [ -f "$cnf" ] && [ ! -L "$cnf" ] || die 'TLS deployment requires a proven regular main cnf'
-        [ "$(sql "$node" "SELECT COUNT(*) FROM performance_schema.persisted_variables WHERE VARIABLE_NAME IN ('ssl_ca','ssl_cert','ssl_key');")" = 0 ] || die 'Existing persisted TLS overrides require explicit migration before cnf deployment'
+        [ "$(sql "$node" "SELECT COUNT(*) FROM performance_schema.persisted_variables WHERE VARIABLE_NAME IN ('ssl_ca','ssl_cert','ssl_key');")" = 0 ] || die "Node $node existing persisted TLS overrides require explicit migration before cnf deployment"
         datadir=$(val "$node" datadir); datadir=${datadir%/}
-        output="$(dirname "$datadir")/gr_tls_${node}_$stamp"
-        [ ! -e "$output" ] || die 'TLS output path collision'
-        mkdir "$output"; chmod 700 "$output"
+        output="$datadir/gr_tls_${node}_$stamp"
+        printf '%s\n' "$output" > "$RUN/tls_change/$node.output"
         host=$(get "$node" advertise); safe_host "$host"
         case $host in *[!0-9.]*) san="DNS:$host";; *) san="IP:$host";; esac
         printf 'basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth,clientAuth\nsubjectAltName=%s\n' "$san" > "$RUN/tls_change/$node.extensions"
-        openssl req -new -newkey rsa:3072 -nodes -subj "/CN=$host" -keyout "$output/server-key.pem" -out "$RUN/tls_change/$node.csr" > "$RUN/tls_change/$node.issue.log" 2>&1 || die 'TLS key/CSR generation failed'
+
+        material="$RUN/tls_change/$node.material"
+        [ ! -e "$material" ] || die "Node $node TLS material path collision"
+        mkdir "$material"; chmod 700 "$material"
+        if [ "$(get "$node" location)" = remote ]; then
+            tls_remote_export "$node"
+            old_ca="$RUN/tls/$node.ca.pem"
+        else
+            pid=$(local_pid "$node") || die 'Cannot prove TLS target process identity'
+            cnf=$(get "$node" cnf)
+            [ -f "$cnf" ] && [ ! -L "$cnf" ] || die 'TLS deployment requires a proven regular main cnf'
+            old_ca=$(val "$node" ssl_ca)
+            case $old_ca in /*) :;; *) old_ca="$datadir/$old_ca";; esac
+        fi
+        printf '%s\n' "$material" > "$RUN/tls_change/$node.material_path"
+
+        openssl req -new -newkey rsa:3072 -nodes -subj "/CN=$host" -keyout "$material/server-key.pem" -out "$RUN/tls_change/$node.csr" > "$RUN/tls_change/$node.issue.log" 2>&1 || die 'TLS key/CSR generation failed'
         serial=$(openssl rand -hex 16)
-        openssl x509 -req -in "$RUN/tls_change/$node.csr" -CA "$authority" -CAkey "$signing_key" -set_serial "0x$serial" -days "$days" -sha256 -extfile "$RUN/tls_change/$node.extensions" -out "$output/server-cert.pem" >> "$RUN/tls_change/$node.issue.log" 2>&1 || die 'TLS certificate signing failed'
-        cat "$authority" > "$output/ca.pem"
-        old_ca=$(val "$node" ssl_ca)
-        case $old_ca in /*) :;; *) old_ca="$datadir/$old_ca";; esac
-        # Retain existing client-certificate trust while adding the selected CA.
-        [ ! -r "$old_ca" ] || cmp -s "$authority" "$old_ca" || cat "$old_ca" >> "$output/ca.pem"
-        chmod 600 "$output/server-key.pem"; chmod 644 "$output/ca.pem" "$output/server-cert.pem"
-        chown -R "$(stat -c %u "$datadir"):$(stat -c %g "$datadir")" "$output"
-        printf '%s\n' "$output" > "$RUN/tls_change/$node.output"
+        openssl x509 -req -in "$RUN/tls_change/$node.csr" -CA "$authority_normalized" -CAkey "$signing_key" -set_serial "0x$serial" -days "$days" -sha256 -extfile "$RUN/tls_change/$node.extensions" -out "$material/server-cert.pem" >> "$RUN/tls_change/$node.issue.log" 2>&1 || die 'TLS certificate signing failed'
+        cat "$authority_normalized" > "$material/ca.pem"
+        # Preserve pre-existing client-certificate trust on each host. MySQL
+        # generated PEM files can contain a trailing NUL byte; normalize only the
+        # copied evidence/material and never modify the active source file.
+        if [ -r "$old_ca" ]; then
+            normalized_old_ca="$RUN/tls/$node.old_ca.normalized.pem"
+            tr -d '\000' < "$old_ca" > "$normalized_old_ca"
+            openssl x509 -in "$normalized_old_ca" -noout >/dev/null 2>&1 || die "Node $node existing TLS CA is not a valid PEM certificate/bundle"
+            cmp -s "$authority_normalized" "$normalized_old_ca" || cat "$normalized_old_ca" >> "$material/ca.pem"
+        fi
+        chmod 600 "$material/server-key.pem"; chmod 644 "$material/ca.pem" "$material/server-cert.pem"
+        cp "$ROOT/$node/recovery_ca" "$RUN/tls_change/$node.recovery_ca.before"
+
+        tls_remote_apply_helper "$node"
+        if [ "$(get "$node" location)" = remote ]; then
+            continue
+        fi
         cnf_chain_snapshot "$cnf" "$RUN/tls_change/$node.include.before" "$(readlink -f "/proc/$pid/cwd")"
         cp -p "$cnf" "$RUN/tls_change/$node.cnf.before"
-        cp "$ROOT/$node/recovery_ca" "$RUN/tls_change/$node.recovery_ca.before"
         sql "$node" "SELECT CONCAT('SET GLOBAL ssl_ca=',QUOTE(@@ssl_ca),'; SET GLOBAL ssl_cert=',QUOTE(@@ssl_cert),'; SET GLOBAL ssl_key=',QUOTE(@@ssl_key),'; ALTER INSTANCE RELOAD TLS;');" > "$RUN/tls_change/$node.runtime_restore.sql"
         sed '/^# BEGIN mysql_gr_tls$/,/^# END mysql_gr_tls$/d' "$cnf" > "$RUN/tls_change/$node.cnf.candidate"
         printf '\n# BEGIN mysql_gr_tls\n[mysqld]\nssl_ca=%s/ca.pem\nssl_cert=%s/server-cert.pem\nssl_key=%s/server-key.pem\n# END mysql_gr_tls\n' "$output" "$output" "$output" >> "$RUN/tls_change/$node.cnf.candidate"
         exe=$(readlink -f "/proc/$pid/exe")
         "$exe" --defaults-file="$RUN/tls_change/$node.cnf.candidate" --validate-config > "$RUN/tls_change/$node.config_validation.log" 2>&1 || die 'TLS candidate cnf validation failed'
     done
+
     for donor in $(ids); do
-        output=$(cat "$RUN/tls_change/$donor.output")
+        donor_material=$(cat "$RUN/tls_change/$donor.material_path")
         host=$(get "$donor" advertise)
         for receiver in $(ids); do
-            trust=$(cat "$RUN/tls_change/$receiver.output")
+            trust=$(cat "$RUN/tls_change/$receiver.material_path")
             case $host in *[!0-9.]*) set -- -verify_hostname "$host";; *) set -- -verify_ip "$host";; esac
-            openssl verify -CAfile "$trust/ca.pem" -purpose sslserver "$@" "$output/server-cert.pem" > "$RUN/tls_change/$receiver-to-$donor.verify" 2>&1 || die 'Proposed cross-member CA/SAN validation failed'
-            openssl verify -CAfile "$trust/ca.pem" -purpose sslclient "$output/server-cert.pem" >> "$RUN/tls_change/$receiver-to-$donor.verify" 2>&1 || die 'Proposed XCom client certificate validation failed'
+            openssl verify -CAfile "$trust/ca.pem" -purpose sslserver "$@" "$donor_material/server-cert.pem" > "$RUN/tls_change/$receiver-to-$donor.verify" 2>&1 || die 'Proposed cross-member CA/SAN validation failed'
+            openssl verify -CAfile "$trust/ca.pem" -purpose sslclient "$donor_material/server-cert.pem" >> "$RUN/tls_change/$receiver-to-$donor.verify" 2>&1 || die 'Proposed XCom client certificate validation failed'
         done
     done
-    if [ "$tls_action" = plan ]; then
-        tls_plan_manifest
-        printf '%s\n' "$RUN/tls_change" > "$ROOT/meta/tls_plan"
-        log "TLS PLAN VERIFIED: $RUN/tls_change. No running TLS context or cnf was changed."
-        return 0
-    fi
+    tls_plan_manifest
+    printf '%s\n' "$RUN/tls_change" > "$ROOT/meta/tls_plan"
+    log "TLS PLAN VERIFIED: $RUN/tls_change. Runtime/cnf unchanged. Remote nodes have copyable host helpers; no package or SELinux policy was installed."
+)
 
+tls_remote_inspect_helper() (
+    i=$1; kind=${2:-inspect}
+    case $kind in inspect) action=tls-inspect; evidence_name=tls_remote_evidence.tsv;; export) action=tls-export; evidence_name=tls_remote_export.tsv;; *) die 'Invalid remote TLS helper kind';; esac
+    file="$RUN/node_${i}_tls_${kind}.sh"
+    {
+        printf '#!/bin/sh\n# Generated MySQL GR TLS host-side %s helper v%s.\n# No DB password, CA private key, or package installer is embedded.\nset -eu\numask 077\n' "$kind" "$VERSION"
+        printf 'ACTION=%s\n' "$(shell_quote "$action")"
+        printf "DO_RESTART='no'\nSNIPPET=''\nCNF=''\n"
+        printf 'VERSION=%s\n' "$(shell_quote "$VERSION")"
+        printf 'EXPECTED_UUID=%s\n' "$(shell_quote "$(get "$i" uuid)")"
+        printf 'EXPECTED_DATA=%s\n' "$(shell_quote "$(val "$i" datadir)")"
+        printf 'EXPECTED_SOCKET=%s\n' "$(shell_quote "$(val "$i" socket)")"
+        printf 'EXPECTED_PID_FILE=%s\n' "$(shell_quote "$(val "$i" pid_file)")"
+        printf 'BASEDIR=%s\n' "$(shell_quote "$(val "$i" basedir)")"
+        printf 'ADVERTISE=%s\n' "$(shell_quote "$(get "$i" advertise)")"
+        printf 'SQL_PORT=%s\n' "$(shell_quote "$(get "$i" sql_port)")"
+        xcom_value=$(get "$i" xcom); printf 'XCOM_PORT=%s\n' "$(shell_quote "${xcom_value##*:}")"
+        printf 'GR_TLS_MODE=%s\n' "$(shell_quote "$(get meta tls)")"
+        printf 'RECOVERY_CA=%s\n' "$(shell_quote "$(get "$i" recovery_ca)")"
+        printf 'DEFAULT_DB_USER=%s\n' "$(shell_quote "$(get "$i" user)")"
+        cat <<'TLS_MANUAL_AUTH'
+printf 'Socket MySQL admin user [%s]: ' "$DEFAULT_DB_USER" >&2
+IFS= read -r db_user || exit 1; db_user=${db_user:-$DEFAULT_DB_USER}
+printf 'Socket MySQL admin password: ' >&2
+saved_tty=''
+if [ -t 0 ]; then
+    saved_tty=$(stty -g); trap 'stty "$saved_tty"' 0; trap 'exit 1' 1 2 15; stty -echo
+fi
+IFS= read -r db_password || exit 1
+[ -z "$saved_tty" ] || stty "$saved_tty"
+trap - 0 1 2 15
+printf '\n' >&2
+manual_option_quote() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+CLIENT_AUTH=$(printf 'user="%s"\npassword="%s"' "$(manual_option_quote "$db_user")" "$(manual_option_quote "$db_password")")
+unset db_password
+TLS_MANUAL_AUTH
+        remote_agent
+    } > "$file"
+    chmod 700 "$file"
+    sh -n "$file" || die 'Generated remote TLS host helper has invalid POSIX sh syntax'
+    log "Node $i remote TLS $kind helper generated: $file"
+    log "Run it on that MySQL host and save stdout, then copy the evidence to: $ROOT/$i/$evidence_name"
+    log 'The helper installs nothing and changes no MySQL/OS setting; it only reads identity/TLS files and host security state.'
+)
+
+tls_remote_export() (
+    i=$1; evidence="$RUN/tls/$i.remote_export.tsv"
+    if command -v ssh >/dev/null 2>&1; then
+        ssh_options "$i"
+        if remote_call "$i" tls-export > "$evidence" 2> "$RUN/tls/$i.remote_export.err"; then :
+        elif [ -s "$ROOT/$i/tls_remote_export.tsv" ]; then cp "$ROOT/$i/tls_remote_export.tsv" "$evidence"
+        else tls_remote_inspect_helper "$i" export; die "Node $i SSH TLS export failed and no manual export evidence is present"; fi
+    elif [ -s "$ROOT/$i/tls_remote_export.tsv" ]; then
+        cp "$ROOT/$i/tls_remote_export.tsv" "$evidence"
+    else
+        tls_remote_inspect_helper "$i" export
+        die "Node $i remote TLS CA export requires the generated host helper because OpenSSH is unavailable. No package will be installed automatically."
+    fi
+    [ "$(awk -F '\t' '$1=="UUID" {print $2;exit}' "$evidence")" = "$(get "$i" uuid)" ] || die "Node $i remote TLS export UUID mismatch"
+    [ "$(awk -F '\t' '$1=="TLS_INSPECT" {print $2;exit}' "$evidence")" = PASSED ] || die "Node $i remote TLS export evidence is incomplete"
+    awk -F '\t' '$1=="TLS_CA_PEM" {sub(/^[^\t]*\t/,""); print}' "$evidence" > "$RUN/tls/$i.ca.pem"
+    awk -F '\t' '$1=="TLS_RECOVERY_CA_PEM" {sub(/^[^\t]*\t/,""); print}' "$evidence" > "$RUN/tls/$i.recovery_ca.pem"
+    openssl x509 -in "$RUN/tls/$i.ca.pem" -noout >/dev/null 2>&1 || die "Node $i exported TLS CA is invalid"
+    openssl x509 -in "$RUN/tls/$i.recovery_ca.pem" -noout >/dev/null 2>&1 || die "Node $i exported recovery CA is invalid"
+)
+
+tls_remote_collect() (
+    i=$1; evidence="$RUN/tls/$i.remote.tsv"
+    if command -v ssh >/dev/null 2>&1; then
+        ssh_options "$i"
+        if remote_call "$i" tls-inspect > "$evidence" 2> "$RUN/tls/$i.remote.err"; then
+            :
+        elif [ -s "$ROOT/$i/tls_remote_evidence.tsv" ]; then
+            cp "$ROOT/$i/tls_remote_evidence.tsv" "$evidence"
+        else
+            tls_remote_inspect_helper "$i"
+            die "Node $i SSH TLS inspection failed and no manual host evidence is present. Evidence: $RUN/tls/$i.remote.err"
+        fi
+    elif [ -s "$ROOT/$i/tls_remote_evidence.tsv" ]; then
+        cp "$ROOT/$i/tls_remote_evidence.tsv" "$evidence"
+    else
+        tls_remote_inspect_helper "$i"
+        die "Node $i is remote and OpenSSH is unavailable. No package will be installed automatically; run the generated host helper and copy its output to $ROOT/$i/tls_remote_evidence.tsv, then rerun precheck."
+    fi
+    [ "$(awk -F '\t' '$1=="UUID" {print $2;exit}' "$evidence")" = "$(get "$i" uuid)" ] || die "Node $i remote TLS evidence UUID mismatch"
+    [ "$(awk -F '\t' '$1=="TLS_INSPECT" {print $2;exit}' "$evidence")" = PASSED ] || die "Node $i remote TLS evidence is incomplete/failed"
+    awk -F '\t' '$1=="TLS_CA_PEM" {sub(/^[^\t]*\t/,""); print}' "$evidence" > "$RUN/tls/$i.ca.pem"
+    awk -F '\t' '$1=="TLS_RECOVERY_CA_PEM" {sub(/^[^\t]*\t/,""); print}' "$evidence" > "$RUN/tls/$i.recovery_ca.pem"
+    awk -F '\t' '$1=="TLS_CERT_PEM" {sub(/^[^\t]*\t/,""); print}' "$evidence" > "$RUN/tls/$i.cert.pem"
+    openssl x509 -in "$RUN/tls/$i.ca.pem" -noout >/dev/null 2>&1 || die "Node $i remote TLS CA evidence is invalid"
+    openssl x509 -in "$RUN/tls/$i.recovery_ca.pem" -noout >/dev/null 2>&1 || die "Node $i remote recovery CA evidence is invalid"
+    openssl x509 -in "$RUN/tls/$i.cert.pem" -noout >/dev/null 2>&1 || die "Node $i remote TLS certificate evidence is invalid"
+    if [ -f "$RUN/tls_change/$i.material_path" ]; then
+        planned_material=$(cat "$RUN/tls_change/$i.material_path")
+        cmp -s "$RUN/tls/$i.cert.pem" "$planned_material/server-cert.pem" || die "Node $i remote TLS evidence does not match the prepared plan; rerun the host helper after applying the current plan"
+    fi
 )
 
 tls_preflight() (
     command -v openssl >/dev/null 2>&1 || die 'Existing openssl is required for TLS CA/SAN validation; no packages are installed'
     mkdir -p "$RUN/tls"
     for donor in $(ids); do
-        [ "$(get "$donor" location)" = local ] || die 'Remote TLS certificates require host-side CA/SAN validation before this controller can approve cutover'
-        directory=$(val "$donor" datadir)
-        cert=$(val "$donor" ssl_cert); key=$(val "$donor" ssl_key)
+        if [ "$(get "$donor" location)" = remote ]; then
+            tls_remote_collect "$donor"
+            continue
+        fi
+        selinux_gr_port_preflight_local "$donor" || exit $?
+        directory=$(val "$donor" datadir); directory=${directory%/}
+        cert=$(val "$donor" ssl_cert); key=$(val "$donor" ssl_key); ca=$(val "$donor" ssl_ca)
+        recovery_ca=$(get "$donor" recovery_ca)
         case $cert in /*) :;; *) cert="$directory/$cert";; esac
         case $key in /*) :;; *) key="$directory/$key";; esac
+        case $ca in /*) :;; '') die "Node $donor has no runtime ssl_ca";; *) ca="$directory/$ca";; esac
+        case $recovery_ca in /*) :;; '') recovery_ca=$ca;; *) recovery_ca="$directory/$recovery_ca";; esac
+        [ -r "$cert" ] && [ -r "$key" ] && [ -r "$ca" ] && [ -r "$recovery_ca" ] || die "Node $donor local TLS file is not readable"
         openssl x509 -in "$cert" -noout -checkend 0 > "$RUN/tls/$donor.expiry" 2>&1 || die "Node $donor TLS certificate invalid/expired"
         openssl x509 -in "$cert" -pubkey -noout > "$RUN/tls/$donor.cert.pub" 2>/dev/null || die 'Cannot read certificate public key'
         openssl pkey -in "$key" -pubout > "$RUN/tls/$donor.key.pub" 2>/dev/null || die 'Cannot read TLS key for key-pair validation'
         cmp -s "$RUN/tls/$donor.cert.pub" "$RUN/tls/$donor.key.pub" || die "Node $donor TLS certificate/key mismatch"
-        host=$(get "$donor" advertise)
+        cp "$cert" "$RUN/tls/$donor.cert.pem"
+        cp "$ca" "$RUN/tls/$donor.ca.pem"
+        cp "$recovery_ca" "$RUN/tls/$donor.recovery_ca.pem"
+        if command -v getenforce >/dev/null 2>&1; then
+            mode=$(getenforce 2>/dev/null || printf 'Unknown')
+            printf 'SELINUX_MODE\t%s\n' "$mode" > "$RUN/tls/$donor.selinux"
+            printf 'TLS_CERT\t%s\t%s\n' "$cert" "$(stat -c %C "$cert" 2>/dev/null || printf '?')" >> "$RUN/tls/$donor.selinux"
+        fi
+    done
+    for donor in $(ids); do
+        cert="$RUN/tls/$donor.cert.pem"; host=$(get "$donor" advertise)
+        openssl x509 -in "$cert" -noout -checkend 0 > "$RUN/tls/$donor.expiry.controller" 2>&1 || die "Node $donor TLS certificate invalid/expired"
+        if [ "$(get meta tls)" = VERIFY_IDENTITY ]; then
+            openssl x509 -in "$cert" -noout -ext subjectAltName > "$RUN/tls/$donor.san" 2>/dev/null || die "Cannot inspect Node $donor TLS SAN"
+            grep -E 'DNS:|IP Address:' "$RUN/tls/$donor.san" >/dev/null || die "Node $donor lacks a SAN for identity verification"
+        fi
         for receiver in $(ids); do
-            for ca in "$(get "$receiver" recovery_ca)" "$(val "$receiver" ssl_ca)"; do
-                case $ca in /*) :;; '') die "Node $receiver has no CA file";; *) ca="$(val "$receiver" datadir)/$ca";; esac
+            for ca in "$RUN/tls/$receiver.recovery_ca.pem" "$RUN/tls/$receiver.ca.pem"; do
                 set -- -CAfile "$ca" -purpose sslserver
                 if [ "$(get meta tls)" = VERIFY_IDENTITY ]; then
-                    openssl x509 -in "$cert" -noout -ext subjectAltName > "$RUN/tls/$donor.san" 2>/dev/null || die 'Cannot inspect TLS SAN'
-                    grep -E 'DNS:|IP Address:' "$RUN/tls/$donor.san" >/dev/null || die "Node $donor lacks a SAN for identity verification"
-                    case $host in *[!0-9.]* ) set -- "$@" -verify_hostname "$host";; *) set -- "$@" -verify_ip "$host";; esac
+                    case $host in *[!0-9.]*) set -- "$@" -verify_hostname "$host";; *) set -- "$@" -verify_ip "$host";; esac
                 fi
                 openssl verify "$@" "$cert" >> "$RUN/tls/$receiver-to-$donor.verify" 2>&1 || die "Node $receiver CA cannot verify donor $donor TLS certificate/identity"
             done
         done
     done
+    log "TLS PREFLIGHT PASSED: local/remote host-side certificate, key, CA, SAN and cross-member trust verified. Evidence: $RUN/tls"
 )
 
 cutover_snapshot() (
