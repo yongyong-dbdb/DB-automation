@@ -209,7 +209,7 @@ configure_admin(){
     au=$(ask 'Cluster admin account name' 'icadmin')
     case $au in ''|*[!A-Za-z0-9_.-]*) die 'Invalid cluster admin user';; esac
     log 'Cluster admin Host must allow connections from every cluster member while remaining as narrow as your network permits.'
-    log "Examples: exact management IP for same-host multi-instance; 10.0.0.% or an appropriate subnet pattern for distributed members. '%' is broad and requires extra confirmation."
+    log "Examples: exact management IP for same-host multi-instance; use the narrowest appropriate subnet pattern for distributed members. '%' is broad and requires extra confirmation."
     rec_ah=$(recommended_admin_host_pattern)
     if [ -n "$rec_ah" ]; then log "Auto-detected narrow Host candidate from current GR MEMBER_HOST: $rec_ah"; fi
     ah=$(ask 'Cluster admin account host pattern' "$rec_ah")
