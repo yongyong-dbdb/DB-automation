@@ -1,7 +1,7 @@
 #!/bin/sh
 set -u
 
-SCRIPT_VERSION="1.2.25"
+SCRIPT_VERSION="1.2.26"
 SCRIPT_DIR=$(CDPATH='' cd "$(dirname "$0")" && pwd)
 DEFAULT_OUTPUT_DIR="$SCRIPT_DIR/results"
 PSQL_BIN=${PSQL_BIN:-}
@@ -319,6 +319,83 @@ SQL
     [ "$PGSS_QUERY_COUNT" -gt 0 ] && PGSS_AVAILABLE=yes
 }
 
+pgss_first_keyword() {
+    _file=$1
+    awk '
+    BEGIN { block_depth=0 }
+    {
+        line=$0
+        if (NR==1) sub(/^\357\273\277/, "", line)
+        i=1
+        while (i <= length(line)) {
+            two=substr(line,i,2)
+            if (block_depth > 0) {
+                if (two == "/*") { block_depth++; i+=2; continue }
+                if (two == "*/") { block_depth--; i+=2; continue }
+                i++; continue
+            }
+            if (two == "--") break
+            if (two == "/*") { block_depth=1; i+=2; continue }
+            c=substr(line,i,1)
+            if (c ~ /[[:space:]]/) { i++; continue }
+            token=""
+            while (i <= length(line)) {
+                c=substr(line,i,1)
+                if (c !~ /[A-Za-z_]/ && token == "") break
+                if (c !~ /[A-Za-z0-9_$]/) break
+                token=token c
+                i++
+            }
+            if (token != "") { print toupper(token); exit }
+            print toupper(c); exit
+        }
+    }' "$_file"
+}
+
+validate_pgss_explain_target() {
+    _file=$1
+    _keyword=$(pgss_first_keyword "$_file")
+
+    case $_keyword in
+        SELECT|INSERT|UPDATE|DELETE|MERGE|VALUES)
+            # PostgreSQL EXPLAIN and PREPARE both support these statement classes.
+            return 0
+            ;;
+        WITH|TABLE)
+            # WITH/TABLE are SELECT-family syntax forms. PostgreSQL itself performs
+            # the final parse/prepare validation later in the normal execution flow.
+            return 0
+            ;;
+        EXECUTE|DECLARE|CREATE)
+            echo >&2
+            echo "Selected statement is in PostgreSQL EXPLAIN's documented scope," >&2
+            echo "but pg_stat_statements replay cannot safely reconstruct it in this mode." >&2
+            printf '  queryid        : %s\n' "$QUERYID" >&2
+            printf '  statement type : %s\n' "$_keyword" >&2
+            echo >&2
+            echo "PostgreSQL EXPLAIN also documents EXECUTE, DECLARE, CREATE TABLE AS," >&2
+            echo "and CREATE MATERIALIZED VIEW AS. This script does not replay those" >&2
+            echo "from pg_stat_statements because they can depend on session state or" >&2
+            echo "have object-creation side effects under EXPLAIN ANALYZE." >&2
+            echo "Use a SQL file and review the execution context explicitly if needed." >&2
+            ;;
+        '')
+            echo "ERROR: pg_stat_statements query text does not contain a SQL statement." >&2
+            ;;
+        *)
+            echo >&2
+            echo "Selected pg_stat_statements entry is not a supported EXPLAIN target." >&2
+            printf '  queryid        : %s\n' "$QUERYID" >&2
+            printf '  statement type : %s\n' "$_keyword" >&2
+            echo >&2
+            echo "PostgreSQL documents EXPLAIN for SELECT, INSERT, UPDATE, DELETE, MERGE," >&2
+            echo "VALUES, EXECUTE, DECLARE, CREATE TABLE AS, and CREATE MATERIALIZED VIEW AS." >&2
+            echo "Utility statements such as SET/SHOW/RESET are not EXPLAIN targets." >&2
+            ;;
+    esac
+    return 1
+}
+
 load_pg_stat_statements_query() {
     PGSS_LOOKUP_USER=$(run_psql -X -qAt -v ON_ERROR_STOP=1 -c 'SELECT current_user;' 2>/dev/null || printf '%s' "$PGUSER")
     PGSS_LOOKUP_DATABASE=$PGDATABASE
@@ -443,6 +520,14 @@ SQL
             if [ "$PGUSER" != postgres ]; then
                 echo "       Re-run this source as postgres or use a SQL file." >&2
             fi
+            continue
+        fi
+
+        if ! validate_pgss_explain_target "$_pgss_sql"; then
+            echo >&2
+            echo "안내: 현재 queryid는 실행계획 분석 대상이 아니므로 bind 입력 단계로 진행하지 않습니다." >&2
+            echo "      다른 queryid를 입력하세요." >&2
+            echo >&2
             continue
         fi
 
