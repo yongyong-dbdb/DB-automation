@@ -1,0 +1,162 @@
+--- a/MySQL/Group-Replication/mysql_gr_migrate.sh
++++ b/MySQL/Group-Replication/mysql_gr_migrate.sh
+@@ -1,11 +1,11 @@
+ #!/bin/sh
+-# mysql_gr_migrate.sh v1.0.14
++# mysql_gr_migrate.sh v1.0.15
+ # POSIX sh; OS utilities and MySQL clients only. No external language packages.
+ # Supported: Oracle MySQL 8.0.27+, 8.4.x, 9.7.x; homogeneous exact versions.
+ # Single-primary or multi-primary / XCom. Never resets GTID or binary logs.
+ set -eu
+ umask 077
+-VERSION=1.0.14
++VERSION=1.0.15
+ ROOT=${MYSQL_GR_WORK_ROOT:-"$(pwd)/mysql_gr_work"}
+ MYSQL=${MYSQL_GR_MYSQL:-mysql}
+ DUMP=${MYSQL_GR_MYSQLDUMP:-mysqldump}
+@@ -193,6 +193,12 @@
+         log 'No compatible sibling work root was found. Run discover with a NEW MYSQL_GR_WORK_ROOT; do not delete the stale project until reviewed.'
+     fi
+ }
++innodb_cluster_guard() {
++    for gi in $(ids); do
++        managed=$(sql "$gi" "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name='mysql_innodb_cluster_metadata';")
++        [ "$managed" = 0 ] || die "Node $gi is managed by InnoDB Cluster metadata. Use MySQL Shell AdminAPI / mysql_innodb_cluster_migrate.sh; GR mutation is blocked."
++    done
++}
+ connected() {
+     mismatch=''
+     for ci in $(ids); do
+@@ -1126,7 +1132,7 @@
+ configure() {
+     PHASE=configure
+     put meta mutation_started configure
+-    connected; no_group; endpoints_check
++    connected; innodb_cluster_guard; no_group; endpoints_check
+     while :; do
+     log '  minimum   : GR-required settings only; preserves existing durability policy where possible.'
+     log '  production: minimum + sync_binlog=1, innodb_flush_log_at_trx_commit=1 and FULL row image.'
+@@ -1233,8 +1239,9 @@
+     fi
+ )
+ precheck() {
+-    connected; no_group; endpoints_check
++    connected; innodb_cluster_guard; no_group; endpoints_check
+     tls_preflight
++    writeability_persistence_check
+     seen=' '
+     for i in $(ids); do
+         sid=$(val "$i" server_id); [ "$sid" -gt 0 ] || die 'server_id=0'
+@@ -2499,6 +2506,7 @@
+ }
+ join() {
+     connected
++    innodb_cluster_guard
+     [ -f "$ROOT/meta/bootstrap_attempted" ] || die 'No recorded bootstrap attempt; use cutover'
+     [ "$(val 1 group_replication_group_name)" = "$(get meta group)" ] || die 'Group UUID mismatch'
+     [ "$(sql 1 "SELECT MEMBER_STATE FROM performance_schema.replication_group_members WHERE MEMBER_ID=@@server_uuid;")" = ONLINE ] || die 'Bootstrap node is not ONLINE. A full group recovery needs manual review; never blindly rebootstrap.'
+@@ -2525,18 +2533,78 @@
+     validate
+     log 'Join complete; all members remain write-fenced. Review then run release.'
+ }
++writeability_persistence_check() {
++    for i in $(ids); do
++        pv="$RUN/node_$i.read_only.persisted.tsv"
++        vi="$RUN/node_$i.read_only.variables_info.tsv"
++        sql "$i" "SELECT VARIABLE_NAME,VARIABLE_VALUE FROM performance_schema.persisted_variables WHERE VARIABLE_NAME IN ('read_only','super_read_only') ORDER BY VARIABLE_NAME;" > "$pv"
++        sql "$i" "SELECT VARIABLE_NAME,VARIABLE_SOURCE,COALESCE(VARIABLE_PATH,''),COALESCE(CAST(SET_TIME AS CHAR),''),COALESCE(SET_USER,''),COALESCE(SET_HOST,'') FROM performance_schema.variables_info WHERE VARIABLE_NAME IN ('read_only','super_read_only') ORDER BY VARIABLE_NAME;" > "$vi"
++        if [ -s "$pv" ]; then
++            log "Node $i has persisted read_only/super_read_only overrides:"
++            cat "$pv" >&2
++            die "Node $i has persisted read_only/super_read_only values. Review and remove the persisted override (for example RESET PERSIST <variable>) before GR migration/validation; the script never resets persisted values automatically."
++        fi
++        bad_source=$(awk -F '\t' '$2 != "DYNAMIC" && $2 != "COMPILED" {print}' "$vi")
++        if [ -n "$bad_source" ]; then
++            log "Node $i has startup/static read_only source(s):"
++            printf '%s\n' "$bad_source" >&2
++            die "Node $i read_only/super_read_only is sourced from startup/static configuration. Remove or explicitly review the source before GR migration so role-based writeability cannot be overridden after restart."
++        fi
++    done
++}
++
++writeability_check() {
++    expected_phase=${1:-auto}
++    mode=$(get meta primary_mode)
++    primaries_writable=yes
++    primaries_fenced=yes
++    for i in $(ids); do
++        role=$(sql "$i" "SELECT MEMBER_ROLE FROM performance_schema.replication_group_members WHERE MEMBER_ID=@@server_uuid;")
++        state=$(sql "$i" "SELECT MEMBER_STATE FROM performance_schema.replication_group_members WHERE MEMBER_ID=@@server_uuid;")
++        ro=$(val "$i" read_only); sro=$(val "$i" super_read_only)
++        [ "$state" = ONLINE ] || die "Node $i is not ONLINE while checking writeability (state=$state)"
++        case "$mode:$role" in
++            single:PRIMARY|multi:PRIMARY)
++                [ "$ro" = 0 ] && [ "$sro" = 0 ] || primaries_writable=no
++                [ "$sro" = 1 ] || primaries_fenced=no
++                ;;
++            single:SECONDARY)
++                [ "$sro" = 1 ] || die "Node $i SECONDARY is writable (read_only=$ro super_read_only=$sro)"
++                ;;
++            multi:SECONDARY) die "Multi-primary node $i unexpectedly reports SECONDARY";;
++            *) die "Unexpected topology while checking writeability: node=$i mode=$mode role=$role";;
++        esac
++    done
++    if [ "$primaries_writable" = yes ]; then
++        WRITEABILITY_STATE=released
++    elif [ "$primaries_fenced" = yes ]; then
++        WRITEABILITY_STATE=fenced
++    else
++        die 'PRIMARY writeability is inconsistent across the group; expected all writable or all intentionally fenced.'
++    fi
++    case "$expected_phase:$WRITEABILITY_STATE" in
++        auto:*) :;;
++        released:released|fenced:fenced) :;;
++        *) die "Writeability state mismatch: expected=$expected_phase actual=$WRITEABILITY_STATE";;
++    esac
++}
++
+ release() {
+     validate
++    innodb_cluster_guard
+     confirm 'RELEASE PRIMARY WRITES'
+     for i in $(ids); do
+         if [ "$(get meta primary_mode)" = multi ] || [ "$i" = 1 ]; then
+             sql "$i" 'SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF;'
+         fi
+     done
+-    log 'Primary write fences released; event schedulers remain OFF.'
++    writeability_check released
++    put meta writes_released "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
++    log 'Primary write fences released and writeability validated; event schedulers remain OFF.'
+ }
+ validate() {
+     connected
++    writeability_persistence_check
+     target=$(val 1 gtid_executed)
+     expected=$(get meta count)
+     for i in $(ids); do
+@@ -2566,8 +2634,14 @@
+         sql "$i" 'SELECT * FROM performance_schema.replication_group_member_stats;' > "$RUN/node_$i.member_stats.tsv"
+     done
+     exact_gtid 1 "$target"
++    writeability_check auto
++    case $WRITEABILITY_STATE in
++        released) release_state='released/writable'; [ -f "$ROOT/meta/writes_released" ] || put meta writes_released 'runtime-detected';;
++        fenced) release_state='pre-release/fenced';;
++        *) die "Unknown writeability state: $WRITEABILITY_STATE";;
++    esac
+     put meta validated "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+-    log "VALIDATION PASSED: $expected ONLINE, $(get meta primary_mode) primary mode. Evidence: $RUN"
++    log "VALIDATION PASSED: $expected ONLINE, $(get meta primary_mode) primary mode, $release_state. Evidence: $RUN"
+ }
+ status() {
+     connected
+@@ -2575,6 +2649,8 @@
+         log "--- Node $i ---"
+         [ ! -f "$ROOT/$i/state" ] || log "Initialization state: $(get "$i" state)"
+         sql "$i" 'SELECT @@server_uuid,@@read_only,@@super_read_only,@@event_scheduler,@@gtid_executed; SELECT * FROM performance_schema.replication_group_members; SELECT CHANNEL_NAME,SERVICE_STATE,LAST_ERROR_NUMBER,LAST_ERROR_MESSAGE FROM performance_schema.replication_connection_status; SELECT CHANNEL_NAME,SERVICE_STATE,LAST_ERROR_NUMBER,LAST_ERROR_MESSAGE FROM performance_schema.replication_applier_status_by_worker;' | tee "$RUN/node_$i.status.tsv"
++        role=$(sql "$i" "SELECT MEMBER_ROLE FROM performance_schema.replication_group_members WHERE MEMBER_ID=@@server_uuid;")
++        log "Role/writeability: role=$role read_only=$(val "$i" read_only) super_read_only=$(val "$i" super_read_only)"
+     done
+ }
+ platform_preflight() {
