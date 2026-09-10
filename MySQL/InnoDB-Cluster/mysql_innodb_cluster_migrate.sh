@@ -1,10 +1,10 @@
 #!/bin/sh
-# mysql_innodb_cluster_migrate.sh v1.0.16
+# mysql_innodb_cluster_migrate.sh v1.0.17
 # POSIX sh. Oracle MySQL GA 8.0+; runtime AdminAPI capability detection. Requires preinstalled mysql/mysqlsh; never installs packages.
 # Safe automation for prepared MySQL instances / existing Group Replication -> InnoDB Cluster.
 set -eu
 umask 077
-VERSION=1.0.16
+VERSION=1.0.17
 ROOT=${MYSQL_IC_WORK_ROOT:-"$(pwd)/mysql_innodb_cluster_work"}
 MYSQL=${MYSQL_IC_MYSQL:-mysql}
 MYSQLSH=${MYSQL_IC_MYSQLSH:-mysqlsh}
@@ -88,16 +88,22 @@ register_node(){
             ;;
         password)
             u=$(ask "Node $i bootstrap admin user" 'root')
-            h=$(ask "Node $i connection host/IP" '127.0.0.1')
-            p=$(ask "Node $i SQL port" '3306')
+            h=$(ask "Node $i connection host/IP" "${MYSQL_HOST:-}")
+            [ -n "$h" ] || die "Node $i connection host/IP is required when password authentication is used"
+            p=$(ask "Node $i SQL port" "${MYSQL_TCP_PORT:-}")
+            case $p in ''|*[!0-9]*) die "Node $i SQL port must be entered as a number";; esac
             put "$i" auth_mode password; put "$i" user "$u"; put "$i" host "$h"; put "$i" port "$p"
             ;;
         *) die 'auth mode must be login-path or password';;
     esac
     cred "$i"
     uuid=$(sql "$i" 'SELECT @@server_uuid;'); ver=$(sql "$i" 'SELECT VERSION();'); port=$(sql "$i" 'SELECT @@port;'); host=$(sql "$i" 'SELECT @@hostname;')
-    # AdminAPI must use an address reachable by every member. Runtime GR MEMBER_HOST is preferred for existing GR.
-    connect_host=$(ask "Node $i member-reachable host/IP for AdminAPI" '127.0.0.1')
+    # AdminAPI must use an address reachable by every member. Prefer live GR MEMBER_HOST, then report_host, then the explicit bootstrap host.
+    detected_member_host=$(sql "$i" "SELECT COALESCE((SELECT MEMBER_HOST FROM performance_schema.replication_group_members WHERE MEMBER_ID='$(q "$uuid")' LIMIT 1),'');")
+    if [ -z "$detected_member_host" ]; then detected_member_host=$(sql "$i" "SELECT COALESCE(@@report_host,'');"); fi
+    if [ -z "$detected_member_host" ] && [ "$(get "$i" auth_mode)" = password ]; then detected_member_host=$(get "$i" host); fi
+    connect_host=$(ask "Node $i member-reachable host/IP for AdminAPI" "$detected_member_host")
+    [ -n "$connect_host" ] || die "Node $i AdminAPI reachable host/IP could not be auto-detected; enter it explicitly"
     put "$i" uuid "$uuid"; put "$i" version "$ver"; put "$i" runtime_port "$port"; put "$i" runtime_host "$host"; put "$i" connect_host "$connect_host"
     log "Node $i: $ver uuid=$uuid SQL=$connect_host:$port runtime_host=$host"
 }
