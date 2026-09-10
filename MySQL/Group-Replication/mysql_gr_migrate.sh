@@ -85,9 +85,10 @@ cleanup() {
 help() {
     cat <<EOF
 mysql_gr_migrate.sh v$VERSION
-Usage: sh mysql_gr_migrate.sh discover|configure|precheck|initialize|cutover|join|release|validate|status|all
+Usage: sh mysql_gr_migrate.sh discover|configure|tls|precheck|initialize|cutover|join|release|validate|status|all
   discover   Select GTID -> GR / Standalone -> GR and 2..9 nodes
   configure  Generate version-aware config; optionally apply/restart local nodes
+  tls        Prepare and verify SAN certificates; default is plan-only (MYSQL_GR_TLS_ACTION=apply to apply)
   precheck   Read-only identity, configuration, schema and channel checks
   initialize Fence writes, catch up GTID replicas, provision empty nodes
   cutover    Recheck, stop selected async channels, configure recovery, bootstrap/join
@@ -2083,7 +2084,11 @@ data_checks() {
 plugin() (
     i=$1
     status=$(sql "$i" "SELECT PLUGIN_STATUS FROM information_schema.plugins WHERE PLUGIN_NAME='group_replication';")
-    if [ -z "$status" ]; then local_write "$i" "INSTALL PLUGIN group_replication SONAME 'group_replication.so';"; fi
+    if [ -z "$status" ]; then
+        mkdir -p "$RUN/cutover_rollback"
+        : > "$RUN/cutover_rollback/$i.new_gr_plugin"
+        local_write "$i" "INSTALL PLUGIN group_replication SONAME 'group_replication.so';"
+    fi
     [ "$(sql "$i" "SELECT PLUGIN_STATUS FROM information_schema.plugins WHERE PLUGIN_NAME='group_replication';")" = ACTIVE ] || die 'GR plugin is not ACTIVE'
 )
 persist() {
@@ -2135,6 +2140,7 @@ accounts() {
     for i in $(ids); do sql "$i" "SHOW GLOBAL VARIABLES WHERE Variable_name LIKE 'validate_password%';" >&2; done
     rp=$(secret 'Recovery password shared across these donor accounts')
     [ -n "$rp" ] || die 'Recovery password cannot be empty'
+    [ "$(printf '%s' "$rp" | wc -c)" -le 32 ] || die 'Replication SOURCE_PASSWORD must not exceed 32 bytes; no recovery accounts have been created'
     for i in $(ids); do
         for host in $hosts; do
             account="'$(q "$ru")'@'$(q "$host")'"
@@ -2155,7 +2161,11 @@ accounts() {
     for i in $(ids); do
         # Server stores channel credentials; only ephemeral SQL is kept locally.
         : > "$RUN/cutover_rollback/$i.new_recovery_channel"
-        sql "$i" "CHANGE REPLICATION SOURCE TO SOURCE_USER='$(q "$ru")', SOURCE_PASSWORD='$(q "$rp")' FOR CHANNEL 'group_replication_recovery';" >/dev/null 2> "$TEMP/account_error"
+        if ! sql "$i" "CHANGE REPLICATION SOURCE TO SOURCE_USER='$(q "$ru")', SOURCE_PASSWORD='$(q "$rp")' FOR CHANNEL 'group_replication_recovery';" >/dev/null 2> "$TEMP/account_error"; then
+            cp "$TEMP/account_error" "$RUN/node_$i.recovery_channel.error"
+            chmod 600 "$RUN/node_$i.recovery_channel.error"
+            die "Recovery channel configuration failed on node $i; protected error evidence: $RUN/node_$i.recovery_channel.error"
+        fi
     done
     unset rp
 }
@@ -2323,7 +2333,7 @@ platform_preflight() {
 }
 
 main() {
-    case $STEP in help|--help|-h) help; return;; --version) printf '%s\n' "$VERSION"; return;; discover|configure|precheck|initialize|cutover|join|release|validate|status|all) :;; *) help; exit 2;; esac
+    case $STEP in help|--help|-h) help; return;; --version) printf '%s\n' "$VERSION"; return;; discover|configure|tls|precheck|initialize|cutover|join|release|validate|status|all) :;; *) help; exit 2;; esac
     platform_preflight
     command -v "$MYSQL" >/dev/null 2>&1 || die 'mysql client not found; set MYSQL_GR_MYSQL'
     case $ROOT in /*) :;; *) ROOT="$(pwd)/$ROOT";; esac
@@ -2994,6 +3004,124 @@ cnf_chain_snapshot() (
     rm -f "$2.unsorted"
 )
 
+tls_restore() (
+    failed=0
+    for node in $(ids); do
+        [ -f "$RUN/tls_change/$node.applied" ] || continue
+        cnf=$(get "$node" cnf)
+        if [ -f "$RUN/tls_change/$node.cnf.before" ]; then
+            cat "$RUN/tls_change/$node.cnf.before" > "$cnf" || failed=1
+        fi
+        sql "$node" "$(cat "$RUN/tls_change/$node.runtime_restore.sql")" > "$RUN/tls_change/$node.rollback.log" 2>&1 || failed=1
+        cat "$RUN/tls_change/$node.recovery_ca.before" > "$ROOT/$node/recovery_ca" || failed=1
+    done
+    [ "$failed" = 0 ] || return 1
+)
+
+tls_plan_manifest() (
+    manifest="$RUN/tls_change/manifest.sha256"
+    : > "$manifest"
+    for node in $(ids); do
+        directory=$(cat "$RUN/tls_change/$node.output")
+        sha256sum "$directory/ca.pem" "$directory/server-cert.pem" "$directory/server-key.pem" "$RUN/tls_change/$node.output" "$RUN/tls_change/$node.cnf.candidate" "$RUN/tls_change/$node.cnf.before" "$RUN/tls_change/$node.runtime_restore.sql" "$RUN/tls_change/$node.recovery_ca.before" "$RUN/tls_change/$node.include.before" >> "$manifest" || exit 1
+    done
+)
+
+tls_apply_plan() (
+    connected; no_group
+    plan=${MYSQL_GR_TLS_PLAN:-$(get meta tls_plan)}
+    [ -d "$plan" ] && [ "$(basename "$plan")" = tls_change ] || die 'Invalid prepared TLS plan'
+    RUN=$(dirname "$plan")
+    sha256sum -c "$plan/manifest.sha256" > "$plan/apply_checksum.log" 2>&1 || die 'Prepared TLS plan/certificates changed; no settings applied'
+    confirm 'APPLY VERIFIED TLS CERTIFICATES'
+    tls_ok=no
+    trap 'rc=$?; trap - 0 1 2 15; if [ "$tls_ok" != yes ]; then tls_restore || log "URGENT: TLS rollback incomplete; inspect $RUN/tls_change"; fi; exit "$rc"' 0
+    trap 'exit 130' 2; trap 'exit 143' 1 15
+    for node in $(ids); do
+        pid=$(local_pid "$node") || die 'TLS target identity changed before apply'
+        cnf=$(get "$node" cnf); output=$(cat "$RUN/tls_change/$node.output")
+        cnf_chain_snapshot "$cnf" "$RUN/tls_change/$node.include.current" "$(readlink -f "/proc/$pid/cwd")"
+        cmp -s "$RUN/tls_change/$node.include.before" "$RUN/tls_change/$node.include.current" || die 'TLS configuration include chain changed concurrently'
+        : > "$RUN/tls_change/$node.applied"
+        cat "$RUN/tls_change/$node.cnf.candidate" > "$cnf"
+        sql "$node" "SET GLOBAL ssl_ca='$(q "$output/ca.pem")'; SET GLOBAL ssl_cert='$(q "$output/server-cert.pem")'; SET GLOBAL ssl_key='$(q "$output/server-key.pem")'; ALTER INSTANCE RELOAD TLS;"
+        put "$node" recovery_ca "$output/ca.pem"
+    done
+    tls_preflight
+    tls_ok=yes
+    log "TLS APPLIED: cross-member CA/SAN verified; existing connections retained. Evidence: $RUN/tls_change"
+)
+
+tls() (
+    PHASE=tls
+    tls_action=${MYSQL_GR_TLS_ACTION:-plan}
+    case $tls_action in plan) :;; apply) tls_apply_plan; exit $?;; *) die 'MYSQL_GR_TLS_ACTION must be plan or apply';; esac
+    connected; no_group
+    command -v openssl >/dev/null 2>&1 || die 'Existing openssl required; no packages will be installed'
+    mkdir -p "$RUN/tls_change"
+    ca_default=$(val 1 ssl_ca)
+    case $ca_default in /*) :;; *) ca_default="$(val 1 datadir)/$ca_default";; esac
+    authority=$(required 'Existing signing CA certificate path' "$ca_default")
+    signing_key=$(required 'Existing signing CA private key path' "$(dirname "$authority")/ca-key.pem")
+    days=$(required 'Certificate validity in days' 365)
+    uint "$days" && [ "$days" -gt 0 ] && [ "$days" -le 3650 ] || die 'Invalid certificate lifetime'
+    openssl x509 -in "$authority" -noout -checkend "$((days*86400))" > "$RUN/tls_change/ca_expiry.log" 2>&1 || die 'CA expires before the requested certificate lifetime'
+    openssl x509 -in "$authority" -pubkey -noout > "$RUN/tls_change/ca.pub" || die 'Cannot read signing CA'
+    openssl pkey -in "$signing_key" -pubout > "$RUN/tls_change/ca_key.pub" 2>/dev/null || die 'Cannot access signing CA key'
+    cmp -s "$RUN/tls_change/ca.pub" "$RUN/tls_change/ca_key.pub" || die 'CA certificate/key mismatch'
+    stamp=$(date +%Y%m%d_%H%M%S)_$$
+    for node in $(ids); do
+        [ "$(get "$node" location)" = local ] || die 'Remote certificate deployment requires running this preparation on the actual host; controller paths are not assumed'
+        pid=$(local_pid "$node") || die 'Cannot prove TLS target process identity'
+        cnf=$(get "$node" cnf)
+        [ -f "$cnf" ] && [ ! -L "$cnf" ] || die 'TLS deployment requires a proven regular main cnf'
+        [ "$(sql "$node" "SELECT COUNT(*) FROM performance_schema.persisted_variables WHERE VARIABLE_NAME IN ('ssl_ca','ssl_cert','ssl_key');")" = 0 ] || die 'Existing persisted TLS overrides require explicit migration before cnf deployment'
+        datadir=$(val "$node" datadir); datadir=${datadir%/}
+        output="$(dirname "$datadir")/gr_tls_${node}_$stamp"
+        [ ! -e "$output" ] || die 'TLS output path collision'
+        mkdir "$output"; chmod 700 "$output"
+        host=$(get "$node" advertise); safe_host "$host"
+        case $host in *[!0-9.]*) san="DNS:$host";; *) san="IP:$host";; esac
+        printf 'basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth,clientAuth\nsubjectAltName=%s\n' "$san" > "$RUN/tls_change/$node.extensions"
+        openssl req -new -newkey rsa:3072 -nodes -subj "/CN=$host" -keyout "$output/server-key.pem" -out "$RUN/tls_change/$node.csr" > "$RUN/tls_change/$node.issue.log" 2>&1 || die 'TLS key/CSR generation failed'
+        serial=$(openssl rand -hex 16)
+        openssl x509 -req -in "$RUN/tls_change/$node.csr" -CA "$authority" -CAkey "$signing_key" -set_serial "0x$serial" -days "$days" -sha256 -extfile "$RUN/tls_change/$node.extensions" -out "$output/server-cert.pem" >> "$RUN/tls_change/$node.issue.log" 2>&1 || die 'TLS certificate signing failed'
+        cat "$authority" > "$output/ca.pem"
+        old_ca=$(val "$node" ssl_ca)
+        case $old_ca in /*) :;; *) old_ca="$datadir/$old_ca";; esac
+        # Retain existing client-certificate trust while adding the selected CA.
+        [ ! -r "$old_ca" ] || cmp -s "$authority" "$old_ca" || cat "$old_ca" >> "$output/ca.pem"
+        chmod 600 "$output/server-key.pem"; chmod 644 "$output/ca.pem" "$output/server-cert.pem"
+        chown -R "$(stat -c %u "$datadir"):$(stat -c %g "$datadir")" "$output"
+        printf '%s\n' "$output" > "$RUN/tls_change/$node.output"
+        cnf_chain_snapshot "$cnf" "$RUN/tls_change/$node.include.before" "$(readlink -f "/proc/$pid/cwd")"
+        cp -p "$cnf" "$RUN/tls_change/$node.cnf.before"
+        cp "$ROOT/$node/recovery_ca" "$RUN/tls_change/$node.recovery_ca.before"
+        sql "$node" "SELECT CONCAT('SET GLOBAL ssl_ca=',QUOTE(@@ssl_ca),'; SET GLOBAL ssl_cert=',QUOTE(@@ssl_cert),'; SET GLOBAL ssl_key=',QUOTE(@@ssl_key),'; ALTER INSTANCE RELOAD TLS;');" > "$RUN/tls_change/$node.runtime_restore.sql"
+        sed '/^# BEGIN mysql_gr_tls$/,/^# END mysql_gr_tls$/d' "$cnf" > "$RUN/tls_change/$node.cnf.candidate"
+        printf '\n# BEGIN mysql_gr_tls\n[mysqld]\nssl_ca=%s/ca.pem\nssl_cert=%s/server-cert.pem\nssl_key=%s/server-key.pem\n# END mysql_gr_tls\n' "$output" "$output" "$output" >> "$RUN/tls_change/$node.cnf.candidate"
+        exe=$(readlink -f "/proc/$pid/exe")
+        "$exe" --defaults-file="$RUN/tls_change/$node.cnf.candidate" --validate-config > "$RUN/tls_change/$node.config_validation.log" 2>&1 || die 'TLS candidate cnf validation failed'
+    done
+    for donor in $(ids); do
+        output=$(cat "$RUN/tls_change/$donor.output")
+        host=$(get "$donor" advertise)
+        for receiver in $(ids); do
+            trust=$(cat "$RUN/tls_change/$receiver.output")
+            case $host in *[!0-9.]*) set -- -verify_hostname "$host";; *) set -- -verify_ip "$host";; esac
+            openssl verify -CAfile "$trust/ca.pem" -purpose sslserver "$@" "$output/server-cert.pem" > "$RUN/tls_change/$receiver-to-$donor.verify" 2>&1 || die 'Proposed cross-member CA/SAN validation failed'
+            openssl verify -CAfile "$trust/ca.pem" -purpose sslclient "$output/server-cert.pem" >> "$RUN/tls_change/$receiver-to-$donor.verify" 2>&1 || die 'Proposed XCom client certificate validation failed'
+        done
+    done
+    if [ "$tls_action" = plan ]; then
+        tls_plan_manifest
+        printf '%s\n' "$RUN/tls_change" > "$ROOT/meta/tls_plan"
+        log "TLS PLAN VERIFIED: $RUN/tls_change. No running TLS context or cnf was changed."
+        return 0
+    fi
+
+)
+
 tls_preflight() (
     command -v openssl >/dev/null 2>&1 || die 'Existing openssl is required for TLS CA/SAN validation; no packages are installed'
     mkdir -p "$RUN/tls"
@@ -3039,9 +3167,17 @@ persist_snapshot() (
     dir="$RUN/cutover_rollback/$node.persist"
     mkdir -p "$dir"
     [ ! -f "$dir/$variable.sql" ] || exit 0
+    null_runtime=$(sql "$node" "SELECT @@GLOBAL.$variable IS NULL;")
+    if [ "$null_runtime" = 1 ]; then
+        case $variable in
+            group_replication_*)
+                [ -f "$RUN/cutover_rollback/$node.new_gr_plugin" ] || die "Existing GR plugin has unset $variable that cannot be restored dynamically; preserve it and review plugin reinitialization before cutover";;
+            *) die "NULL runtime value of $variable has no validated rollback path";;
+        esac
+    fi
     # Capture runtime and persisted values separately: RESET PERSIST does not
     # restore the current GLOBAL value and SET PERSIST alone conflates the two.
-    sql "$node" "SELECT CONCAT('SET GLOBAL $variable=',QUOTE(@@GLOBAL.$variable),';'); SELECT IF(COUNT(*)=0,'RESET PERSIST IF EXISTS $variable;',CONCAT('SET PERSIST_ONLY $variable=',QUOTE(MAX(VARIABLE_VALUE)),';')) FROM performance_schema.persisted_variables WHERE VARIABLE_NAME='$variable';" > "$dir/$variable.sql.tmp"
+    sql "$node" "SELECT IF(@@GLOBAL.$variable IS NULL,'SELECT 1;',CONCAT('SET GLOBAL $variable=',QUOTE(@@GLOBAL.$variable),';')); SELECT IF(COUNT(*)=0,'RESET PERSIST IF EXISTS $variable;',CONCAT('SET PERSIST_ONLY $variable=',QUOTE(MAX(VARIABLE_VALUE)),';')) FROM performance_schema.persisted_variables WHERE VARIABLE_NAME='$variable';" > "$dir/$variable.sql.tmp"
     [ "$(wc -l < "$dir/$variable.sql.tmp")" = 2 ] || die 'Incomplete persisted-variable rollback snapshot'
     mv "$dir/$variable.sql.tmp" "$dir/$variable.sql"
     printf '%s\n' "$variable" >> "$dir/order"
@@ -3052,7 +3188,7 @@ rollback_cutover() (
     for node in $(ids); do
         dir="$RUN/cutover_rollback"
         sql "$node" 'SET GLOBAL super_read_only=ON;' || failed=1
-        if [ -f "$dir/$node.new_recovery_channel" ]; then
+        if [ -f "$dir/$node.new_recovery_channel" ] && [ "$(sql "$node" "SELECT COUNT(*) FROM performance_schema.replication_connection_configuration WHERE CHANNEL_NAME='group_replication_recovery';")" = 1 ]; then
             sql "$node" "RESET REPLICA ALL FOR CHANNEL 'group_replication_recovery';" || failed=1
         fi
         if [ -s "$dir/$node.accounts.sql" ]; then
@@ -3061,8 +3197,14 @@ rollback_cutover() (
         if [ -s "$dir/$node.persist/order" ]; then
             awk '{a[NR]=$0} END {for(i=NR;i>0;i--)print a[i]}' "$dir/$node.persist/order" > "$dir/$node.persist/reverse"
             while IFS= read -r variable; do
-                sql "$node" "$(cat "$dir/$node.persist/$variable.sql")" || failed=1
+                while IFS= read -r restore_statement; do
+                    [ -n "$restore_statement" ] || continue
+                    sql "$node" "$restore_statement" || failed=1
+                done < "$dir/$node.persist/$variable.sql"
             done < "$dir/$node.persist/reverse"
+        fi
+        if [ -f "$dir/$node.new_gr_plugin" ] && [ "$(sql "$node" "SELECT COUNT(*) FROM information_schema.plugins WHERE PLUGIN_NAME='group_replication';")" = 1 ]; then
+            local_write "$node" 'UNINSTALL PLUGIN group_replication;' || failed=1
         fi
         if [ -s "$dir/$node.async.sql" ]; then
             sql "$node" "$(cat "$dir/$node.async.sql")" || failed=1

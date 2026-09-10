@@ -79,6 +79,34 @@ grep -Fx 'SET GLOBAL example=1;' "$RUN/cutover_rollback/1.persist/example.sql"
     def test_existing_recovery_channel_not_overwritten(self):
         self.shell('put meta count 1; sql() { printf 1; }; cutover_snapshot', 'existing recovery channel metadata')
 
+    def test_existing_null_plugin_setting_stops_before_mutation(self):
+        self.shell('sql() { printf 1; }; persist_snapshot 1 group_replication_group_name', 'cannot be restored dynamically')
+
+    def test_new_plugin_null_setting_uses_plugin_rollback(self):
+        self.shell('''mkdir -p "$RUN/cutover_rollback"
+: > "$RUN/cutover_rollback/1.new_gr_plugin"
+sql() { case "$2" in *'IS NULL;'*) printf 1;; *) printf 'SELECT 1;\nRESET PERSIST IF EXISTS group_replication_group_name;\n';; esac; }
+persist_snapshot 1 group_replication_group_name
+! grep -q '=NULL' "$RUN/cutover_rollback/1.persist/group_replication_group_name.sql"
+''')
+
+    def test_failed_channel_creation_is_not_reset(self):
+        self.shell('''put meta count 1
+mkdir -p "$RUN/cutover_rollback"
+: > "$RUN/cutover_rollback/1.new_recovery_channel"
+sql() { case "$2" in *'SELECT COUNT(*)'*) printf 0;; *) printf '%s\n' "$2" >> "$RUN/actions";; esac; }
+rollback_cutover
+! grep -q 'RESET REPLICA' "$RUN/actions"
+''')
+
+    def test_recovery_password_length_before_account_creation(self):
+        self.shell('''put meta count 1
+required() { case $1 in 'Recovery accounts '*) printf create;; 'Dedicated recovery user') printf recovery;; *) printf localhost;; esac; }
+secret() { printf 123456789012345678901234567890123; }
+sql() { :; }
+accounts
+''', '32 bytes')
+
     def test_rollback_only_new_channel_and_accounts(self):
         self.shell('''put meta count 1
 mkdir -p "$RUN/cutover_rollback/1.persist"
@@ -86,7 +114,7 @@ printf example > "$RUN/cutover_rollback/1.persist/order"
 printf 'SET GLOBAL example=1;\nRESET PERSIST IF EXISTS example;\n' > "$RUN/cutover_rollback/1.persist/example.sql"
 printf 'DROP USER IF EXISTS recovery;\n' > "$RUN/cutover_rollback/1.accounts.sql"
 : > "$RUN/cutover_rollback/1.new_recovery_channel"
-sql() { printf '%s\n' "$2" >> "$RUN/actions"; }
+sql() { case "$2" in *"SELECT COUNT(*)"*) printf 1;; *) printf '%s\n' "$2" >> "$RUN/actions";; esac; }
 local_write() { sql "$1" "$2"; }
 rollback_cutover
 grep -F "RESET REPLICA ALL FOR CHANNEL 'group_replication_recovery'" "$RUN/actions"

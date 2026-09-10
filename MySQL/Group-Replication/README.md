@@ -1,6 +1,8 @@
 # MySQL GR 전환 자동화 v1.0.12 검증 후보
 
 `gr-v1.0.12-reprovision`은 **main merge 금지 / production-ready 아님**.
+`tls` 명령은 기본적으로 인증서 생성·검증만 수행한다. `MYSQL_GR_TLS_ACTION=apply`는 저장된 계획을 적용하며 cnf/runtime 복원 처리를 포함한다.
+
 실서버 결과와 남은 작업은 [VALIDATION.md](VALIDATION.md), 재개 기준은 [HANDOFF.md](HANDOFF.md) 참조.
 
 이번 후보에는 DEFINER 계정을 삭제하지 않는 계정 선복원, 객체 복원 후 GRANT/default role 적용,
