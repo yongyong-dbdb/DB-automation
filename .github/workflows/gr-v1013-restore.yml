@@ -1,0 +1,57 @@
+name: restore-gr-v1013
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/gr-v1013-restore.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  restore:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Reconstruct and verify validated script
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat \
+            .github/gr_v1013_payload.part0 \
+            .github/gr_v1013_payload.part1 \
+            .github/gr_v1013_payload.part2 \
+            .github/gr_v1013_payload.part3a \
+            .github/gr_v1013_payload.part3b \
+            .github/gr_v1013_payload.missing8k \
+            .github/gr_v1013_payload.part4 > /tmp/gr_v1013.b64
+          test "$(wc -c < /tmp/gr_v1013.b64)" -eq 64576
+          base64 -d /tmp/gr_v1013.b64 > /tmp/gr_v1013.xz
+          xz -dc /tmp/gr_v1013.xz > /tmp/mysql_gr_migrate.sh
+          echo 'dc9a1a3ba205c7627094c03ecf065ae7dd7524158c210ef9a753bf3870d35489  /tmp/mysql_gr_migrate.sh' | sha256sum -c -
+          sh -n /tmp/mysql_gr_migrate.sh
+          test "$(wc -l < /tmp/mysql_gr_migrate.sh)" -eq 4157
+          grep -q '^# mysql_gr_migrate.sh v1.0.13$' /tmp/mysql_gr_migrate.sh
+          cp /tmp/mysql_gr_migrate.sh 'MySQL/Group-Replication/mysql_gr_migrate.sh'
+          rm -f 'MySQL/Group-Replication/reprovision_helper.sh'
+          rm -f .github/gr_v1013_payload.part0 \
+                .github/gr_v1013_payload.part1 \
+                .github/gr_v1013_payload.part2 \
+                .github/gr_v1013_payload.part3a \
+                .github/gr_v1013_payload.part3b \
+                .github/gr_v1013_payload.missing8k \
+                .github/gr_v1013_payload.part4 \
+                .github/workflows/gr-v1013-restore.yml
+      - name: Commit verified result
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git diff --cached --quiet && exit 0
+          git commit -m 'Apply validated GR v1.0.13 single-file implementation'
+          git push origin HEAD:main
