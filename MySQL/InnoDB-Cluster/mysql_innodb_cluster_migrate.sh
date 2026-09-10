@@ -1,10 +1,10 @@
 #!/bin/sh
-# mysql_innodb_cluster_migrate.sh v1.0.15
+# mysql_innodb_cluster_migrate.sh v1.0.16
 # POSIX sh. Oracle MySQL GA 8.0+; runtime AdminAPI capability detection. Requires preinstalled mysql/mysqlsh; never installs packages.
 # Safe automation for prepared MySQL instances / existing Group Replication -> InnoDB Cluster.
 set -eu
 umask 077
-VERSION=1.0.15
+VERSION=1.0.16
 ROOT=${MYSQL_IC_WORK_ROOT:-"$(pwd)/mysql_innodb_cluster_work"}
 MYSQL=${MYSQL_IC_MYSQL:-mysql}
 MYSQLSH=${MYSQL_IC_MYSQLSH:-mysqlsh}
@@ -57,7 +57,7 @@ EOF
 cred(){ i=$1; [ -f "$TMP/$i.pw" ] && return 0; mode=$(get "$i" auth_mode); if [ "$mode" = login-path ]; then return 0; fi; pw=$(secret "Node $i password for $(get "$i" user)"); printf '%s\n' "$pw" > "$TMP/$i.pw"; chmod 600 "$TMP/$i.pw"; }
 mysql_cmd(){ i=$1; shift; if [ "$(get "$i" auth_mode)" = login-path ]; then lp=$(get "$i" login_path); lf=$(get "$i" login_file); MYSQL_TEST_LOGIN_FILE="$lf" "$MYSQL" --login-path="$lp" "$@"; else cred "$i"; pw=$(cat "$TMP/$i.pw"); MYSQL_PWD="$pw" "$MYSQL" -h "$(get "$i" host)" -P "$(get "$i" port)" -u "$(get "$i" user)" --protocol=TCP "$@"; fi; }
 sql(){ i=$1; stmt=$2; printf '%s\n' "$stmt" | mysql_cmd "$i" --batch --raw --skip-column-names; }
-mysqlsh_exec(){ i=$1; code=$2; out=$3; if [ "$(get "$i" auth_mode)" = login-path ]; then lp=$(get "$i" login_path); lf=$(get "$i" login_file); MYSQL_TEST_LOGIN_FILE="$lf" "$MYSQLSH" --no-wizard --login-path="$lp" --js --execute="$code" >"$out" 2>&1; else cred "$i"; uri="$(get "$i" user)@$(get "$i" host):$(get "$i" port)"; cat "$TMP/$i.pw" | "$MYSQLSH" --no-wizard --uri "$uri" --passwords-from-stdin --js --execute="$code" >"$out" 2>&1; fi; }
+mysqlsh_exec(){ i=$1; code=$2; out=$3; if [ "$(get "$i" auth_mode)" = login-path ]; then lp=$(get "$i" login_path); lf=$(get "$i" login_file); MYSQL_TEST_LOGIN_FILE="$lf" "$MYSQLSH" --login-path="$lp" --no-wizard --js --execute="$code" >"$out" 2>&1; else cred "$i"; uri="$(get "$i" user)@$(get "$i" host):$(get "$i" port)"; cat "$TMP/$i.pw" | "$MYSQLSH" --no-wizard --uri "$uri" --passwords-from-stdin --js --execute="$code" >"$out" 2>&1; fi; }
 admin_ready(){ [ -f "$ROOT/meta/admin_user" ]; }
 admin_cred(){ [ -f "$TMP/admin.pw" ] && return 0; admin_ready || die 'Run configure-admin first'; ap=$(secret "Cluster admin password for $(get meta admin_user)"); [ -n "$ap" ] || die 'Cluster admin password cannot be empty'; printf '%s\n' "$ap" > "$TMP/admin.pw"; chmod 600 "$TMP/admin.pw"; }
 admin_host_for(){ i=$1; if [ -f "$ROOT/$i/admin_host" ]; then get "$i" admin_host; else get "$i" connect_host; fi; }
@@ -148,6 +148,50 @@ sql_precheck(){
     : > "$ROOT/meta/sql_prechecked"
     log "SQL PRECHECK PASSED: members=$total ONLINE=$online mode=$(get meta gr_mode). No configuration was changed."
 }
+show_existing_admin_candidates(){
+    out="$ROOT/existing_admin_candidates.txt"
+    accounts="$TMP/existing_accounts.tsv"
+    : > "$out"
+    sql 1 "SELECT User,Host FROM mysql.user WHERE User<>'' AND User NOT IN ('mysql.infoschema','mysql.session','mysql.sys') ORDER BY User,Host;" > "$accounts"
+    log 'Existing AdminAPI account candidates:'
+    log '  Candidate means the same user@host exists on every registered node.'
+    log '  Listed privileges are informational only; roles and release-specific AdminAPI requirements can change effective privileges.'
+    log '  Final acceptance always requires the supplied password plus dba.checkInstanceConfiguration() on every node.'
+    found=0
+    tab=$(printf '\t')
+    while IFS="$tab" read -r u h; do
+        [ -n "$u" ] && [ -n "$h" ] || continue
+        all=yes
+        for i in $(ids); do
+            c=$(sql "$i" "SELECT COUNT(*) FROM mysql.user WHERE User='$(q "$u")' AND Host='$(q "$h")';")
+            [ "$c" -eq 1 ] || { all=no; break; }
+        done
+        [ "$all" = yes ] || continue
+        found=$((found+1))
+        printf '  %s@%s\n' "$u" "$h" >> "$out"
+        gp=$(sql 1 "SELECT COALESCE(GROUP_CONCAT(PRIVILEGE_TYPE ORDER BY PRIVILEGE_TYPE SEPARATOR ','),'') FROM information_schema.USER_PRIVILEGES WHERE GRANTEE=CONCAT(CHAR(39),'$(q "$u")',CHAR(39),'@',CHAR(39),'$(q "$h")',CHAR(39));")
+        dp=$(sql 1 "SELECT COALESCE(GROUP_CONCAT(PRIV ORDER BY PRIV SEPARATOR ','),'') FROM mysql.global_grants WHERE USER='$(q "$u")' AND HOST='$(q "$h")';" 2>/dev/null || printf '')
+        [ -n "$gp" ] || gp='(none shown; effective privileges may be role-based)'
+        printf '    global/static: %s\n' "$gp" >> "$out"
+        [ -z "$dp" ] || printf '    global/dynamic: %s\n' "$dp" >> "$out"
+    done < "$accounts"
+    [ "$found" -gt 0 ] || printf '  (no identical user@host account exists on every registered node)\n' >> "$out"
+    cat "$out" >&2
+}
+
+recommended_admin_host_pattern(){
+    members=$(grmembers 1)
+    [ -n "$members" ] || { printf ''; return 0; }
+    first=$(printf '%s\n' "$members" | awk 'NF{print $2; exit}')
+    [ -n "$first" ] || { printf ''; return 0; }
+    same=yes
+    while IFS= read -r h; do [ "$h" = "$first" ] || same=no; done <<EOF
+$(printf '%s\n' "$members" | awk 'NF{print $2}')
+EOF
+    [ "$same" = yes ] || { printf ''; return 0; }
+    case $first in localhost|127.0.0.1|::1) printf '';; *) printf '%s' "$first";; esac
+}
+
 configure_admin(){
     [ -f "$ROOT/meta/complete" ] || die 'Run discover first'
     sql_precheck
@@ -159,13 +203,16 @@ configure_admin(){
     log '  create   : create a dedicated AdminAPI account using dba.configureInstance(clusterAdmin=...).'
     log '             MySQL Shell grants only the privileges required for InnoDB Cluster administration for this version.'
     log '  existing : reuse an existing account. The script validates it and never broadens privileges automatically.'
+    show_existing_admin_candidates
     action=$(choice 'Cluster admin account action' create create existing)
 
     au=$(ask 'Cluster admin account name' 'icadmin')
     case $au in ''|*[!A-Za-z0-9_.-]*) die 'Invalid cluster admin user';; esac
     log 'Cluster admin Host must allow connections from every cluster member while remaining as narrow as your network permits.'
     log "Examples: exact management IP for same-host multi-instance; 10.0.0.% or an appropriate subnet pattern for distributed members. '%' is broad and requires extra confirmation."
-    ah=$(ask 'Cluster admin account host pattern' '')
+    rec_ah=$(recommended_admin_host_pattern)
+    if [ -n "$rec_ah" ]; then log "Auto-detected narrow Host candidate from current GR MEMBER_HOST: $rec_ah"; fi
+    ah=$(ask 'Cluster admin account host pattern' "$rec_ah")
     [ -n "$ah" ] || die 'Cluster admin host pattern cannot be empty'
     [ "$ah" != '%' ] || { log "WARNING: '$au'@'%' accepts authentication attempts from any source address allowed by network controls."; confirm "ALLOW-BROAD-ADMIN-HOST-$au"; }
     ap=$(secret 'Cluster admin password')
@@ -193,7 +240,7 @@ print("IC_ADMIN_CONFIGURED=ok");
 EOF
                 chmod 600 "$js"
                 if [ "$(get "$i" auth_mode)" = login-path ]; then
-                    MYSQL_TEST_LOGIN_FILE="$(get "$i" login_file)" "$MYSQLSH" --no-wizard --login-path="$(get "$i" login_path)" --js -f "$js" >"$out" 2>&1 || { cat "$out" >&2; die "clusterAdmin creation failed on node $i"; }
+                    MYSQL_TEST_LOGIN_FILE="$(get "$i" login_file)" "$MYSQLSH" --login-path="$(get "$i" login_path)" --no-wizard --js -f "$js" >"$out" 2>&1 || { cat "$out" >&2; die "clusterAdmin creation failed on node $i"; }
                 else
                     cred "$i"; uri="$(get "$i" user)@$(get "$i" host):$(get "$i" port)"
                     cat "$TMP/$i.pw" | "$MYSQLSH" --no-wizard --uri "$uri" --passwords-from-stdin --js -f "$js" >"$out" 2>&1 || { cat "$out" >&2; die "clusterAdmin creation failed on node $i"; }
