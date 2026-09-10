@@ -6,7 +6,7 @@ PostgreSQL SQL 실행계획과 Planner 관련 정보를 한 번에 확인하기 
 
 지원 범위: PostgreSQL 12 ~ 18
 
-> **현재 main 기준 최신 스크립트 버전: `v1.2.25`**
+> **현재 main 기준 최신 스크립트 버전: `v1.2.26`**
 
 실행 파일:
 
@@ -197,6 +197,42 @@ EXPLAIN (... FORMAT JSON) EXECUTE ...
 ```
 
 Bind 후보 탐색도 별도 Python Parser 없이 PostgreSQL Plan JSON, catalog, SQL 함수와 shell 기본 도구를 이용해 처리.
+
+### pg_stat_statements EXPLAIN 대상 검증
+
+`pg_stat_statements`에서 가져온 query text는 bind 입력 전에 statement 종류를 먼저 확인한다.
+
+PostgreSQL 공식 `EXPLAIN` 문서의 statement 범위:
+
+```text
+SELECT
+INSERT
+UPDATE
+DELETE
+MERGE
+VALUES
+EXECUTE
+DECLARE
+CREATE TABLE AS
+CREATE MATERIALIZED VIEW AS
+```
+
+이 중 `pg_stat_statements` replay의 bind 분석에서 사용하는 `PREPARE`와 직접 호환되는 기본 대상은 다음과 같이 처리한다.
+
+```text
+SELECT
+INSERT
+UPDATE
+DELETE
+MERGE
+VALUES
+```
+
+`WITH`와 `TABLE`은 SELECT 계열 문법 형태이므로 첫 키워드만으로 거부하지 않고, 이후 실제 PostgreSQL parser/PREPARE 단계에서 최종 검증한다.
+
+`SET`, `SHOW`, `RESET` 등 EXPLAIN 대상이 아닌 utility statement는 bind 입력 전에 차단하고 다른 queryid를 다시 입력받는다.
+
+`EXECUTE`, `DECLARE`, `CREATE TABLE AS`, `CREATE MATERIALIZED VIEW AS`는 PostgreSQL 공식 EXPLAIN 대상이지만 `pg_stat_statements` replay에서는 자동 재현하지 않는다. Prepared Statement/Cursor 등 원본 세션 상태 의존성 또는 `EXPLAIN ANALYZE` 시 객체 생성 부작용이 있기 때문이다. 필요한 경우 SQL 파일로 명시적으로 실행 환경을 검토한 뒤 사용한다.
 
 ### Prepared Plan Mode
 
@@ -425,7 +461,7 @@ TEXT Plan을 역파싱하여 구조 추정
 
 운영 환경에서는 PostgreSQL Server Version, 실제 Session 설정, 통계 변경, Concurrent Activity에 따라 Plan 및 누적 통계 값 변동 가능.
 
-## v1.2.25 기준 의존성 정리
+## v1.2.26 기준 의존성 정리
 
 - `plan_tree.py` 제거
 - Python 3 런타임 의존 제거
