@@ -1,11 +1,11 @@
 #!/bin/sh
-# mysql_gr_migrate.sh v1.0.11
+# mysql_gr_migrate.sh v1.0.12
 # POSIX sh; OS utilities and MySQL clients only. No external language packages.
 # Supported: Oracle MySQL 8.0.27+, 8.4.x, 9.7.x; homogeneous exact versions.
 # Single-primary or multi-primary / XCom. Never resets GTID or binary logs.
 set -eu
 umask 077
-VERSION=1.0.11
+VERSION=1.0.12
 ROOT=${MYSQL_GR_WORK_ROOT:-"$(pwd)/mysql_gr_work"}
 MYSQL=${MYSQL_GR_MYSQL:-mysql}
 DUMP=${MYSQL_GR_MYSQLDUMP:-mysqldump}
@@ -58,6 +58,9 @@ secret() (
 cleanup() {
     rc=$?
     trap - 0 1 2 15
+    if [ "$rc" -ne 0 ] && [ -d "${RUN:-}/cutover_rollback" ] && [ ! -f "$ROOT/meta/bootstrap_attempted" ]; then
+        rollback_cutover || log "URGENT: cutover rollback incomplete; preserve $RUN/cutover_rollback"
+    fi
     if [ -n "${BOOT_NODE:-}" ] && [ -d "${TEMP:-}" ]; then
         sql "$BOOT_NODE" 'SET GLOBAL group_replication_bootstrap_group=OFF;' >/dev/null 2>&1 || log 'URGENT: manually set group_replication_bootstrap_group=OFF on bootstrap node.'
     fi
@@ -82,9 +85,10 @@ cleanup() {
 help() {
     cat <<EOF
 mysql_gr_migrate.sh v$VERSION
-Usage: sh mysql_gr_migrate.sh discover|configure|precheck|initialize|cutover|join|release|validate|status|all
+Usage: sh mysql_gr_migrate.sh discover|configure|tls|precheck|initialize|cutover|join|release|validate|status|all
   discover   Select GTID -> GR / Standalone -> GR and 2..9 nodes
   configure  Generate version-aware config; optionally apply/restart local nodes
+  tls        Prepare and verify SAN certificates; default is plan-only (MYSQL_GR_TLS_ACTION=apply to apply)
   precheck   Read-only identity, configuration, schema and channel checks
   initialize Fence writes, catch up GTID replicas, provision empty nodes
   cutover    Recheck, stop selected async channels, configure recovery, bootstrap/join
@@ -387,7 +391,7 @@ config_lines() (
     i=$1; sid=$2
     printf '[mysqld]\nserver_id=%s\ngtid_mode=ON\nenforce_gtid_consistency=ON\nbinlog_format=ROW\nlog_replica_updates=ON\nreplica_preserve_commit_order=ON\nskip_replica_start=ON\n' "$sid"
     if [ "$(val "$i" log_bin)" != 1 ]; then printf 'log_bin\n'; fi
-    for pair in 'transaction_write_set_extraction XXHASH64' 'replica_parallel_type LOGICAL_CLOCK' 'master_info_repository TABLE' 'relay_log_info_repository TABLE'; do
+    for pair in 'xa_detach_on_prepare ON' 'transaction_write_set_extraction XXHASH64' 'replica_parallel_type LOGICAL_CLOCK' 'master_info_repository TABLE' 'relay_log_info_repository TABLE'; do
         set -- $pair
         if hasvar "$i" "$1"; then printf '%s=%s\n' "$1" "$2"; fi
     done
@@ -568,6 +572,39 @@ r_identity() {
     [ -z "$RDEFAULT" ] || printf '%s\n' "$RDEFAULT" >> "$RTMP/candidates"
     sort -u "$RTMP/candidates" -o "$RTMP/candidates"
 }
+r_chain_walk() (
+    file=$1; cwd=$2; depth=$3
+    [ "$depth" -le 32 ] || r_die 'Configuration include cycle or excessive depth'
+    case $file in /*) :;; *) file="$cwd/$file";; esac
+    file=$(readlink -f "$file") || r_die 'Cannot resolve configuration include'
+    [ -f "$file" ] && [ -r "$file" ] || r_die "Unreadable configuration include: $file"
+    case $file in *'
+'*|*'\t'*) r_die 'Unsupported configuration filename';; esac
+    sha256sum "$file" || exit 1
+    awk '/^[[:space:]]*!include(dir)?[[:space:]]/ {line=$0; sub(/^[[:space:]]*/,"",line); key=line; sub(/[[:space:]].*$/, "",key); sub(/^[^[:space:]]+[[:space:]]+/, "",line); sub(/[[:space:]]+$/, "",line); print key "\t" line}' "$file" > "$RTMP/include.$$.${depth}"
+    tab=$(printf '\t')
+    while IFS="$tab" read -r kind path; do
+        case $path in \"*\") path=${path#\"}; path=${path%\"};; \'*\') path=${path#\'}; path=${path%\'};; esac
+        case $path in /*) :;; *) path="$cwd/$path";; esac
+        case $kind in
+            '!include') r_chain_walk "$path" "$cwd" "$((depth+1))" || exit 1;;
+            '!includedir')
+                [ -d "$path" ] && [ -r "$path" ] || r_die "Unreadable includedir: $path"
+                printf 'DIRECTORY %s\n' "$path"
+                for child in "$path"/*.cnf; do
+                    [ -e "$child" ] || continue
+                    r_chain_walk "$child" "$cwd" "$((depth+1))" || exit 1
+                done;;
+        esac
+    done < "$RTMP/include.$$.${depth}"
+)
+
+r_chain_snapshot() (
+    r_chain_walk "$1" "$3" 0 > "$2.unsorted" || exit 1
+    LC_ALL=C sort -u "$2.unsorted" > "$2"
+    rm -f "$2.unsorted"
+)
+
 r_config_guard() {
     case $CNF in /*) :;; *) r_die 'Choose an absolute remote configuration path';; esac
     [ -f "$CNF" ] && [ ! -L "$CNF" ] || r_die 'Configuration must be a regular non-symlink file'
@@ -695,6 +732,7 @@ r_main() {
     START_LOG="${CNF}.gr_start_${stamp}.log"
     CANDIDATE=$(mktemp "${CNF}.gr_candidate.XXXXXX")
     cp -a "$CNF" "$CANDIDATE"
+    r_chain_snapshot "$CNF" "$RTMP/include.before" "$RCWD"
     cp -a "$CNF" "$RTMP/original.cnf"
     sed '/^# BEGIN mysql_gr_migrate$/,/^# END mysql_gr_migrate$/d' "$CNF" > "$RTMP/config"
     printf '\n# BEGIN mysql_gr_migrate\n%s\n# END mysql_gr_migrate\n' "$SNIPPET" >> "$RTMP/config"
@@ -715,6 +753,8 @@ r_main() {
     fi
     [ "$ACTION" = apply ] || r_die 'Unknown remote action'
     r_same_process
+    r_chain_snapshot "$CNF" "$RTMP/include.current" "$RCWD"
+    cmp -s "$RTMP/include.before" "$RTMP/include.current" || r_die 'Configuration include chain changed concurrently'
     cmp -s "$CNF" "$RTMP/original.cnf" || r_die 'Configuration changed concurrently; original left unchanged'
     BACKUP="${CNF}.before_gr_${stamp}"
     [ ! -e "$BACKUP" ] || r_die 'Backup already exists'
@@ -946,6 +986,7 @@ schema_check() (
 )
 precheck() {
     connected; no_group; endpoints_check
+    tls_preflight
     seen=' '
     for i in $(ids); do
         sid=$(val "$i" server_id); [ "$sid" -gt 0 ] || die 'server_id=0'
@@ -967,6 +1008,9 @@ precheck() {
         [ -n "$(val "$i" ssl_cert)" ] && [ -n "$(val "$i" ssl_key)" ] || die 'Server TLS certificate/key required'
         [ "$(sql "$i" "SELECT COUNT(*) FROM information_schema.plugins WHERE PLUGIN_NAME='clone' AND PLUGIN_STATUS='ACTIVE';")" = 0 ] || die 'Active Clone plugin needs a separately reviewed clone workflow; this workflow is incremental-only'
         channels_check "$i"; schema_check "$i"
+        if hasvar "$i" xa_detach_on_prepare; then
+            case $(val "$i" xa_detach_on_prepare) in 1|ON) :;; *) die "Node $i xa_detach_on_prepare must be ON for this GR workflow";; esac
+        fi
         sql "$i" 'XA RECOVER;' > "$RUN/node_$i.xa.tsv"
         [ ! -s "$RUN/node_$i.xa.tsv" ] || die 'Prepared XA must be resolved before migration'
         sql "$i" 'SHOW GLOBAL VARIABLES;' > "$RUN/node_$i.variables.tsv"
@@ -1514,16 +1558,281 @@ inspect_extra_gtids() {
     fi
 }
 
+
+capture_reprovision_evidence() {
+    i=$1; target=$2
+    dir="$RUN/node_${i}.reprovision"
+    mkdir -p "$dir"; chmod 700 "$dir"
+    sql "$i" "SELECT @@server_uuid,@@hostname,@@port,@@socket,@@datadir,@@pid_file,@@server_id,REPLACE(REPLACE(@@gtid_executed,CHAR(10),''),CHAR(13),''),REPLACE(REPLACE(@@gtid_purged,CHAR(10),''),CHAR(13),''),@@read_only,@@super_read_only,@@event_scheduler;" > "$dir/runtime_before.tsv"
+    sql "$i" 'SELECT CURRENT_USER(),USER();' > "$dir/current_user.tsv"
+    sql "$i" 'SHOW GRANTS FOR CURRENT_USER;' > "$dir/current_admin_grants.sql" 2>/dev/null || :
+    sql "$i" "SELECT PLUGIN_NAME,PLUGIN_STATUS,PLUGIN_TYPE,PLUGIN_LIBRARY FROM information_schema.plugins ORDER BY PLUGIN_NAME;" > "$dir/plugins.tsv"
+    sql "$i" "SELECT EVENT_SCHEMA,EVENT_NAME,DEFINER,STATUS,EVENT_TYPE,EXECUTE_AT,INTERVAL_VALUE,INTERVAL_FIELD FROM information_schema.events ORDER BY EVENT_SCHEMA,EVENT_NAME;" > "$dir/events.tsv"
+    sql "$i" 'SELECT * FROM performance_schema.persisted_variables ORDER BY VARIABLE_NAME;' > "$dir/persisted_variables.tsv" 2>/dev/null || :
+    sql "$i" 'SHOW REPLICA STATUS;' > "$dir/replica_status.tsv" 2>/dev/null || :
+    sql "$i" "SELECT CHANNEL_NAME,HOST,PORT,AUTO_POSITION FROM performance_schema.replication_connection_configuration ORDER BY CHANNEL_NAME;" > "$dir/replication_connections.tsv" 2>/dev/null || :
+    printf 'TARGET_GTID\t%s\n' "$target" > "$dir/target_gtid.tsv"
+    if [ "$(get "$i" location)" = local ]; then
+        pnow=$(local_pid "$i") || die "Node $i local runtime identity changed; reprovision package not generated"
+        tr '\000' '\n' < "/proc/$pnow/cmdline" > "$dir/mysqld_argv.txt"
+        cat "/proc/$pnow/cgroup" > "$dir/mysqld_cgroup.txt" 2>/dev/null || :
+        readlink -f "/proc/$pnow/exe" > "$dir/mysqld_exe.txt"
+        stat -c '%n|%U|%G|%u|%g|%a|%d|%i' "$(val "$i" datadir)" > "$dir/filesystem_identity.txt"
+        cnf=$(get "$i" cnf)
+        if [ -n "$cnf" ] && [ -f "$cnf" ] && [ ! -L "$cnf" ]; then
+            cp -p "$cnf" "$dir/$(basename "$cnf").before_reprovision"
+            sha256sum "$cnf" "$dir/$(basename "$cnf").before_reprovision" > "$dir/cnf.sha256"
+            stat -c '%n|%U|%G|%u|%g|%a|%d|%i' "$cnf" >> "$dir/filesystem_identity.txt"
+        fi
+    else
+        write_mysql_readonly_command "$i" 'SELECT @@server_uuid,@@hostname,@@port,@@socket,@@datadir,@@pid_file,@@server_id,@@gtid_executed,@@gtid_purged;' "$dir/remote_identity_check.sh"
+    fi
+    printf '%s' "$dir"
+}
+
+
+
+mysqldump_version_guard() {
+    command -v "$DUMP" >/dev/null 2>&1 || die 'Matching mysqldump executable required'
+    version_file="$RUN/mysqldump_version.txt"
+    "$DUMP" --version > "$version_file" 2>&1 || die 'Cannot execute mysqldump --version'
+    dump_version=$(sed -n 's/.*Ver \([0-9][0-9.]*\).*/\1/p' "$version_file" | head -n 1)
+    source_version=$(get 1 version | sed 's/[^0-9.].*//')
+    [ -n "$dump_version" ] && [ "$dump_version" = "$source_version" ] || die "mysqldump version ${dump_version:-UNKNOWN} does not match Source server $source_version; set MYSQL_GR_MYSQLDUMP"
+}
+
+source_admin_target_credential() {
+    i=$1
+    credential 1
+    candidate="$TEMP/$i.source_admin.cnf"
+    {
+        printf '[client]\n'
+        sed -n '/^user=/p; /^password=/p' "$TEMP/1.cnf"
+        if [ "$(get "$i" mode)" = socket ]; then
+            printf 'protocol=SOCKET\nsocket="%s"\n' "$(optq "$(get "$i" socket)")"
+        else
+            printf 'protocol=TCP\nhost="%s"\nport=%s\nssl-mode=%s\n' "$(optq "$(get "$i" host)")" "$(get "$i" port)" "$(get "$i" admin_tls)"
+            [ ! -s "$ROOT/$i/admin_ca" ] || printf 'ssl-ca="%s"\n' "$(optq "$(get "$i" admin_ca)")"
+        fi
+        printf '\n[mysql]\nconnect-timeout=10\n'
+    } > "$candidate"
+    chmod 600 "$candidate"
+    if ! target_current=$(printf 'SELECT CURRENT_USER();\n' | "$MYSQL" --defaults-file="$candidate" --no-login-paths --batch --raw --skip-column-names 2>/dev/null); then
+        rm -f "$candidate"
+        return 1
+    fi
+    source_current=$(sql 1 'SELECT CURRENT_USER();')
+    if [ "$target_current" != "$source_current" ]; then
+        rm -f "$candidate"
+        return 1
+    fi
+    mv -f "$candidate" "$TEMP/$i.cnf"
+}
+
+export_source_accounts() {
+    dir=$1; account_node=${2:-1}
+    account_list="$dir/source_accounts.list"
+    account_sql="$dir/source_accounts.sql"
+    grant_sql="$dir/source_grants.sql"
+    default_roles="$dir/source_default_roles.sql"
+    role_rows="$dir/.source_default_roles.rows"
+
+    if ! sql "$account_node" "SELECT CONCAT(QUOTE(u.User),'@',QUOTE(u.Host)) FROM mysql.user u LEFT JOIN (SELECT DISTINCT FROM_USER,FROM_HOST FROM mysql.role_edges) r ON r.FROM_USER=u.User AND r.FROM_HOST=u.Host WHERE u.User NOT IN ('mysql.infoschema','mysql.session','mysql.sys') ORDER BY CASE WHEN r.FROM_USER IS NULL THEN 1 ELSE 0 END,u.User,u.Host;" > "$account_list"; then
+        die 'Cannot enumerate Source accounts/roles for logical reprovisioning'
+    fi
+    [ -s "$account_list" ] || die 'Source account list is empty; logical provisioning cannot safely mark the full Source GTID set executed'
+
+    source_admin=$(sql "$account_node" "SELECT CONCAT(QUOTE(User),'@',QUOTE(Host)) FROM mysql.user WHERE CONCAT(User,'@',Host)=CURRENT_USER();")
+    [ -n "$source_admin" ] || die 'Cannot resolve the Source administrative account in mysql.user'
+    grep -Fx "$source_admin" "$account_list" >/dev/null 2>&1 || die 'Source administrative account was not included in the account export'
+
+    : > "$account_sql"
+    printf '%s\n' '-- Generated from authoritative node 1. Contains authentication hashes; protect this file.' >> "$account_sql"
+    printf '%s\n' 'SET SESSION sql_log_bin=0;' >> "$account_sql"
+    printf '%s\n' 'SET SESSION sql_log_bin=0;' > "$grant_sql"
+
+    account_no=0
+    while IFS= read -r account; do
+        [ -n "$account" ] || continue
+        case $account in *';'*) die 'Unexpected account literal from Source';; esac
+        account_no=$((account_no+1))
+        create_file="$dir/.source_create_user_$account_no.tsv"
+        if hasvar "$account_node" print_identified_with_as_hex; then
+            if ! sql "$account_node" "SET SESSION print_identified_with_as_hex=ON; SHOW CREATE USER $account;" > "$create_file"; then
+                rm -f "$create_file"
+                die "SHOW CREATE USER failed for $account"
+            fi
+        else
+            if ! sql "$account_node" "SHOW CREATE USER $account;" > "$create_file"; then
+                rm -f "$create_file"
+                die "SHOW CREATE USER failed for $account"
+            fi
+        fi
+        create=$(cut -f2- "$create_file")
+        rm -f "$create_file"
+        [ -n "$create" ] || die "SHOW CREATE USER returned no definition for $account"
+        # Preserve existing DEFINER relationships. Fresh staging has root@localhost;
+        # CREATE IF NOT EXISTS followed by ALTER also restores its authentication.
+        create=${create%;}
+        case $create in 'CREATE USER '*) :;; *) die 'Unexpected SHOW CREATE USER output';; esac
+        printf 'CREATE USER IF NOT EXISTS %s;\n' "${create#CREATE USER }" >> "$account_sql"
+        printf 'ALTER USER %s;\n' "${create#CREATE USER }" >> "$account_sql"
+    done < "$account_list"
+
+    grant_no=0
+    while IFS= read -r account; do
+        [ -n "$account" ] || continue
+        grant_no=$((grant_no+1))
+        grant_file="$dir/.source_grants_$grant_no.tsv"
+        if ! sql "$account_node" "SHOW GRANTS FOR $account;" > "$grant_file"; then
+            rm -f "$grant_file"
+            die "SHOW GRANTS failed for $account; refusing an incomplete account package"
+        fi
+        [ -s "$grant_file" ] || { rm -f "$grant_file"; die "SHOW GRANTS returned no rows for $account"; }
+        while IFS= read -r grant_line; do
+            [ -n "$grant_line" ] || continue
+            printf '%s;\n' "${grant_line%;}" >> "$grant_sql"
+        done < "$grant_file"
+        rm -f "$grant_file"
+    done < "$account_list"
+
+    if ! sql "$account_node" "SELECT QUOTE(USER),QUOTE(HOST),QUOTE(DEFAULT_ROLE_USER),QUOTE(DEFAULT_ROLE_HOST) FROM mysql.default_roles ORDER BY USER,HOST,DEFAULT_ROLE_USER,DEFAULT_ROLE_HOST;" > "$role_rows"; then
+        rm -f "$role_rows"
+        die 'Cannot export Source default-role metadata; refusing an incomplete account package'
+    fi
+    : > "$default_roles"
+    tab=$(printf '\t')
+    current_account=''
+    current_roles=''
+    while IFS="$tab" read -r role_user role_host default_user default_host; do
+        [ -n "$role_user" ] || continue
+        account="$role_user@$role_host"
+        role="$default_user@$default_host"
+        if [ -n "$current_account" ] && [ "$account" != "$current_account" ]; then
+            printf 'SET DEFAULT ROLE %s TO %s;\n' "$current_roles" "$current_account" >> "$default_roles"
+            current_roles=''
+        fi
+        current_account=$account
+        if [ -n "$current_roles" ]; then current_roles="$current_roles,$role"; else current_roles=$role; fi
+    done < "$role_rows"
+    [ -z "$current_account" ] || printf 'SET DEFAULT ROLE %s TO %s;\n' "$current_roles" "$current_account" >> "$default_roles"
+    rm -f "$role_rows"
+    cat "$default_roles" >> "$grant_sql"
+
+    printf '%s\n' 'SET SESSION sql_log_bin=1;' >> "$account_sql"
+    printf '%s\n' 'SET SESSION sql_log_bin=1;' >> "$grant_sql"
+    chmod 600 "$account_list" "$account_sql" "$grant_sql" "$default_roles"
+    (cd "$dir" && sha256sum source_accounts.sql source_grants.sql > source_accounts.sql.sha256)
+    printf '%s' "$account_sql"
+}
+
+prepare_reprovision_dump() {
+    i=$1; target=$2; dir=$3
+    definer_guard 1
+    dbs=$(sql 1 "SELECT schema_name FROM information_schema.schemata WHERE schema_name NOT IN ('mysql','sys','performance_schema','information_schema') ORDER BY schema_name;")
+    [ -n "$dbs" ] || die 'Authoritative source has no application DBs; automatic logical reprovision package cannot be built'
+    for db in $dbs; do case $db in *[!A-Za-z0-9_\$]*) die 'Database name requires external provisioning';; esac; done
+    mysqldump_version_guard
+    accounts=$(export_source_accounts "$dir")
+    dump="$dir/source_application.sql"
+    set -f; set -- $dbs; set +f
+    "$DUMP" --defaults-file="$TEMP/1.cnf" --no-login-paths --single-transaction --quick --skip-lock-tables --routines --events --triggers --hex-blob --set-gtid-purged=ON --databases "$@" > "$dump" 2> "$dir/source_dump.log"
+    [ -s "$dump" ] || die 'Reprovision source dump is empty'
+    (cd "$dir" && sha256sum source_application.sql > source_application.sql.sha256)
+    printf 'ACCOUNT_SQL\t%s\n' "$accounts" > "$dir/logical_reprovision_components.tsv"
+    printf 'APPLICATION_DUMP\t%s\n' "$dump" >> "$dir/logical_reprovision_components.tsv"
+    [ "$(normalize_gtid "$(val 1 gtid_executed)")" = "$target" ] || die 'Authoritative source GTID changed while preparing reprovision package'
+    printf '%s' "$dump"
+}
+
+write_reprovision_plan() {
+    i=$1; target=$2; dir=$3; dump=$4
+    plan="$dir/reprovision_plan.txt"
+    datadir=$(val "$i" datadir); datadir=${datadir%/}
+    cnf=$(get "$i" cnf)
+    old_uuid=$(get "$i" uuid)
+    stamp='$(date +%Y%m%d_%H%M%S)_$$'
+    {
+        printf 'Node %s clean reprovision plan\n' "$i"
+        printf 'Authoritative node: 1\nOld UUID: %s\nTarget GTID: %s\nDatadir: %s\nCNF: %s\nDump: %s\n\n' "$old_uuid" "$target" "$datadir" "$cnf" "$dump"
+        printf 'Safety rules:\n'
+        printf '  - Do NOT run RESET BINARY LOGS AND GTIDS / RESET MASTER.\n'
+        printf '  - Do NOT delete the original datadir. Preserve it by atomic rename on the same filesystem.\n'
+        printf '  - Build and validate a fresh staging datadir before the final swap whenever OS access permits.\n'
+        printf '  - auto.cnf from the old datadir remains only in the rollback backup; it must not be copied into the fresh datadir.\n'
+        printf '  - Re-read PID/server_uuid/datadir immediately before any stop or swap; saved PID values are evidence only.\n\n'
+        printf 'Recommended path layout at execution time:\n'
+        printf '  STAGING=%s.gr_reprovision_stage_%s\n' "$datadir" "$stamp"
+        printf '  BACKUP=%s.before_gr_reprovision_%s\n' "$datadir" "$stamp"
+        printf '  FAILED=%s.failed_gr_reprovision_%s\n\n' "$datadir" "$stamp"
+        if [ "$(get "$i" location)" = local ]; then
+            pnow=$(local_pid "$i") || die "Node $i runtime identity changed while writing reprovision plan"
+            exe=$(readlink -f "/proc/$pnow/exe")
+            owner=$(stat -c %U "$datadir")
+            pidfile=$(val "$i" pid_file); sock=$(val "$i" socket)
+            service=$(sed -n 's#.*\/\([^/]*\.service\)$#\1#p' "/proc/$pnow/cgroup" | head -n 1)
+            printf 'Local runtime evidence:\n  PID=%s\n  mysqld=%s\n  owner=%s\n  pid_file=%s\n  socket=%s\n  systemd_service=%s\n\n' "$pnow" "$exe" "$owner" "$pidfile" "$sock" "${service:-NONE}"
+            printf 'Execution sequence:\n'
+            printf '  1. Revalidate current UUID/datadir/PID and verify CNF checksum.\n'
+            printf '  2. Create STAGING as a sibling of the current datadir with the same owner/group/mode.\n'
+            printf '  3. Initialize STAGING with the same mysqld version using --initialize-insecure and isolated socket/pid/log/binlog paths.\n'
+            printf '  4. Start only the STAGING instance with --skip-networking and event_scheduler=OFF.\n'
+            printf '  5. Create/alter accounts without DROP USER, restore %s, then restore source_grants.sql/default roles in the same session.\n' "$dump"
+            printf '     Account SQL contains authentication hashes and GRANT/role state; keep mode 600 and never print it to an unprotected terminal/log.\n'
+            printf '  6. Verify application objects, Source account/role state, and GTID exactly equals %s before final swap.\n' "$target"
+            printf '     If account/default-role export was incomplete, stop and use external/reviewed provisioning rather than marking all Source GTIDs executed.\n'
+            printf '  7. Stop STAGING cleanly, stop the original instance using the proven launcher, then rename original datadir -> BACKUP and STAGING -> original datadir.\n'
+            printf '  8. Start the original launcher, verify NEW server_uuid != %s, GTID == target, schema/data checks, and super_read_only=ON.\n' "$old_uuid"
+            printf '  9. Keep BACKUP until GR validation and application smoke tests are complete.\n\n'
+            printf 'Rollback sequence if the swapped instance fails validation:\n'
+            printf '  - Stop the new instance with the same proven launcher.\n'
+            printf '  - Rename current datadir -> FAILED.\n'
+            printf '  - Rename BACKUP -> %s.\n' "$datadir"
+            printf '  - Start the original launcher and verify server_uuid returns to %s before resuming any service.\n' "$old_uuid"
+        else
+            printf 'Remote-node handling:\n'
+            printf '  - Controller cannot assume filesystem access. Use SSH only after host/instance identity verification.\n'
+            printf '  - If SSH/OS access is unavailable, run the generated remote_identity_check.sh on/from an authorized host and execute the same STAGING/BACKUP/swap procedure there.\n'
+            printf '  - Copy the application dump, source_accounts.sql, and both checksum files to the target host before stopping the original instance; verify every checksum there.\n'
+            printf '  - Restore both application data and Source account/role state in an isolated STAGING instance before any datadir swap.\n'
+            printf '  - Do not infer a remote cnf/datadir path from the controller filesystem.\n'
+        fi
+        printf '\nAfter successful reprovision:\n'
+        printf '  - A fresh server_uuid is expected. Do not continue with this migration state.\n'
+        printf '  - Use a fresh MYSQL_GR_WORK_ROOT, run discover again, then configure/precheck/initialize.\n'
+    } > "$plan"
+    chmod 600 "$plan"
+    printf '%s' "$plan"
+}
+
+prepare_reprovision() {
+    i=$1; target=$2; reason=$3
+    log "Preparing reversible clean-reprovision package for node $i. No datadir/config mutation is performed by this step."
+    dir=$(capture_reprovision_evidence "$i" "$target")
+    dump=$(prepare_reprovision_dump "$i" "$target" "$dir")
+    plan=$(write_reprovision_plan "$i" "$target" "$dir" "$dump")
+    build_reprovision_executor "$i" "$target" "$dir"
+    printf 'REASON\t%s\n' "$reason" > "$dir/reason.tsv"
+    log "Reprovision evidence : $dir"
+    log "Source dump          : $dump"
+    log "Reprovision plan     : $plan"
+    log "Host-side executor: sh $dir/reprovision_helper.sh stage $dir TARGET_AUTH SOURCE_AUTH"
+    log 'Copy the COMPLETE package to a remote host without SSH. Run stage, review its result, then swap; rollback uses the same package. Original datadir is retained.'
+}
+
 divergence_abort_snapshot() {
     i=$1
     snapshot="$RUN/divergence_abort_state.tsv"
     {
-        printf 'NODE\tREAD_ONLY\tSUPER_READ_ONLY\tEVENT_SCHEDULER\tGTID_EXECUTED\n'
+        printf 'NODE	SERVER_UUID	READ_ONLY	SUPER_READ_ONLY	EVENT_SCHEDULER	GTID_EXECUTED
+'
         for j in $(ids); do
-            if row=$(sql "$j" 'SELECT @@server_uuid,@@read_only,@@super_read_only,@@event_scheduler,@@gtid_executed;' 2>/dev/null); then
-                printf '%s\t%s\n' "$j" "$row"
+            if row=$(sql "$j" "SELECT @@server_uuid,@@read_only,@@super_read_only,@@event_scheduler,REPLACE(REPLACE(@@gtid_executed,CHAR(10),''),CHAR(13),'');" 2>/dev/null); then
+                printf '%s	%s
+' "$j" "$row"
             else
-                printf '%s\tUNAVAILABLE\n' "$j"
+                printf '%s	UNAVAILABLE	UNAVAILABLE	UNAVAILABLE	UNAVAILABLE	UNAVAILABLE
+' "$j"
             fi
         done
     } > "$snapshot"
@@ -1543,9 +1852,10 @@ divergence_abort_snapshot() {
     fi
     log "  4) Review inspection summary: $RUN/node_${i}.errant_gtid_inspection.tsv"
     log '  5) Keep the migration stopped; do not run cutover while extra GTIDs remain.'
-    log '  6) After reviewed reconciliation/reprovisioning, rerun precheck and initialize if instance identity is unchanged.'
-    log '     If server_uuid/instance identity changed, use a fresh MYSQL_GR_WORK_ROOT and run discover again.'
+    log '  6) Choose reprovision to generate a reversible clean-rebuild package, or external for another reviewed method.'
+    log '  7) After a rebuild changes server_uuid, use a fresh MYSQL_GR_WORK_ROOT and run discover again.'
 }
+
 
 divergence_workflow() {
     i=$1; target=$2
@@ -1553,43 +1863,52 @@ divergence_workflow() {
     [ -n "$GTID_EXTRA" ] || return 0
     log "Node $i has divergent GTID history. There is no automatic ignore, skip, GTID rewrite, or reset path."
     while :; do
-        log '  inspect : read current binary logs and decode only the extra GTIDs; no SQL is applied (binary-log I/O/network reads may occur).'
-        log '  external: stop here for reviewed reconciliation/reprovisioning from the authoritative source.'
-        log '  abort   : stop without changing GTID history; save a read-only state snapshot and print next checks.'
-        action=$(required "Node $i divergent GTID action (inspect/external/abort)" inspect)
+        log '  inspect     : read current binary logs and decode only the extra GTIDs; no SQL is applied.'
+        log '  reprovision : generate evidence + authoritative logical dump + reversible STAGING/BACKUP/rollback plan.'
+        log '  external    : stop here for another reviewed reconciliation/reprovisioning method.'
+        log '  abort       : stop without changing GTID history; save a read-only state snapshot.'
+        action=$(required "Node $i divergent GTID action (inspect/reprovision/external/abort)" inspect)
         case $action in
             inspect)
                 inspect_extra_gtids "$i" "$target"
                 log 'Inspection complete. Review the saved evidence before deciding how to reconcile the member.'
                 while :; do
-                    log '  external: reconcile/reprovision outside this script, then rerun after identity and GTID checks pass.'
-                    log '  abort   : save current state and print exactly what to review next; no GTID reconciliation is attempted.'
-                    next_action=$(required "Node $i action after inspection (external/abort)" abort)
+                    log '  reprovision: prepare a reversible clean-rebuild package from authoritative node 1.'
+                    log '  external   : use another separately reviewed reconciliation/provisioning method.'
+                    log '  abort      : save current state and stop; no GTID reconciliation is attempted.'
+                    next_action=$(required "Node $i action after inspection (reprovision/external/abort)" abort)
                     case $next_action in
+                        reprovision)
+                            divergence_abort_snapshot "$i"
+                            prepare_reprovision "$i" "$target" "divergent GTID history ($GTID_ORIGIN)"
+                            die "Node $i reprovision package prepared; execute/review it, then rediscover with a fresh work root";;
                         external)
                             divergence_abort_snapshot "$i"
                             external_manual_guidance "$i" "divergent GTID history ($GTID_ORIGIN)"
-                            log "Node $i must be reconciled or reprovisioned from authoritative node 1 using a separately validated procedure."
                             die "Node $i external reconciliation/reprovisioning required before GR migration";;
                         abort)
                             divergence_abort_snapshot "$i"
                             die "Node $i divergence left unchanged after read-only inspection";;
-                        *) log 'Invalid action. Enter external or abort.';;
+                        *) log 'Invalid action. Enter reprovision, external, or abort.';;
                     esac
                 done
                 ;;
+            reprovision)
+                divergence_abort_snapshot "$i"
+                prepare_reprovision "$i" "$target" "divergent GTID history ($GTID_ORIGIN)"
+                die "Node $i reprovision package prepared; execute/review it, then rediscover with a fresh work root";;
             external)
                 divergence_abort_snapshot "$i"
                 external_manual_guidance "$i" "divergent GTID history ($GTID_ORIGIN)"
-                log "Node $i must be reconciled or reprovisioned from authoritative node 1 using a separately validated procedure."
                 die "Node $i external reconciliation/reprovisioning required before GR migration";;
             abort)
                 divergence_abort_snapshot "$i"
                 die "Node $i divergence left unchanged";;
-            *) log 'Invalid action. Enter inspect, external, or abort.';;
+            *) log 'Invalid action. Enter inspect, reprovision, external, or abort.';;
         esac
     done
 }
+
 
 catchup() (
     i=$1; target=$(normalize_gtid "$2")
@@ -1667,29 +1986,28 @@ initialize() {
                 fi
                 [ -z "$(normalize_gtid "$(val "$i" gtid_executed)")" ] || die "Node $i gained GTID history after classification; no automatic GTID reset is performed"
                 [ "$(sql "$i" "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name NOT IN ('mysql','sys','performance_schema','information_schema');")" = 0 ] || die "Node $i is no longer empty; externally provision it"
-                dbs=$(sql 1 "SELECT schema_name FROM information_schema.schemata WHERE schema_name NOT IN ('mysql','sys','performance_schema','information_schema') ORDER BY schema_name;")
-                [ -n "$dbs" ] || die 'Authoritative source has no application DBs; use external/preprovisioned verification for this intentionally empty topology'
-                for db in $dbs; do case $db in *[!A-Za-z0-9_\$]*) die 'Database name requires external provisioning';; esac; done
-                command -v "$DUMP" >/dev/null 2>&1 || die 'Matching mysqldump executable required'
-                "$DUMP" --version > "$RUN/mysqldump_version.txt"
-                dv=$(sed -n 's/.*Ver \([0-9][0-9.]*\).*/\1/p' "$RUN/mysqldump_version.txt")
-                sv=$(get 1 version | sed 's/[^0-9.].*//')
-                [ "$dv" = "$sv" ] || die "mysqldump version $dv does not match server $sv; set MYSQL_GR_MYSQLDUMP"
                 confirm "INITIALIZE EMPTY NODE $i"
-                dump="$RUN/full_application_node_$i.sql"
-                set -f; set -- $dbs; set +f
-                "$DUMP" --defaults-file="$TEMP/1.cnf" --no-login-paths --single-transaction --quick --skip-lock-tables --routines --events --triggers --hex-blob --set-gtid-purged=ON --databases "$@" > "$dump" 2> "$RUN/node_$i.dump.log"
-                [ -s "$dump" ] || die 'Empty dump'
-                sha256sum "$dump" > "$dump.sha256"
-                [ "$(normalize_gtid "$(val 1 gtid_executed)")" = "$target" ] || die 'Source changed during initialization'
+                package="$RUN/node_${i}.new_empty_provision"
+                mkdir -p "$package"; chmod 700 "$package"
+                dump=$(prepare_reprovision_dump "$i" "$target" "$package")
+                account_sql="$package/source_accounts.sql"
+                (cd "$package" && sha256sum -c source_application.sql.sha256 >/dev/null) || die 'Source application dump checksum verification failed before restore'
+                (cd "$package" && sha256sum -c source_accounts.sql.sha256 >/dev/null) || die 'Source account package checksum verification failed before restore'
                 mkdir -p "$TEMP/unfenced"; : > "$TEMP/unfenced/$i"
-                sql "$i" 'SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF;'
-                if ! "$MYSQL" --defaults-file="$TEMP/$i.cnf" --no-login-paths --binary-mode < "$dump" > "$RUN/node_$i.restore.log" 2>&1; then
+                # Keep read_only=ON so ordinary application accounts remain fenced while
+                # the administrative provisioning session temporarily disables super_read_only.
+                sql "$i" 'SET GLOBAL read_only=ON; SET GLOBAL super_read_only=OFF;'
+                if ! { cat "$account_sql" "$dump" "$package/source_grants.sql"; } | "$MYSQL" --defaults-file="$TEMP/$i.cnf" --no-login-paths --binary-mode > "$RUN/node_$i.restore.log" 2>&1; then
+                    source_admin_target_credential "$i" || :
                     sql "$i" 'SET GLOBAL super_read_only=ON;' || :
-                    die "Restore failed; node $i requires external clean reprovisioning before retry"
+                    die "Account/object/grant restore failed; node $i requires clean reprovisioning before retry"
                 fi
-                events=$(sql "$i" "SELECT CONCAT('ALTER EVENT ',CHAR(96),REPLACE(EVENT_SCHEMA,CHAR(96),CONCAT(CHAR(96),CHAR(96))),CHAR(96),'.',CHAR(96),REPLACE(EVENT_NAME,CHAR(96),CONCAT(CHAR(96),CHAR(96))),CHAR(96),' DISABLE;') FROM information_schema.events;")
-                sql "$i" "SET SESSION sql_log_bin=0; $events SET GLOBAL super_read_only=ON;"
+                if ! source_admin_target_credential "$i"; then
+                    die "Source accounts were restored but Source administrative credentials cannot reconnect to node $i; keep read_only=ON and externally verify/reprovision before retry"
+                fi
+                sql "$i" 'SET GLOBAL super_read_only=ON;'
+                # Fence execution with the scheduler, preserving event definitions.
+                sql "$i" 'SET GLOBAL event_scheduler=OFF;'
                 rm -f "$TEMP/unfenced/$i"
                 catchup "$i" "$target"
                 put "$i" initialized dump
@@ -1713,8 +2031,18 @@ initialize() {
             NEEDS_PROVISIONING)
                 log "Node $i state: NEEDS_PROVISIONING - it is not empty and does not exactly match the authoritative GTID/data starting point."
                 gtid_compare "$i" "$target"
-                external_manual_guidance "$i" "member is not empty and does not match the authoritative starting point"
-                die "Node $i requires external provisioning from node 1 before GR migration; automatic merge/reset is not performed"
+                log '  reprovision: generate evidence + authoritative dump + reversible STAGING/BACKUP/rollback plan.'
+                log '  external   : use another separately reviewed provisioning method.'
+                method=$(required "Node $i provisioning (reprovision/external)" reprovision)
+                case $method in
+                    reprovision)
+                        prepare_reprovision "$i" "$target" 'member is not empty and does not match the authoritative starting point'
+                        die "Node $i reprovision package prepared; execute/review it, then rediscover with a fresh work root";;
+                    external)
+                        external_manual_guidance "$i" "member is not empty and does not match the authoritative starting point"
+                        die "Node $i requires external provisioning from node 1 before GR migration";;
+                    *) die 'Choose reprovision or external';;
+                esac
                 ;;
             DIVERGED)
                 log "Node $i state: DIVERGED - extra GTIDs exist outside the authoritative node 1 set."
@@ -1731,6 +2059,7 @@ initialize() {
 }
 
 data_checks() {
+    full_object_checks
     manifest_sql="SELECT TABLE_SCHEMA,TABLE_NAME,TABLE_TYPE,COALESCE(ENGINE,'') FROM information_schema.tables WHERE TABLE_SCHEMA NOT IN ('mysql','sys','performance_schema','information_schema') ORDER BY TABLE_SCHEMA,TABLE_NAME; SELECT TABLE_SCHEMA,TABLE_NAME,COLUMN_NAME,ORDINAL_POSITION,COLUMN_TYPE,IS_NULLABLE,COALESCE(COLUMN_DEFAULT,'<NULL>'),EXTRA FROM information_schema.columns WHERE TABLE_SCHEMA NOT IN ('mysql','sys','performance_schema','information_schema') ORDER BY TABLE_SCHEMA,TABLE_NAME,ORDINAL_POSITION;"
     sql 1 "$manifest_sql" > "$RUN/node_1.schema_manifest.tsv"
     for i in $(ids); do
@@ -1755,11 +2084,16 @@ data_checks() {
 plugin() (
     i=$1
     status=$(sql "$i" "SELECT PLUGIN_STATUS FROM information_schema.plugins WHERE PLUGIN_NAME='group_replication';")
-    if [ -z "$status" ]; then local_write "$i" "INSTALL PLUGIN group_replication SONAME 'group_replication.so';"; fi
+    if [ -z "$status" ]; then
+        mkdir -p "$RUN/cutover_rollback"
+        : > "$RUN/cutover_rollback/$i.new_gr_plugin"
+        local_write "$i" "INSTALL PLUGIN group_replication SONAME 'group_replication.so';"
+    fi
     [ "$(sql "$i" "SELECT PLUGIN_STATUS FROM information_schema.plugins WHERE PLUGIN_NAME='group_replication';")" = ACTIVE ] || die 'GR plugin is not ACTIVE'
 )
 persist() {
     hasvar "$1" "$2" || die "Node $1 lacks required GR option $2"
+    persist_snapshot "$1" "$2"
     sql "$1" "SET PERSIST $2='$(q "$3")';"
 }
 group_settings() (
@@ -1806,11 +2140,13 @@ accounts() {
     for i in $(ids); do sql "$i" "SHOW GLOBAL VARIABLES WHERE Variable_name LIKE 'validate_password%';" >&2; done
     rp=$(secret 'Recovery password shared across these donor accounts')
     [ -n "$rp" ] || die 'Recovery password cannot be empty'
+    [ "$(printf '%s' "$rp" | wc -c)" -le 32 ] || die 'Replication SOURCE_PASSWORD must not exceed 32 bytes; no recovery accounts have been created'
     for i in $(ids); do
         for host in $hosts; do
             account="'$(q "$ru")'@'$(q "$host")'"
             if [ "$action" = create ]; then
                 [ "$(sql "$i" "SELECT COUNT(*) FROM mysql.user WHERE User='$(q "$ru")' AND Host='$(q "$host")';")" = 0 ] || die "Account exists on node $i; choose existing or another name"
+                printf 'DROP USER IF EXISTS %s;\n' "$account" >> "$RUN/cutover_rollback/$i.accounts.sql"
                 # sql_log_bin=0 prevents local account provisioning from making errant GTIDs.
                 local_write "$i" "CREATE USER $account IDENTIFIED BY '$(q "$rp")' REQUIRE SSL; GRANT REPLICATION SLAVE, CONNECTION_ADMIN ON *.* TO $account;" secret
             else
@@ -1824,7 +2160,12 @@ accounts() {
     if [ "$action" = existing ]; then confirm 'RECOVERY ACCOUNT GRANTS REVIEWED'; fi
     for i in $(ids); do
         # Server stores channel credentials; only ephemeral SQL is kept locally.
-        sql "$i" "CHANGE REPLICATION SOURCE TO SOURCE_USER='$(q "$ru")', SOURCE_PASSWORD='$(q "$rp")' FOR CHANNEL 'group_replication_recovery';" >/dev/null 2> "$TEMP/account_error"
+        : > "$RUN/cutover_rollback/$i.new_recovery_channel"
+        if ! sql "$i" "CHANGE REPLICATION SOURCE TO SOURCE_USER='$(q "$ru")', SOURCE_PASSWORD='$(q "$rp")' FOR CHANNEL 'group_replication_recovery';" >/dev/null 2> "$TEMP/account_error"; then
+            cp "$TEMP/account_error" "$RUN/node_$i.recovery_channel.error"
+            chmod 600 "$RUN/node_$i.recovery_channel.error"
+            die "Recovery channel configuration failed on node $i; protected error evidence: $RUN/node_$i.recovery_channel.error"
+        fi
     done
     unset rp
 }
@@ -1851,6 +2192,7 @@ cutover() {
     log 'Confirm verified backups, data/DEFINER accounts, member-to-member SQL/XCom connectivity and TLS certificates.'
     log 'Recovery credentials are stored by MySQL in replication metadata. GR start_on_boot remains OFF.'
     confirm 'CUTOVER TO GR'
+    cutover_snapshot
     for i in $(ids); do
         sql "$i" 'SHOW REPLICA STATUS;' > "$RUN/node_$i.async_before.tsv"
         sql "$i" 'SELECT * FROM performance_schema.persisted_variables;' > "$RUN/node_$i.persisted_before.tsv"
@@ -1951,6 +2293,7 @@ validate() {
             [ "$(sql "$i" "SELECT COUNT(*) FROM performance_schema.replication_group_members WHERE MEMBER_ROLE='PRIMARY';")" = "$expected" ] || die 'Multi-primary role count mismatch'
         fi
         [ "$(sql "$i" "SELECT WAIT_FOR_EXECUTED_GTID_SET('$(q "$target")',300);")" = 0 ] || die 'Validation GTID timeout'
+        exact_gtid "$i" "$target"
         [ "$(sql "$i" "SELECT COUNT(*) FROM performance_schema.replication_applier_status_by_worker WHERE CHANNEL_NAME LIKE 'group_replication_%' AND LAST_ERROR_NUMBER<>0;")" = 0 ] || die 'Applier error'
         if [ "$(get meta primary_mode)" = single ] && [ "$i" != 1 ]; then [ "$(val "$i" super_read_only)" = 1 ] || die 'Secondary is writable'; fi
         [ "$(val "$i" group_replication_group_name)" = "$(get meta group)" ] || die 'Group UUID mismatch'
@@ -1963,6 +2306,7 @@ validate() {
         sql "$i" 'SELECT @@auto_increment_increment,@@auto_increment_offset,@@group_replication_auto_increment_increment;' > "$RUN/node_$i.auto_increment.tsv"
         sql "$i" 'SELECT * FROM performance_schema.replication_group_member_stats;' > "$RUN/node_$i.member_stats.tsv"
     done
+    exact_gtid 1 "$target"
     put meta validated "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     log "VALIDATION PASSED: $expected ONLINE, $(get meta primary_mode) primary mode. Evidence: $RUN"
 }
@@ -1989,7 +2333,7 @@ platform_preflight() {
 }
 
 main() {
-    case $STEP in help|--help|-h) help; return;; --version) printf '%s\n' "$VERSION"; return;; discover|configure|precheck|initialize|cutover|join|release|validate|status|all) :;; *) help; exit 2;; esac
+    case $STEP in help|--help|-h) help; return;; --version) printf '%s\n' "$VERSION"; return;; discover|configure|tls|precheck|initialize|cutover|join|release|validate|status|all) :;; *) help; exit 2;; esac
     platform_preflight
     command -v "$MYSQL" >/dev/null 2>&1 || die 'mysql client not found; set MYSQL_GR_MYSQL'
     case $ROOT in /*) :;; *) ROOT="$(pwd)/$ROOT";; esac
@@ -2013,6 +2357,9 @@ main() {
 # v1.0.9: generic per-GTID DML/DDL summaries and safe current-metadata comparison for divergent members.
 # v1.0.10: POSIX-awk conditional fix and controller utility/awk compatibility preflight before mutation.
 # v1.0.11: broader controller utility preflight and RENAME TABLE source/target metadata coverage.
+# v1.0.12: reversible reprovision package generation, staging/swap rollback plan, and stable abort TSV output.
+#           Logical reprovision package also exports Source users/roles/grants because partial mysqldump GTID metadata covers the full Source GTID set.
+# v1.0.12-logical-safety2: NEW_EMPTY account restore + fail-fast grants/default roles + dump version guard.
 safe_host() { case $1 in ''|*[!a-zA-Z0-9_.-]*) die "Use an IPv4 address or DNS name (IPv6 is not supported in v$VERSION).";; esac; }
 
 host_is_local() (
@@ -2577,12 +2924,15 @@ done
             if [ "$(get "$j" location)" = local ] && [ "$(get "$j" cnf)" = "$cnf" ]; then die 'Shared cnf requires manual instance-specific settings'; fi
         done
         candidate="${cnf}.gr_candidate_$$"
+        cnf_chain_snapshot "$cnf" "$RUN/node_$i.include_chain.before" "$(readlink -f "/proc/$p/cwd")"
         sed '/^# BEGIN mysql_gr_migrate$/,/^# END mysql_gr_migrate$/d' "$cnf" > "$candidate"
         { printf '\n# BEGIN mysql_gr_migrate\n'; cat "$snippet"; printf '# END mysql_gr_migrate\n'; } >> "$candidate"
         if ! "$exe" --defaults-file="$candidate" --validate-config > "$RUN/node_$i.config_validation.log" 2>&1; then
             rm -f "$candidate"; die "Configuration validation failed: $RUN/node_$i.config_validation.log"
         fi
         backup="${cnf}.before_gr_$(date +%Y%m%d_%H%M%S)_$$"
+        cnf_chain_snapshot "$cnf" "$RUN/node_$i.include_chain.current" "$(readlink -f "/proc/$p/cwd")"
+        cmp -s "$RUN/node_$i.include_chain.before" "$RUN/node_$i.include_chain.current" || die 'Configuration include chain changed while preparing candidate'
         cp -p "$cnf" "$backup"; cmp -s "$cnf" "$backup" || die 'Config backup verification failed'
         cat "$candidate" > "$cnf"; rm -f "$candidate"
         log "Saved backup: $backup"
@@ -2599,4 +2949,321 @@ done
 }
 
 
-main
+build_reprovision_executor() (
+    node=$1; expected=$2; directory=$3
+    script_dir=${MYSQL_GR_SCRIPT_DIR:-$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)}
+    [ -f "$script_dir/reprovision_helper.sh" ] && [ -f "$script_dir/mysql_gr_migrate.sh" ] || die 'Keep reprovision_helper.sh beside mysql_gr_migrate.sh; set MYSQL_GR_SCRIPT_DIR when sourced'
+    cp "$script_dir/reprovision_helper.sh" "$script_dir/mysql_gr_migrate.sh" "$directory/"
+    printf '%s\n' "$(get "$node" uuid)" > "$directory/expected_uuid"
+    printf '%s\n' "$(val "$node" socket)" > "$directory/expected_socket"
+    printf '%s\n' "$(val "$node" datadir)" > "$directory/expected_datadir"
+    printf '%s\n' "$(get "$node" cnf)" > "$directory/expected_cnf"
+    printf '%s\n' "$(val 1 version)" > "$directory/source_version"
+    printf '%s\n' "$expected" > "$directory/target_gtid"
+    databases=$(sql 1 "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME NOT IN ('mysql','sys','performance_schema','information_schema') ORDER BY SCHEMA_NAME;")
+    printf '%s\n' "$databases" > "$directory/databases"
+    set -f; set -- $databases; set +f
+    [ "$#" -gt 0 ] || die 'Empty source schema inventory'
+    for database do case $database in *[!A-Za-z0-9_\$]*) die 'Unsupported schema name';; esac; done
+    "$DUMP" --defaults-file="$TEMP/1.cnf" --no-login-paths --skip-comments --skip-dump-date --no-tablespaces --set-gtid-purged=OFF --routines --events --triggers --hex-blob --order-by-primary --skip-extended-insert --databases "$@" > "$directory/source_validation.sql" 2> "$directory/source_validation.err" || die 'Full source validation snapshot failed'
+    exact_gtid 1 "$expected"
+    (cd "$directory" && sha256sum expected_uuid expected_socket expected_datadir expected_cnf source_version target_gtid databases source_accounts.list source_accounts.sql source_grants.sql source_default_roles.sql source_application.sql source_validation.sql mysql_gr_migrate.sh reprovision_helper.sh > package.sha256)
+    chmod 600 "$directory"/*
+)
+
+cnf_chain_walk() (
+    file=$1; cwd=$2; depth=$3
+    [ "$depth" -le 32 ] || die 'Configuration include cycle or excessive depth'
+    case $file in /*) :;; *) file="$cwd/$file";; esac
+    file=$(readlink -f "$file") || die 'Cannot resolve configuration include'
+    [ -f "$file" ] && [ -r "$file" ] || die "Unreadable configuration include: $file"
+    case $file in *'
+'*|*'\t'*) die 'Unsupported configuration filename';; esac
+    sha256sum "$file" || exit 1
+    awk '/^[[:space:]]*!include(dir)?[[:space:]]/ {line=$0; sub(/^[[:space:]]*/,"",line); key=line; sub(/[[:space:]].*$/, "",key); sub(/^[^[:space:]]+[[:space:]]+/, "",line); sub(/[[:space:]]+$/, "",line); print key "\t" line}' "$file" > "$TEMP/include.$$.${depth}"
+    tab=$(printf '\t')
+    while IFS="$tab" read -r kind path; do
+        case $path in \"*\") path=${path#\"}; path=${path%\"};; \'*\') path=${path#\'}; path=${path%\'};; esac
+        case $path in /*) :;; *) path="$cwd/$path";; esac
+        case $kind in
+            '!include') cnf_chain_walk "$path" "$cwd" "$((depth+1))" || exit 1;;
+            '!includedir')
+                [ -d "$path" ] && [ -r "$path" ] || die "Unreadable includedir: $path"
+                printf 'DIRECTORY %s\n' "$path"
+                for child in "$path"/*.cnf; do
+                    [ -e "$child" ] || continue
+                    cnf_chain_walk "$child" "$cwd" "$((depth+1))" || exit 1
+                done;;
+        esac
+    done < "$TEMP/include.$$.${depth}"
+)
+
+cnf_chain_snapshot() (
+    cnf_chain_walk "$1" "$3" 0 > "$2.unsorted" || exit 1
+    LC_ALL=C sort -u "$2.unsorted" > "$2"
+    rm -f "$2.unsorted"
+)
+
+tls_restore() (
+    failed=0
+    for node in $(ids); do
+        [ -f "$RUN/tls_change/$node.applied" ] || continue
+        cnf=$(get "$node" cnf)
+        if [ -f "$RUN/tls_change/$node.cnf.before" ]; then
+            cat "$RUN/tls_change/$node.cnf.before" > "$cnf" || failed=1
+        fi
+        sql "$node" "$(cat "$RUN/tls_change/$node.runtime_restore.sql")" > "$RUN/tls_change/$node.rollback.log" 2>&1 || failed=1
+        cat "$RUN/tls_change/$node.recovery_ca.before" > "$ROOT/$node/recovery_ca" || failed=1
+    done
+    [ "$failed" = 0 ] || return 1
+)
+
+tls_plan_manifest() (
+    manifest="$RUN/tls_change/manifest.sha256"
+    : > "$manifest"
+    for node in $(ids); do
+        directory=$(cat "$RUN/tls_change/$node.output")
+        sha256sum "$directory/ca.pem" "$directory/server-cert.pem" "$directory/server-key.pem" "$RUN/tls_change/$node.output" "$RUN/tls_change/$node.cnf.candidate" "$RUN/tls_change/$node.cnf.before" "$RUN/tls_change/$node.runtime_restore.sql" "$RUN/tls_change/$node.recovery_ca.before" "$RUN/tls_change/$node.include.before" >> "$manifest" || exit 1
+    done
+)
+
+tls_apply_plan() (
+    connected; no_group
+    plan=${MYSQL_GR_TLS_PLAN:-$(get meta tls_plan)}
+    [ -d "$plan" ] && [ "$(basename "$plan")" = tls_change ] || die 'Invalid prepared TLS plan'
+    RUN=$(dirname "$plan")
+    sha256sum -c "$plan/manifest.sha256" > "$plan/apply_checksum.log" 2>&1 || die 'Prepared TLS plan/certificates changed; no settings applied'
+    confirm 'APPLY VERIFIED TLS CERTIFICATES'
+    tls_ok=no
+    trap 'rc=$?; trap - 0 1 2 15; if [ "$tls_ok" != yes ]; then tls_restore || log "URGENT: TLS rollback incomplete; inspect $RUN/tls_change"; fi; exit "$rc"' 0
+    trap 'exit 130' 2; trap 'exit 143' 1 15
+    for node in $(ids); do
+        pid=$(local_pid "$node") || die 'TLS target identity changed before apply'
+        cnf=$(get "$node" cnf); output=$(cat "$RUN/tls_change/$node.output")
+        cnf_chain_snapshot "$cnf" "$RUN/tls_change/$node.include.current" "$(readlink -f "/proc/$pid/cwd")"
+        cmp -s "$RUN/tls_change/$node.include.before" "$RUN/tls_change/$node.include.current" || die 'TLS configuration include chain changed concurrently'
+        : > "$RUN/tls_change/$node.applied"
+        cat "$RUN/tls_change/$node.cnf.candidate" > "$cnf"
+        sql "$node" "SET GLOBAL ssl_ca='$(q "$output/ca.pem")'; SET GLOBAL ssl_cert='$(q "$output/server-cert.pem")'; SET GLOBAL ssl_key='$(q "$output/server-key.pem")'; ALTER INSTANCE RELOAD TLS;"
+        put "$node" recovery_ca "$output/ca.pem"
+    done
+    tls_preflight
+    tls_ok=yes
+    log "TLS APPLIED: cross-member CA/SAN verified; existing connections retained. Evidence: $RUN/tls_change"
+)
+
+tls() (
+    PHASE=tls
+    tls_action=${MYSQL_GR_TLS_ACTION:-plan}
+    case $tls_action in plan) :;; apply) tls_apply_plan; exit $?;; *) die 'MYSQL_GR_TLS_ACTION must be plan or apply';; esac
+    connected; no_group
+    command -v openssl >/dev/null 2>&1 || die 'Existing openssl required; no packages will be installed'
+    mkdir -p "$RUN/tls_change"
+    ca_default=$(val 1 ssl_ca)
+    case $ca_default in /*) :;; *) ca_default="$(val 1 datadir)/$ca_default";; esac
+    authority=$(required 'Existing signing CA certificate path' "$ca_default")
+    signing_key=$(required 'Existing signing CA private key path' "$(dirname "$authority")/ca-key.pem")
+    days=$(required 'Certificate validity in days' 365)
+    uint "$days" && [ "$days" -gt 0 ] && [ "$days" -le 3650 ] || die 'Invalid certificate lifetime'
+    openssl x509 -in "$authority" -noout -checkend "$((days*86400))" > "$RUN/tls_change/ca_expiry.log" 2>&1 || die 'CA expires before the requested certificate lifetime'
+    openssl x509 -in "$authority" -pubkey -noout > "$RUN/tls_change/ca.pub" || die 'Cannot read signing CA'
+    openssl pkey -in "$signing_key" -pubout > "$RUN/tls_change/ca_key.pub" 2>/dev/null || die 'Cannot access signing CA key'
+    cmp -s "$RUN/tls_change/ca.pub" "$RUN/tls_change/ca_key.pub" || die 'CA certificate/key mismatch'
+    stamp=$(date +%Y%m%d_%H%M%S)_$$
+    for node in $(ids); do
+        [ "$(get "$node" location)" = local ] || die 'Remote certificate deployment requires running this preparation on the actual host; controller paths are not assumed'
+        pid=$(local_pid "$node") || die 'Cannot prove TLS target process identity'
+        cnf=$(get "$node" cnf)
+        [ -f "$cnf" ] && [ ! -L "$cnf" ] || die 'TLS deployment requires a proven regular main cnf'
+        [ "$(sql "$node" "SELECT COUNT(*) FROM performance_schema.persisted_variables WHERE VARIABLE_NAME IN ('ssl_ca','ssl_cert','ssl_key');")" = 0 ] || die 'Existing persisted TLS overrides require explicit migration before cnf deployment'
+        datadir=$(val "$node" datadir); datadir=${datadir%/}
+        output="$(dirname "$datadir")/gr_tls_${node}_$stamp"
+        [ ! -e "$output" ] || die 'TLS output path collision'
+        mkdir "$output"; chmod 700 "$output"
+        host=$(get "$node" advertise); safe_host "$host"
+        case $host in *[!0-9.]*) san="DNS:$host";; *) san="IP:$host";; esac
+        printf 'basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth,clientAuth\nsubjectAltName=%s\n' "$san" > "$RUN/tls_change/$node.extensions"
+        openssl req -new -newkey rsa:3072 -nodes -subj "/CN=$host" -keyout "$output/server-key.pem" -out "$RUN/tls_change/$node.csr" > "$RUN/tls_change/$node.issue.log" 2>&1 || die 'TLS key/CSR generation failed'
+        serial=$(openssl rand -hex 16)
+        openssl x509 -req -in "$RUN/tls_change/$node.csr" -CA "$authority" -CAkey "$signing_key" -set_serial "0x$serial" -days "$days" -sha256 -extfile "$RUN/tls_change/$node.extensions" -out "$output/server-cert.pem" >> "$RUN/tls_change/$node.issue.log" 2>&1 || die 'TLS certificate signing failed'
+        cat "$authority" > "$output/ca.pem"
+        old_ca=$(val "$node" ssl_ca)
+        case $old_ca in /*) :;; *) old_ca="$datadir/$old_ca";; esac
+        # Retain existing client-certificate trust while adding the selected CA.
+        [ ! -r "$old_ca" ] || cmp -s "$authority" "$old_ca" || cat "$old_ca" >> "$output/ca.pem"
+        chmod 600 "$output/server-key.pem"; chmod 644 "$output/ca.pem" "$output/server-cert.pem"
+        chown -R "$(stat -c %u "$datadir"):$(stat -c %g "$datadir")" "$output"
+        printf '%s\n' "$output" > "$RUN/tls_change/$node.output"
+        cnf_chain_snapshot "$cnf" "$RUN/tls_change/$node.include.before" "$(readlink -f "/proc/$pid/cwd")"
+        cp -p "$cnf" "$RUN/tls_change/$node.cnf.before"
+        cp "$ROOT/$node/recovery_ca" "$RUN/tls_change/$node.recovery_ca.before"
+        sql "$node" "SELECT CONCAT('SET GLOBAL ssl_ca=',QUOTE(@@ssl_ca),'; SET GLOBAL ssl_cert=',QUOTE(@@ssl_cert),'; SET GLOBAL ssl_key=',QUOTE(@@ssl_key),'; ALTER INSTANCE RELOAD TLS;');" > "$RUN/tls_change/$node.runtime_restore.sql"
+        sed '/^# BEGIN mysql_gr_tls$/,/^# END mysql_gr_tls$/d' "$cnf" > "$RUN/tls_change/$node.cnf.candidate"
+        printf '\n# BEGIN mysql_gr_tls\n[mysqld]\nssl_ca=%s/ca.pem\nssl_cert=%s/server-cert.pem\nssl_key=%s/server-key.pem\n# END mysql_gr_tls\n' "$output" "$output" "$output" >> "$RUN/tls_change/$node.cnf.candidate"
+        exe=$(readlink -f "/proc/$pid/exe")
+        "$exe" --defaults-file="$RUN/tls_change/$node.cnf.candidate" --validate-config > "$RUN/tls_change/$node.config_validation.log" 2>&1 || die 'TLS candidate cnf validation failed'
+    done
+    for donor in $(ids); do
+        output=$(cat "$RUN/tls_change/$donor.output")
+        host=$(get "$donor" advertise)
+        for receiver in $(ids); do
+            trust=$(cat "$RUN/tls_change/$receiver.output")
+            case $host in *[!0-9.]*) set -- -verify_hostname "$host";; *) set -- -verify_ip "$host";; esac
+            openssl verify -CAfile "$trust/ca.pem" -purpose sslserver "$@" "$output/server-cert.pem" > "$RUN/tls_change/$receiver-to-$donor.verify" 2>&1 || die 'Proposed cross-member CA/SAN validation failed'
+            openssl verify -CAfile "$trust/ca.pem" -purpose sslclient "$output/server-cert.pem" >> "$RUN/tls_change/$receiver-to-$donor.verify" 2>&1 || die 'Proposed XCom client certificate validation failed'
+        done
+    done
+    if [ "$tls_action" = plan ]; then
+        tls_plan_manifest
+        printf '%s\n' "$RUN/tls_change" > "$ROOT/meta/tls_plan"
+        log "TLS PLAN VERIFIED: $RUN/tls_change. No running TLS context or cnf was changed."
+        return 0
+    fi
+
+)
+
+tls_preflight() (
+    command -v openssl >/dev/null 2>&1 || die 'Existing openssl is required for TLS CA/SAN validation; no packages are installed'
+    mkdir -p "$RUN/tls"
+    for donor in $(ids); do
+        [ "$(get "$donor" location)" = local ] || die 'Remote TLS certificates require host-side CA/SAN validation before this controller can approve cutover'
+        directory=$(val "$donor" datadir)
+        cert=$(val "$donor" ssl_cert); key=$(val "$donor" ssl_key)
+        case $cert in /*) :;; *) cert="$directory/$cert";; esac
+        case $key in /*) :;; *) key="$directory/$key";; esac
+        openssl x509 -in "$cert" -noout -checkend 0 > "$RUN/tls/$donor.expiry" 2>&1 || die "Node $donor TLS certificate invalid/expired"
+        openssl x509 -in "$cert" -pubkey -noout > "$RUN/tls/$donor.cert.pub" 2>/dev/null || die 'Cannot read certificate public key'
+        openssl pkey -in "$key" -pubout > "$RUN/tls/$donor.key.pub" 2>/dev/null || die 'Cannot read TLS key for key-pair validation'
+        cmp -s "$RUN/tls/$donor.cert.pub" "$RUN/tls/$donor.key.pub" || die "Node $donor TLS certificate/key mismatch"
+        host=$(get "$donor" advertise)
+        for receiver in $(ids); do
+            for ca in "$(get "$receiver" recovery_ca)" "$(val "$receiver" ssl_ca)"; do
+                case $ca in /*) :;; '') die "Node $receiver has no CA file";; *) ca="$(val "$receiver" datadir)/$ca";; esac
+                set -- -CAfile "$ca" -purpose sslserver
+                if [ "$(get meta tls)" = VERIFY_IDENTITY ]; then
+                    openssl x509 -in "$cert" -noout -ext subjectAltName > "$RUN/tls/$donor.san" 2>/dev/null || die 'Cannot inspect TLS SAN'
+                    grep -E 'DNS:|IP Address:' "$RUN/tls/$donor.san" >/dev/null || die "Node $donor lacks a SAN for identity verification"
+                    case $host in *[!0-9.]* ) set -- "$@" -verify_hostname "$host";; *) set -- "$@" -verify_ip "$host";; esac
+                fi
+                openssl verify "$@" "$cert" >> "$RUN/tls/$receiver-to-$donor.verify" 2>&1 || die "Node $receiver CA cannot verify donor $donor TLS certificate/identity"
+            done
+        done
+    done
+)
+
+cutover_snapshot() (
+    mkdir -p "$RUN/cutover_rollback"
+    for node in $(ids); do
+        # Existing recovery credentials cannot be reconstructed from P_S.
+        # Never overwrite them and then pretend rollback can restore them.
+        [ "$(sql "$node" "SELECT COUNT(*) FROM performance_schema.replication_connection_configuration WHERE CHANNEL_NAME='group_replication_recovery';")" = 0 ] || die "Node $node has existing recovery channel metadata; preserve it and use a reviewed recovery procedure"
+        sql "$node" "SELECT CONCAT('START REPLICA IO_THREAD FOR CHANNEL ',QUOTE(CHANNEL_NAME),';') FROM performance_schema.replication_connection_status WHERE CHANNEL_NAME NOT LIKE 'group_replication_%' AND SERVICE_STATE='ON'; SELECT CONCAT('START REPLICA SQL_THREAD FOR CHANNEL ',QUOTE(CHANNEL_NAME),';') FROM performance_schema.replication_applier_status WHERE CHANNEL_NAME NOT LIKE 'group_replication_%' AND SERVICE_STATE='ON';" > "$RUN/cutover_rollback/$node.async.sql"
+    done
+)
+
+persist_snapshot() (
+    node=$1; variable=$2
+    case $variable in ''|*[!a-zA-Z0-9_]*) die 'Invalid persisted variable identifier';; esac
+    dir="$RUN/cutover_rollback/$node.persist"
+    mkdir -p "$dir"
+    [ ! -f "$dir/$variable.sql" ] || exit 0
+    null_runtime=$(sql "$node" "SELECT @@GLOBAL.$variable IS NULL;")
+    if [ "$null_runtime" = 1 ]; then
+        case $variable in
+            group_replication_*)
+                [ -f "$RUN/cutover_rollback/$node.new_gr_plugin" ] || die "Existing GR plugin has unset $variable that cannot be restored dynamically; preserve it and review plugin reinitialization before cutover";;
+            *) die "NULL runtime value of $variable has no validated rollback path";;
+        esac
+    fi
+    # Capture runtime and persisted values separately: RESET PERSIST does not
+    # restore the current GLOBAL value and SET PERSIST alone conflates the two.
+    sql "$node" "SELECT IF(@@GLOBAL.$variable IS NULL,'SELECT 1;',CONCAT('SET GLOBAL $variable=',QUOTE(@@GLOBAL.$variable),';')); SELECT IF(COUNT(*)=0,'RESET PERSIST IF EXISTS $variable;',CONCAT('SET PERSIST_ONLY $variable=',QUOTE(MAX(VARIABLE_VALUE)),';')) FROM performance_schema.persisted_variables WHERE VARIABLE_NAME='$variable';" > "$dir/$variable.sql.tmp"
+    [ "$(wc -l < "$dir/$variable.sql.tmp")" = 2 ] || die 'Incomplete persisted-variable rollback snapshot'
+    mv "$dir/$variable.sql.tmp" "$dir/$variable.sql"
+    printf '%s\n' "$variable" >> "$dir/order"
+)
+
+rollback_cutover() (
+    failed=0
+    for node in $(ids); do
+        dir="$RUN/cutover_rollback"
+        sql "$node" 'SET GLOBAL super_read_only=ON;' || failed=1
+        if [ -f "$dir/$node.new_recovery_channel" ] && [ "$(sql "$node" "SELECT COUNT(*) FROM performance_schema.replication_connection_configuration WHERE CHANNEL_NAME='group_replication_recovery';")" = 1 ]; then
+            sql "$node" "RESET REPLICA ALL FOR CHANNEL 'group_replication_recovery';" || failed=1
+        fi
+        if [ -s "$dir/$node.accounts.sql" ]; then
+            local_write "$node" "$(cat "$dir/$node.accounts.sql")" secret || failed=1
+        fi
+        if [ -s "$dir/$node.persist/order" ]; then
+            awk '{a[NR]=$0} END {for(i=NR;i>0;i--)print a[i]}' "$dir/$node.persist/order" > "$dir/$node.persist/reverse"
+            while IFS= read -r variable; do
+                while IFS= read -r restore_statement; do
+                    [ -n "$restore_statement" ] || continue
+                    sql "$node" "$restore_statement" || failed=1
+                done < "$dir/$node.persist/$variable.sql"
+            done < "$dir/$node.persist/reverse"
+        fi
+        if [ -f "$dir/$node.new_gr_plugin" ] && [ "$(sql "$node" "SELECT COUNT(*) FROM information_schema.plugins WHERE PLUGIN_NAME='group_replication';")" = 1 ]; then
+            local_write "$node" 'UNINSTALL PLUGIN group_replication;' || failed=1
+        fi
+        if [ -s "$dir/$node.async.sql" ]; then
+            sql "$node" "$(cat "$dir/$node.async.sql")" || failed=1
+        fi
+        sql "$node" 'SET GLOBAL super_read_only=ON;' || failed=1
+    done
+    [ "$failed" = 0 ] || return 1
+    printf '%s\n' 'Restored pre-bootstrap settings, new recovery objects and previous async thread state; write fences retained.' > "$RUN/cutover_rollback/result.txt"
+)
+
+definer_guard() (
+    node=$1
+    orphan=$(sql "$node" "SELECT COUNT(*) FROM (SELECT DEFINER FROM information_schema.VIEWS WHERE TABLE_SCHEMA NOT IN ('mysql','sys','performance_schema','information_schema') UNION SELECT DEFINER FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA NOT IN ('mysql','sys','performance_schema','information_schema') UNION SELECT DEFINER FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA NOT IN ('mysql','sys','performance_schema','information_schema') UNION SELECT DEFINER FROM information_schema.EVENTS WHERE EVENT_SCHEMA NOT IN ('mysql','sys','performance_schema','information_schema')) d WHERE NOT EXISTS (SELECT 1 FROM mysql.user u WHERE CONCAT(u.User,'@',u.Host)=d.DEFINER);")
+    [ "$orphan" = 0 ] || die "Node $node has missing DEFINER accounts; repair explicitly before export/validation"
+)
+
+exact_gtid() (
+    node=$1; expected=$2
+    # Set equality, not string equality or just a successful wait for a subset.
+    equal=$(sql "$node" "SELECT GTID_SUBSET(@@GLOBAL.gtid_executed,'$(q "$expected")') AND GTID_SUBSET('$(q "$expected")',@@GLOBAL.gtid_executed);")
+    [ "$equal" = 1 ] || die "Node $node GTID set differs from the frozen reference"
+)
+
+object_snapshot() (
+    node=$1; output=$2
+    credential "$node"
+    definer_guard "$node"
+    databases=$(sql "$node" "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME NOT IN ('mysql','sys','performance_schema','information_schema') ORDER BY SCHEMA_NAME;")
+    printf '%s\n' "$databases" > "$output.databases"
+    : > "$output"
+    [ -n "$databases" ] || exit 0
+    set -f
+    set -- $databases
+    for database do case $database in *[!A-Za-z0-9_\$]*) die 'Schema name requires reviewed external validation';; esac; done
+    # Includes empty databases, indexes, constraints, partitions, views,
+    # routine bodies/characteristics, triggers and events, with their DEFINERs.
+    "$DUMP" --defaults-file="$TEMP/$node.cnf" --no-login-paths --no-data --routines --events --triggers --no-tablespaces --set-gtid-purged=OFF --skip-comments --skip-dump-date --databases "$@" > "$output" 2> "$output.err" || die "Node $node full stored-object export failed"
+)
+
+full_object_checks() (
+    mysqldump_version_guard
+    object_snapshot 1 "$RUN/node_1.full_objects.sql"
+    for node in $(ids); do
+        [ "$node" != 1 ] || continue
+        object_snapshot "$node" "$RUN/node_$node.full_objects.sql"
+        account_snapshot_compare "$node"
+        cmp -s "$RUN/node_1.full_objects.sql.databases" "$RUN/node_$node.full_objects.sql.databases" || die "Node $node schema inventory mismatch"
+        diff -u "$RUN/node_1.full_objects.sql" "$RUN/node_$node.full_objects.sql" > "$RUN/node_$node.full_objects.diff" || die "Node $node schema/stored object mismatch; inspect full_objects.diff"
+    done
+)
+
+account_snapshot_compare() (
+    node=$1
+    mkdir -p "$RUN/accounts_source" "$RUN/accounts_$node"
+    export_source_accounts "$RUN/accounts_source" 1 >/dev/null
+    export_source_accounts "$RUN/accounts_$node" "$node" >/dev/null
+    for component in source_accounts.list source_accounts.sql source_grants.sql source_default_roles.sql; do
+        cmp -s "$RUN/accounts_source/$component" "$RUN/accounts_$node/$component" || die "Node $node account/role state mismatch ($component); protected evidence retained"
+    done
+)
+
+if [ "${MYSQL_GR_LIB_ONLY:-0}" != 1 ]; then main; fi
