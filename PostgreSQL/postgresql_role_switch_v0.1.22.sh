@@ -1150,7 +1150,7 @@ detect_external_ha_manager() {
 
 primary_standby_list_file() {
     psl_file=$1
-    psql_call "SELECT pid::text || E'\\t' || application_name || E'\\t' || COALESCE(client_addr::text,'local') || E'\\t' || usename || E'\\t' || state || E'\\t' || sync_state || E'\\t' || COALESCE(replay_lsn::text,'') || E'\\t' || COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)::bigint::text,'') || E'\\t' || COALESCE((SELECT slot_name FROM pg_replication_slots s WHERE s.active_pid=r.pid LIMIT 1),'') FROM pg_stat_replication r WHERE state <> 'backup' AND NOT EXISTS (SELECT 1 FROM pg_replication_slots s WHERE s.active_pid=r.pid AND s.slot_type='logical') ORDER BY application_name, client_addr NULLS FIRST, pid" > "$psl_file"
+    psql_call "SELECT pid::text || E'\\t' || application_name || E'\\t' || COALESCE(host(client_addr),'local') || E'\\t' || usename || E'\\t' || state || E'\\t' || sync_state || E'\\t' || COALESCE(replay_lsn::text,'') || E'\\t' || COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)::bigint::text,'') || E'\\t' || COALESCE((SELECT slot_name FROM pg_replication_slots s WHERE s.active_pid=r.pid LIMIT 1),'') FROM pg_stat_replication r WHERE state <> 'backup' AND NOT EXISTS (SELECT 1 FROM pg_replication_slots s WHERE s.active_pid=r.pid AND s.slot_type='logical') ORDER BY application_name, client_addr NULLS FIRST, pid" > "$psl_file"
 }
 
 select_primary_candidate() {
@@ -1711,7 +1711,7 @@ show_client_session_check() {
 }
 
 revalidate_switchover_topology() {
-    rst_selected_identity=$(psql_call_var pid "$CANDIDATE_PID" "SELECT application_name || E'\\t' || COALESCE(client_addr::text,'local') || E'\\t' || usename || E'\\t' || state || E'\\t' || COALESCE((SELECT slot_name FROM pg_replication_slots s WHERE s.active_pid=r.pid LIMIT 1),'') FROM pg_stat_replication r WHERE pid=:'pid'::integer LIMIT 1" 2>/dev/null | sed -n '1p') || rst_selected_identity=""
+    rst_selected_identity=$(psql_call_var pid "$CANDIDATE_PID" "SELECT application_name || E'\\t' || COALESCE(host(client_addr),'local') || E'\\t' || usename || E'\\t' || state || E'\\t' || COALESCE((SELECT slot_name FROM pg_replication_slots s WHERE s.active_pid=r.pid LIMIT 1),'') FROM pg_stat_replication r WHERE pid=:'pid'::integer LIMIT 1" 2>/dev/null | sed -n '1p') || rst_selected_identity=""
     rst_expected_identity=$(printf '%s\t%s\t%s\tstreaming\t%s' "$CANDIDATE_APP" "$CANDIDATE_CLIENT" "$CANDIDATE_REPL_USER" "${CANDIDATE_SLOT:-}")
     if [ "$rst_selected_identity" != "$rst_expected_identity" ]; then
         rollback_preconfigured_primary
@@ -2269,7 +2269,7 @@ remote_list() {
 
 remote_downstreams() {
     remote_init_exact "$1"
-    psql_call "SELECT 'DOWNSTREAM' || E'\\t' || application_name || E'\\t' || COALESCE(client_addr::text,'local') || E'\\t' || state || E'\\t' || sync_state || E'\\t' || COALESCE(replay_lsn::text,'') || E'\\t' || COALESCE((SELECT slot_name FROM pg_replication_slots s WHERE s.active_pid=r.pid AND s.slot_type='physical' LIMIT 1),'') FROM pg_stat_replication r WHERE state <> 'backup' AND NOT EXISTS (SELECT 1 FROM pg_replication_slots s WHERE s.active_pid=r.pid AND s.slot_type='logical') ORDER BY application_name, client_addr NULLS FIRST, pid"
+    psql_call "SELECT 'DOWNSTREAM' || E'\\t' || application_name || E'\\t' || COALESCE(host(client_addr),'local') || E'\\t' || state || E'\\t' || sync_state || E'\\t' || COALESCE(replay_lsn::text,'') || E'\\t' || COALESCE((SELECT slot_name FROM pg_replication_slots s WHERE s.active_pid=r.pid AND s.slot_type='physical' LIMIT 1),'') FROM pg_stat_replication r WHERE state <> 'backup' AND NOT EXISTS (SELECT 1 FROM pg_replication_slots s WHERE s.active_pid=r.pid AND s.slot_type='logical') ORDER BY application_name, client_addr NULLS FIRST, pid"
 }
 
 remote_list_downstream() {
