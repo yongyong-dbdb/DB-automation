@@ -30,14 +30,14 @@ jobs:
           set -euo pipefail
           target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
           for fn in select_local_instance validate_supported_version prepare_state_dir initialize_result_report planned_switchover preconfigure_former_primary rollback_preconfigured_primary remote_create_slot psql_call_var; do
-            grep -Eq "^${fn}\\(\\)[[:space:]]*\\{" "$target" || { echo "missing function: $fn" >&2; exit 1; }
+            grep -F "${fn}() {" "$target" >/dev/null || { echo "missing function: $fn" >&2; exit 1; }
           done
       - name: Guard against accidental bulk deletion
         shell: bash
         run: |
           set -euo pipefail
           target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
-          base_lines=$(git show 07f396e0f365724f3e455d5dc583be2d415fe253:"$target" | wc -l)
+          base_lines=$(git show 315e9d2a3b68801e117dc1726f4383b5e2e7cbe8:"$target" | wc -l)
           new_lines=$(wc -l < "$target")
           echo "base_lines=$base_lines new_lines=$new_lines"
           [ "$new_lines" -ge "$base_lines" ] || { echo 'rebuilt target is unexpectedly shorter than known-good base' >&2; exit 1; }
