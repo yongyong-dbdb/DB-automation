@@ -1,0 +1,38 @@
+name: Patch PostgreSQL role switch client host
+
+on:
+  push:
+    paths:
+      - '.github/patches/trigger-role-switch-client-host.txt'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Use host(inet) for operational SSH host values
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
+          before=$(grep -o "COALESCE(client_addr::text,'local')" "$target" | wc -l)
+          test "$before" -eq 3
+          sed -i "s/COALESCE(client_addr::text,'local')/COALESCE(host(client_addr),'local')/g" "$target"
+          test "$(grep -o "COALESCE(host(client_addr),'local')" "$target" | wc -l)" -eq 3
+          sh -n "$target"
+          git diff --check
+      - name: Commit patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add PostgreSQL/postgresql_role_switch_v0.1.22.sh
+          git diff --cached --quiet && exit 0
+          git commit -m 'fix: use host address for SSH transport prompts'
+          git push origin HEAD:main
