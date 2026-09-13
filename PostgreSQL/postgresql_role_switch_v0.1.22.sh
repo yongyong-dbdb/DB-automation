@@ -1515,9 +1515,11 @@ unselected_standby_check() {
     [ "$usc_count" -gt 0 ] || return 0
 
     say ""
-    say "Unselected Standby Servers"
-    say "  역할 전환 후 former Primary Server가 Cascading Standby가 되면 선택하지 않은 Standby Server가 동일 서버를 계속 Upstream Server로 사용할 수 있는지 확인합니다."
-    say "  각 Standby Server의 system_identifier, sender_port, slot_name, pg_stat_wal_receiver.status 및 recovery_target_timeline을 확인합니다."
+    say "Unselected Standby Validation"
+    say "  아래 서버는 새 Primary 후보가 아닙니다. 선택한 Standby 외에 현재 Primary에 직접 연결된 나머지 Standby를 검증합니다."
+    say "  현재 설계에서는 Planned Switchover 후 former Primary가 Standby가 되고, 이 Unselected Standby는 former Primary를 계속 Upstream으로 사용하는 Cascading Standby 구조를 유지합니다."
+    say "  예상 토폴로지: Selected Standby (New Primary) -> Former Primary (Standby) -> Unselected Standby"
+    say "  system_identifier, sender_port, slot_name, pg_stat_wal_receiver.status 및 recovery_target_timeline을 확인합니다."
 
     usc_i=1
     while [ "$usc_i" -le "$usc_count" ]; do
@@ -1525,16 +1527,16 @@ unselected_standby_check() {
         usc_app=$(printf '%s\n' "$usc_line" | awk -F '\t' '{print $2}')
         usc_client=$(printf '%s\n' "$usc_line" | awk -F '\t' '{print $3}')
         usc_slot=$(printf '%s\n' "$usc_line" | awk -F '\t' '{print $9}')
-        printf '  Standby Server %s/%s: application_name=%s, client_addr=%s, slot_name=%s\n' "$usc_i" "$usc_count" "$usc_app" "$usc_client" "${usc_slot:-}"
-        usc_host=$(ask "Standby Server SSH host or 'local'" "$usc_client") || usage_die "Input cancelled."
-        [ -n "$usc_host" ] || usage_die "Standby Server host is required."
+        printf '  Validation target %s/%s (Unselected Standby; not a promotion candidate): application_name=%s, client_addr=%s, slot_name=%s\n' "$usc_i" "$usc_count" "$usc_app" "$usc_client" "${usc_slot:-}"
+        usc_host=$(ask "Unselected Standby validation SSH host or 'local'" "$usc_client") || usage_die "Input cancelled."
+        [ -n "$usc_host" ] || usage_die "Unselected Standby validation host is required."
         if [ "$usc_host" = "local" ]; then
             usc_transport="local"
             usc_target="local"
         else
             command -v ssh >/dev/null 2>&1 || die "ssh client is not available for Standby Server verification."
-            usc_user=$(ask "Standby Server SSH user" "$(id -un 2>/dev/null || echo '')") || usage_die "Input cancelled."
-            [ -n "$usc_user" ] || usage_die "Standby Server SSH user is required."
+            usc_user=$(ask "Unselected Standby validation SSH user" "$(id -un 2>/dev/null || echo '')") || usage_die "Input cancelled."
+            [ -n "$usc_user" ] || usage_die "Unselected Standby validation SSH user is required."
             usc_transport="ssh"
             usc_target="$usc_user@$usc_host"
             mktemp_safe || remote_die "Could not create temporary file for Standby Server SSH validation."
@@ -1559,7 +1561,7 @@ unselected_standby_check() {
         if [ "$usc_matches" -eq 1 ]; then
             usc_pick=1
         else
-            usc_pick=$(ask "Standby Server instance number for $usc_app" "") || usage_die "Input cancelled."
+            usc_pick=$(ask "Unselected Standby instance number for validation ($usc_app)" "") || usage_die "Input cancelled."
         fi
         case "$usc_pick" in ''|*[!0-9]*) usage_die "Invalid Standby Server instance selection." ;; esac
         usc_selected=$(awk -F '\t' -v n="$usc_pick" '$1=="DOWNSTREAM_INSTANCE" {i++; if(i==n) print}' "$usc_instances")
