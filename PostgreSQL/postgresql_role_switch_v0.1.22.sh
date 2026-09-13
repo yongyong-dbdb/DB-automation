@@ -90,6 +90,15 @@ REMOTE_TOPOLOGY_ROLE=""
 REMOTE_DOWNSTREAM_COUNT=""
 REMOTE_RECOVERY_TARGET_TIMELINE=""
 REMOTE_RECEIVER_SLOT=""
+REMOTE_MAX_WAL_SENDERS=""
+REMOTE_MAX_REPLICATION_SLOTS=""
+REMOTE_REPLICATION_SLOT_COUNT=""
+REMOTE_RISKY_PHYSICAL_SLOT_COUNT=""
+REMOTE_ARCHIVED_COUNT=""
+REMOTE_ARCHIVER_FAILED_COUNT=""
+REMOTE_LAST_ARCHIVED_TIME=""
+REMOTE_LAST_FAILED_TIME=""
+REMOTE_ARCHIVER_UNRESOLVED=""
 
 say() { printf '%s\n' "$*"; }
 info() { printf '[INFO] %s\n' "$*"; }
@@ -239,6 +248,7 @@ on_exit() {
             after_promotion|rejoin_old_primary)
                 warn "The candidate has been promoted. Do NOT restart the former Primary as a Primary."
                 warn "Keep the former Primary stopped until it is confirmed to start with standby.signal and correct primary_conninfo."
+                manual_recovery_branch_notice
                 ;;
         esac
     fi
@@ -1547,6 +1557,90 @@ logical_replication_slot_precheck() {
     done < "$lrsp_tmp"
 }
 
+current_primary_slot_wal_status_guard() {
+    if [ "$PG_MAJOR" -lt 13 ]; then
+        record_check "MANUAL CHECK" "Physical Slot WAL Retention" "PostgreSQL $PG_MAJOR does not expose pg_replication_slots.wal_status; inspect physical slot WAL retention before Switchover"
+        return 0
+    fi
+    cps_risky=$(psql_call "SELECT count(*) FROM pg_replication_slots WHERE slot_type='physical' AND wal_status IN ('unreserved','lost')" 2>/dev/null | tr -d '[:space:]') || die "Could not inspect physical replication slot wal_status on the current Primary Server."
+    case "$cps_risky" in ''|*[!0-9]*) die "Unexpected physical replication slot risk count: $cps_risky" ;; esac
+    if [ "$cps_risky" -gt 0 ]; then
+        psql_call "SELECT slot_name || ' | wal_status=' || wal_status || ' | safe_wal_size=' || COALESCE(safe_wal_size::text,'NULL') FROM pg_replication_slots WHERE slot_type='physical' AND wal_status IN ('unreserved','lost') ORDER BY slot_name" 2>/dev/null | sed 's/^/  /' >&2 || true
+        die "$cps_risky physical replication slot(s) on the current Primary Server have wal_status=unreserved/lost. Switchover is blocked until required WAL retention is safe."
+    fi
+    record_check "PASSED" "Physical Slot WAL Retention" "current Primary physical slots have no wal_status=unreserved/lost"
+}
+
+candidate_switchover_safety_precheck() {
+    css_reserve_slots=${1:-0}
+    css_line=$(remote_invoke --remote-switchover-safety "$REMOTE_PGDATA" 2>/dev/null | awk -F '\t' '$1=="SWITCHOVER_SAFETY" {print; exit}') || classify_remote_failure "$?" "Could not inspect the selected Standby Server's switchover capacity and safety state."
+    [ -n "$css_line" ] || die "Selected Standby Server returned no switchover safety data."
+    REMOTE_MAX_WAL_SENDERS=$(printf '%s\n' "$css_line" | awk -F '\t' '{print $2}')
+    REMOTE_MAX_REPLICATION_SLOTS=$(printf '%s\n' "$css_line" | awk -F '\t' '{print $3}')
+    REMOTE_REPLICATION_SLOT_COUNT=$(printf '%s\n' "$css_line" | awk -F '\t' '{print $4}')
+    REMOTE_RISKY_PHYSICAL_SLOT_COUNT=$(printf '%s\n' "$css_line" | awk -F '\t' '{print $5}')
+    REMOTE_ARCHIVED_COUNT=$(printf '%s\n' "$css_line" | awk -F '\t' '{print $6}')
+    REMOTE_ARCHIVER_FAILED_COUNT=$(printf '%s\n' "$css_line" | awk -F '\t' '{print $7}')
+    REMOTE_LAST_ARCHIVED_TIME=$(printf '%s\n' "$css_line" | awk -F '\t' '{print $8}')
+    REMOTE_LAST_FAILED_TIME=$(printf '%s\n' "$css_line" | awk -F '\t' '{print $9}')
+    REMOTE_ARCHIVER_UNRESOLVED=$(printf '%s\n' "$css_line" | awk -F '\t' '{print $10}')
+
+    for css_n in "$REMOTE_MAX_WAL_SENDERS" "$REMOTE_MAX_REPLICATION_SLOTS" "$REMOTE_REPLICATION_SLOT_COUNT"; do
+        case "$css_n" in ''|*[!0-9]*) die "Selected Standby Server returned an invalid capacity value: ${css_n:-<empty>}" ;; esac
+    done
+    css_required_senders=$((REMOTE_DOWNSTREAM_COUNT + 1))
+    [ "$REMOTE_MAX_WAL_SENDERS" -ge "$css_required_senders" ] || die "Selected Standby Server max_wal_senders=$REMOTE_MAX_WAL_SENDERS cannot serve $REMOTE_DOWNSTREAM_COUNT existing downstream Standby Server(s) plus the former Primary Server; required >= $css_required_senders."
+    css_required_slots=$((REMOTE_REPLICATION_SLOT_COUNT + css_reserve_slots))
+    [ "$REMOTE_MAX_REPLICATION_SLOTS" -ge "$css_required_slots" ] || die "Selected Standby Server max_replication_slots=$REMOTE_MAX_REPLICATION_SLOTS cannot accommodate existing slots=$REMOTE_REPLICATION_SLOT_COUNT plus requested new reverse slots=$css_reserve_slots; required >= $css_required_slots."
+
+    if [ "$REMOTE_RISKY_PHYSICAL_SLOT_COUNT" = "-1" ]; then
+        record_check "MANUAL CHECK" "Candidate Physical Slot WAL Retention" "PostgreSQL $REMOTE_MAJOR does not expose pg_replication_slots.wal_status"
+    else
+        case "$REMOTE_RISKY_PHYSICAL_SLOT_COUNT" in ''|*[!0-9]*) die "Selected Standby Server returned an invalid risky slot count: $REMOTE_RISKY_PHYSICAL_SLOT_COUNT" ;; esac
+        [ "$REMOTE_RISKY_PHYSICAL_SLOT_COUNT" -eq 0 ] || die "Selected Standby Server has $REMOTE_RISKY_PHYSICAL_SLOT_COUNT physical replication slot(s) with wal_status=unreserved/lost. Switchover is blocked."
+        record_check "PASSED" "Candidate Physical Slot WAL Retention" "no physical slot has wal_status=unreserved/lost"
+    fi
+    record_check "PASSED" "Candidate WAL Sender Capacity" "max_wal_senders=$REMOTE_MAX_WAL_SENDERS required=$css_required_senders"
+    record_check "PASSED" "Candidate Replication Slot Capacity" "max_replication_slots=$REMOTE_MAX_REPLICATION_SLOTS used=$REMOTE_REPLICATION_SLOT_COUNT reserved_for_reverse=$css_reserve_slots"
+}
+
+local_archiver_health_guard() {
+    [ "$LOCAL_ARCHIVE_MODE" != "off" ] || return 0
+    lah_line=$(psql_call "SELECT archived_count::text || E'\\t' || failed_count::text || E'\\t' || COALESCE(last_archived_time::text,'') || E'\\t' || COALESCE(last_failed_time::text,'') || E'\\t' || CASE WHEN failed_count > 0 AND last_failed_time IS NOT NULL AND (last_archived_time IS NULL OR last_failed_time > last_archived_time) THEN '1' ELSE '0' END FROM pg_stat_archiver" 2>/dev/null | sed -n '1p') || die "Could not inspect pg_stat_archiver on the current Primary Server."
+    lah_failed=$(printf '%s\n' "$lah_line" | awk -F '\t' '{print $2}')
+    lah_last_ok=$(printf '%s\n' "$lah_line" | awk -F '\t' '{print $3}')
+    lah_last_fail=$(printf '%s\n' "$lah_line" | awk -F '\t' '{print $4}')
+    lah_unresolved=$(printf '%s\n' "$lah_line" | awk -F '\t' '{print $5}')
+    [ "$lah_unresolved" = "0" ] || die "Current Primary Server pg_stat_archiver shows the most recent archival attempt failed after the most recent successful archive: last_archived_time=${lah_last_ok:-<none>}, last_failed_time=${lah_last_fail:-<none>}, failed_count=${lah_failed:-unknown}."
+    record_check "PASSED" "Current Primary pg_stat_archiver" "no unresolved latest archival failure; failed_count=${lah_failed:-unknown}"
+}
+
+candidate_archiver_health_guard() {
+    [ "$LOCAL_ARCHIVE_MODE" != "off" ] || return 0
+    if [ "$REMOTE_ARCHIVE_MODE" = "always" ]; then
+        [ "${REMOTE_ARCHIVER_UNRESOLVED:-1}" = "0" ] || die "Selected Standby Server archive_mode=always and pg_stat_archiver shows a newer failure than success: last_archived_time=${REMOTE_LAST_ARCHIVED_TIME:-<none>}, last_failed_time=${REMOTE_LAST_FAILED_TIME:-<none>}."
+        record_check "PASSED" "Candidate pg_stat_archiver" "archive_mode=always; no unresolved latest archival failure"
+    else
+        record_check "MANUAL CHECK" "Candidate pg_stat_archiver" "archive_mode=$REMOTE_ARCHIVE_MODE; standby-time pg_stat_archiver cannot prove post-promotion archive destination success"
+    fi
+}
+
+external_restart_fencing_guard() {
+    say ""
+    say "External HA / Service Restart / Fencing"
+    say "  이 스크립트의 data_directory 잠금은 외부 HA manager, service manager, watchdog 또는 별도 운영 자동화가 former Primary를 다시 Primary로 기동하는 것을 차단하지 못합니다."
+    if ! choose_yes_no "Former Primary의 자동 재기동/자동 failover가 중지되어 있고 fencing 또는 동등한 split-brain 방지 절차가 준비되어 있습니까" "no"; then
+        die "Switchover aborted because external restart/failover/fencing control was not confirmed."
+    fi
+    record_check "MANUAL CHECK" "External HA / Fencing" "operator confirmed automatic restart/failover is controlled and split-brain prevention is in place"
+}
+
+manual_recovery_branch_notice() {
+    warn "Automatic pg_rewind or automatic base-backup reprovisioning is intentionally NOT performed."
+    warn "If the former Primary was started writable after promotion, or timeline history diverged, keep it stopped and do not attempt normal standby restart."
+    warn "Compare timeline history and control state first. Use pg_rewind only when its prerequisites and required WAL are satisfied; otherwise reinitialize from a new base backup."
+    record_check "MANUAL CHECK" "Former Primary Recovery Branch" "timeline divergence requires operator-directed pg_rewind or new base backup; no automatic destructive recovery is performed"
+}
 startup_options_guard() {
     sog_cmdline_count=$(psql_call "SELECT count(*) FROM pg_settings WHERE source='command line' AND name <> 'data_directory'" 2>/dev/null | tr -d '[:space:]') || sog_cmdline_count=0
     if [ -z "$POSTMASTER_OPTIONS" ] && [ "$sog_cmdline_count" -gt 0 ] 2>/dev/null; then
@@ -1667,6 +1761,9 @@ planned_switchover() {
     choose_remote_transport
     remote_select_instance
     acquire_candidate_lock
+    current_primary_slot_wal_status_guard
+    candidate_switchover_safety_precheck 0
+    external_restart_fencing_guard
 
     [ "$REMOTE_ROLE" = "standby" ] || die "Selected remote instance is not a Standby."
     [ "$REMOTE_SYSTEM_IDENTIFIER" = "$SYSTEM_IDENTIFIER" ] || die "system_identifier mismatch. The selected Standby Server belongs to a different PostgreSQL cluster."
@@ -1692,6 +1789,8 @@ planned_switchover() {
 
     LOCAL_ARCHIVE_MODE=$(psql_call "SHOW archive_mode" 2>/dev/null | tr -d '[:space:]') || LOCAL_ARCHIVE_MODE=""
     LOCAL_ARCHIVE_READY=$(archive_mechanism_configured 2>/dev/null || echo 0)
+    local_archiver_health_guard
+    candidate_archiver_health_guard
     if [ "$LOCAL_ARCHIVE_MODE" != "off" ] && [ "$REMOTE_ARCHIVE_MODE" = "off" ]; then
         die "The current Primary Server has archive_mode=$LOCAL_ARCHIVE_MODE, but the selected Standby Server has archive_mode=off. Promotion would disable continuous archiving on the new Primary Server."
     fi
@@ -1707,6 +1806,10 @@ planned_switchover() {
         if ! choose_yes_no "The selected Standby Server's continuous archiving destination/credentials have been verified" "no"; then
             die "The selected Standby Server's continuous archiving readiness was not confirmed."
         fi
+        if ! choose_yes_no "Shared archive destination의 동일 WAL 파일 중복 처리 정책(멱등 저장/동일 내용 재전송)이 안전함을 확인했습니까" "no"; then
+            die "Continuous archiving duplicate-WAL handling was not confirmed."
+        fi
+        record_check "MANUAL CHECK" "Archive Duplicate WAL Handling" "operator confirmed duplicate WAL handling is safe"
         record_check "MANUAL CHECK" "Continuous Archiving" "destination and credentials confirmed by operator"
     fi
     case "$REMOTE_DEFAULT_TX_READ_ONLY" in
@@ -1854,6 +1957,11 @@ planned_switchover() {
         fi
     fi
 
+    if [ -n "${REVERSE_SLOT:-}" ]; then
+        candidate_switchover_safety_precheck 1
+    else
+        candidate_switchover_safety_precheck 0
+    fi
     startup_options_guard || die "Switchover cannot guarantee that the former Primary will restart with the same startup configuration."
 
     show_client_session_check
@@ -2302,6 +2410,25 @@ remote_validate_candidate() {
     printf 'CANDIDATE_READY\t%s\n' "$rvc_pgdata"
 }
 
+remote_switchover_safety() {
+    rss_pgdata=$1
+    remote_init_exact "$rss_pgdata"
+    rss_mws=$(psql_call "SHOW max_wal_senders" 2>/dev/null | tr -d '[:space:]') || exit 3
+    rss_mrs=$(psql_call "SHOW max_replication_slots" 2>/dev/null | tr -d '[:space:]') || exit 4
+    rss_slots=$(psql_call "SELECT count(*) FROM pg_replication_slots" 2>/dev/null | tr -d '[:space:]') || exit 5
+    if [ "$PG_MAJOR" -ge 13 ]; then
+        rss_risky=$(psql_call "SELECT count(*) FROM pg_replication_slots WHERE slot_type='physical' AND wal_status IN ('unreserved','lost')" 2>/dev/null | tr -d '[:space:]') || exit 6
+    else
+        rss_risky=-1
+    fi
+    rss_arch=$(psql_call "SELECT archived_count::text || E'\\t' || failed_count::text || E'\\t' || COALESCE(last_archived_time::text,'') || E'\\t' || COALESCE(last_failed_time::text,'') || E'\\t' || CASE WHEN failed_count > 0 AND last_failed_time IS NOT NULL AND (last_archived_time IS NULL OR last_failed_time > last_archived_time) THEN '1' ELSE '0' END FROM pg_stat_archiver" 2>/dev/null | sed -n '1p') || exit 7
+    rss_archived=$(printf '%s\n' "$rss_arch" | awk -F '\t' '{print $1}')
+    rss_failed=$(printf '%s\n' "$rss_arch" | awk -F '\t' '{print $2}')
+    rss_last_ok=$(printf '%s\n' "$rss_arch" | awk -F '\t' '{print $3}')
+    rss_last_fail=$(printf '%s\n' "$rss_arch" | awk -F '\t' '{print $4}')
+    rss_unresolved=$(printf '%s\n' "$rss_arch" | awk -F '\t' '{print $5}')
+    printf 'SWITCHOVER_SAFETY\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$rss_mws" "$rss_mrs" "$rss_slots" "$rss_risky" "$rss_archived" "$rss_failed" "$rss_last_ok" "$rss_last_fail" "$rss_unresolved"
+}
 remote_wait_streaming_downstreams() {
     rwsd_pgdata=$1
     rwsd_expected=$2
@@ -2436,6 +2563,11 @@ case "${1:-}" in
     --remote-validate-candidate)
         [ "$#" -eq 6 ] || exit 64
         remote_validate_candidate "$2" "$3" "$4" "$5" "$6"
+        exit $?
+        ;;
+    --remote-switchover-safety)
+        [ "$#" -eq 2 ] || exit 64
+        remote_switchover_safety "$2"
         exit $?
         ;;
     --remote-wait-streaming-downstreams)
