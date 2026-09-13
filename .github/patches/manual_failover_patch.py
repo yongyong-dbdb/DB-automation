@@ -3,211 +3,50 @@ from pathlib import Path
 p = Path('PostgreSQL/postgresql_role_switch_v0.1.22.sh')
 s = p.read_text()
 
-if 'manual_failover() {' in s and 'show_switchover_execution_plan() {' in s:
-    raise SystemExit(0)
-
-anchor = 'planned_switchover() {\n'
-assert anchor in s
-helper = r'''show_switchover_execution_plan() {
-    section "Planned Switchover Execution Plan" "최종 승인 후 실제로 수행할 PostgreSQL/OS 작업입니다. primary_conninfo의 민감정보는 표시하지 않습니다."
-    printf '  Current Primary data_directory : %s\n' "$PGDATA"
-    printf '  Current Primary port           : %s\n' "$PGPORT"
-    printf '  Selected Standby host          : %s\n' "$CANDIDATE_CLIENT"
-    printf '  Selected Standby data_directory: %s\n' "$REMOTE_PGDATA"
-    printf '  Selected Standby port          : %s\n' "$REMOTE_PORT"
-    say ""
-    say "  1. Stage reverse replication settings on current Primary"
-    say "     ALTER SYSTEM SET primary_conninfo = '<redacted>';"
-    if [ -n "${REVERSE_SLOT:-}" ]; then
-        printf "     ALTER SYSTEM SET primary_slot_name = '%s';\n" "$REVERSE_SLOT"
-    else
-        say "     ALTER SYSTEM SET primary_slot_name = '';"
-    fi
-    say "     ALTER SYSTEM SET recovery_target_timeline = 'latest';"
-    say ""
-    say "  2. Revalidate pg_stat_replication / pg_stat_wal_receiver immediately before shutdown"
-    say ""
-    say "  3. Stop current Primary cleanly"
-    printf '     %s -D %s -m %s -w stop\n' "$PG_CTL_BIN" "$PGDATA" "$SWITCH_SHUTDOWN_MODE"
-    say ""
-    say "  4. Read former Primary final checkpoint and clean shutdown state"
-    printf '     %s %s\n' "$PG_CONTROLDATA_BIN" "$PGDATA"
-    say ""
-    say "  5. Wait until selected Standby replays through the final checkpoint"
-    say "     SELECT pg_last_wal_replay_lsn();"
-    say ""
-    say "  6. Promote selected Standby"
-    say "     SELECT pg_promote();"
-    say ""
-    say "  7. Create/verify reverse physical replication slot when configured"
-    [ -z "${REVERSE_SLOT:-}" ] || printf "     SELECT pg_create_physical_replication_slot('%s', true);\n" "$REVERSE_SLOT"
-    say ""
-    say "  8. Create standby.signal on former Primary"
-    printf '     create %s/standby.signal\n' "$PGDATA"
-    say ""
-    say "  9. Start former Primary as Standby"
-    printf '     %s -D %s -w start\n' "$PG_CTL_BIN" "$PGDATA"
-    say ""
-    say " 10. Verify pg_is_in_recovery(), pg_stat_wal_receiver.status and pg_stat_replication"
-}
-
+old = '''        case "$CURRENT_PHASE" in
+            before_primary_stop|initial|precheck)
+                # ALTER SYSTEM changes staged for role reversal must be restored
+                # while the current Primary Server is still available.
+                rollback_preconfigured_primary
+                ;;
+            after_primary_stop)
 '''
-s = s.replace(anchor, helper + anchor, 1)
-
-old = '''    show_client_session_check\n\n    CURRENT_PHASE="before_primary_stop"\n    if ! confirm_word "SWITCHOVER" "Pre-Switchover checks completed. The next step stages reverse replication settings and shuts down the current Primary."; then\n'''
-new = '''    show_client_session_check\n    show_switchover_execution_plan\n\n    CURRENT_PHASE="before_primary_stop"\n    if ! confirm_word "SWITCHOVER" "Pre-Switchover checks completed. Review the execution plan above. The next step stages reverse replication settings and shuts down the current Primary."; then\n'''
+new = '''        case "$CURRENT_PHASE" in
+            before_primary_stop|initial|precheck)
+                # ALTER SYSTEM changes staged for role reversal must be restored
+                # while the current Primary Server is still available.
+                rollback_preconfigured_primary
+                ;;
+            failover_precheck)
+                :
+                ;;
+            failover_pre_promote)
+                warn "Manual Failover stopped before promotion. Verify this server is still a Standby and keep the former Primary fenced until topology is confirmed."
+                ;;
+            failover_after_promotion)
+                warn "Manual Failover promotion was requested. Keep the former Primary fenced and do NOT restart it as Primary."
+                manual_recovery_branch_notice
+                ;;
+            after_primary_stop)
+'''
 assert old in s
 s = s.replace(old, new, 1)
 
-anchor = 'replication_control_menu() {\n'
-assert anchor in s
-failover = r'''wait_local_replay_lsn() {
-    wlr_target=$1
-    wlr_timeout=$(bounded_wait_seconds "$2") || return 1
-    wlr_i=0
-    while [ "$wlr_i" -lt "$wlr_timeout" ]; do
-        wlr_replay=$(psql_call "SELECT COALESCE(pg_last_wal_replay_lsn()::text,'')" 2>/dev/null | sed -n '1p') || wlr_replay=""
-        if [ -n "$wlr_replay" ]; then
-            wlr_ok=$(psql_call_var target "$wlr_target" "SELECT CASE WHEN pg_last_wal_replay_lsn() IS NOT NULL AND pg_last_wal_replay_lsn() >= :'target'::pg_lsn THEN 1 ELSE 0 END" 2>/dev/null | tr -d '[:space:]') || wlr_ok=0
-            [ "$wlr_ok" = "1" ] && return 0
-        fi
-        sleep 1
-        wlr_i=$((wlr_i + 1))
-    done
-    return 1
-}
+s = s.replace('die "Planned Switchover must run as the PostgreSQL server OS account ($clea_owner), not $clea_user; pg_ctl cannot safely administer this instance under another account."',
+              'die "This operation must run as the PostgreSQL server OS account ($clea_owner), not $clea_user; PostgreSQL instance administration cannot safely continue under another OS account."', 1)
 
-show_manual_failover_execution_plan() {
-    section "Manual Failover Execution Plan" "이 작업은 장애 Primary를 자동 판정하지 않습니다. 운영자가 Primary 장애와 fencing을 확인한 뒤 현재 Standby를 승격합니다."
-    printf '  Candidate data_directory      : %s\n' "$PGDATA"
-    printf '  Candidate port                : %s\n' "$PGPORT"
-    printf '  pg_stat_wal_receiver.status   : %s\n' "${FAILOVER_RECEIVER_STATUS:-<not connected>}"
-    printf '  pg_last_wal_receive_lsn()     : %s\n' "${FAILOVER_RECEIVE_LSN:-<NULL>}"
-    printf '  pg_last_wal_replay_lsn()      : %s\n' "${FAILOVER_REPLAY_LSN:-<NULL>}"
-    printf '  receive/replay gap (derived)  : %s\n' "${FAILOVER_REPLAY_GAP:-unknown}"
-    say ""
-    say "  1. Revalidate that this server is still a Standby"
-    say "     SELECT pg_is_in_recovery();"
-    say ""
-    say "  2. Revalidate pg_stat_wal_receiver.status is not streaming"
-    say ""
-    if [ -n "${FAILOVER_RECEIVE_LSN:-}" ]; then
-        say "  3. Wait until pg_last_wal_replay_lsn() reaches the last WAL already received"
-    else
-        say "  3. No non-NULL pg_last_wal_receive_lsn() is available; no local receive target can be proven"
-    fi
-    say ""
-    say "  4. Promote this Standby"
-    say "     SELECT pg_promote();"
-    say ""
-    say "  5. Verify promotion"
-    say "     SELECT pg_is_in_recovery();  -- must be false"
-    say ""
-    say "  6. Former Primary is NOT restarted or rewound automatically"
-    say "     Rejoin requires operator-directed pg_rewind or a new base backup after topology/timeline review."
-}
+s = s.replace('manual_failover() {\n    CURRENT_PHASE="precheck"\n', 'manual_failover() {\n    CURRENT_PHASE="failover_precheck"\n', 1)
+s = s.replace('    CURRENT_PHASE="after_primary_stop"\n    failover_promote=$(psql_call "SELECT pg_promote()"', '    CURRENT_PHASE="failover_pre_promote"\n    failover_promote=$(psql_call "SELECT pg_promote()"', 1)
+s = s.replace('    SWITCHOVER_PROMOTED=1\n    CURRENT_PHASE="after_promotion"\n\n    refresh_role || die "Promotion was requested', '    SWITCHOVER_PROMOTED=1\n    CURRENT_PHASE="failover_after_promotion"\n\n    refresh_role || die "Promotion was requested', 1)
 
-manual_failover() {
-    CURRENT_PHASE="precheck"
-    require_standby
-    validate_supported_version
-    check_local_execution_account
-    check_pg_wal_free_space
-
-    section "Manual Failover" "장애 Primary를 대신하여 현재 Standby를 운영자가 명시적으로 Primary로 승격합니다. Automatic Failover는 수행하지 않습니다."
-    say "  PostgreSQL은 Primary 장애를 판정하거나 fencing을 수행하지 않습니다. Primary 장애와 split-brain 방지 상태를 운영자가 확인해야 합니다."
-
-    FAILOVER_RECEIVER_STATUS=$(psql_call "SELECT COALESCE(status,'') FROM pg_stat_wal_receiver LIMIT 1" 2>/dev/null | sed -n '1p')
-    FAILOVER_RECEIVE_LSN=$(psql_call "SELECT COALESCE(pg_last_wal_receive_lsn()::text,'')" 2>/dev/null | sed -n '1p')
-    FAILOVER_REPLAY_LSN=$(psql_call "SELECT COALESCE(pg_last_wal_replay_lsn()::text,'')" 2>/dev/null | sed -n '1p')
-    FAILOVER_REPLAY_GAP=$(psql_call "SELECT CASE WHEN pg_last_wal_receive_lsn() IS NULL OR pg_last_wal_replay_lsn() IS NULL THEN NULL ELSE pg_wal_lsn_diff(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn()) END" 2>/dev/null | sed -n '1p')
-    FAILOVER_RECOVERY_TIMELINE=$(psql_call "SHOW recovery_target_timeline" 2>/dev/null | tr -d '[:space:]') || FAILOVER_RECOVERY_TIMELINE=""
-    FAILOVER_PAUSE_STATE=$(pause_state 2>/dev/null || echo unknown)
-    FAILOVER_DOWNSTREAM_COUNT=$(psql_call "SELECT count(*) FROM pg_stat_replication r WHERE state <> 'backup' AND NOT EXISTS (SELECT 1 FROM pg_replication_slots s WHERE s.active_pid=r.pid AND s.slot_type='logical')" 2>/dev/null | tr -d '[:space:]') || FAILOVER_DOWNSTREAM_COUNT=""
-
-    [ "$FAILOVER_RECEIVER_STATUS" != "streaming" ] || die "Manual Failover is blocked because pg_stat_wal_receiver.status=streaming. The current Standby still has an active streaming connection to its Upstream Server."
-    [ "$FAILOVER_RECOVERY_TIMELINE" = "latest" ] || die "Manual Failover requires recovery_target_timeline=latest; current value=$FAILOVER_RECOVERY_TIMELINE."
-    case "$FAILOVER_PAUSE_STATE" in "not paused"|f|false|"") ;; *) die "Manual Failover is blocked because WAL replay is paused or pause was requested: $FAILOVER_PAUSE_STATE" ;; esac
-    case "$FAILOVER_DOWNSTREAM_COUNT" in ''|*[!0-9]*) die "Could not determine SELECT count(*) FROM pg_stat_replication on the failover candidate." ;; esac
-
-    record_check "PASSED" "Manual Failover Candidate" "Current Role=Standby; recovery_target_timeline=latest; WAL replay is not paused"
-    if [ -n "$FAILOVER_RECEIVER_STATUS" ]; then
-        record_check "WARNING" "pg_stat_wal_receiver.status" "status=$FAILOVER_RECEIVER_STATUS; not streaming; operator must confirm Primary failure"
-    else
-        record_check "WARNING" "pg_stat_wal_receiver.status" "no active WAL Receiver row; operator must confirm Primary failure"
-    fi
-
-    if ! confirm_word "PRIMARY_UNAVAILABLE" "Confirm independently that the former Primary is unavailable for normal service. This script cannot prove server failure from the Standby alone."; then
-        cancel_operation "Manual Failover cancelled because Primary unavailability was not confirmed."
-    fi
-    record_check "MANUAL CHECK" "Primary Availability" "operator confirmed former Primary is unavailable"
-
-    if ! confirm_word "PRIMARY_FENCED" "Confirm that the former Primary cannot accept writes or restart as Primary (STONITH/fencing or an equivalent isolation procedure)."; then
-        cancel_operation "Manual Failover cancelled because fencing was not confirmed."
-    fi
-    record_check "MANUAL CHECK" "Primary Fencing" "operator confirmed former Primary is fenced from serving as Primary"
-
-    if [ -n "$FAILOVER_RECEIVE_LSN" ]; then
-        failover_wait_default=$(psql_call "SELECT CASE WHEN setting::bigint = 0 THEN 120 ELSE GREATEST(30, LEAST(600, (setting::bigint / 1000) * 2)) END FROM pg_settings WHERE name='wal_receiver_timeout'" 2>/dev/null | tr -d '[:space:]') || failover_wait_default=120
-        [ "$failover_wait_default" -le "$MAX_WAIT_SECONDS" ] 2>/dev/null || failover_wait_default=$MAX_WAIT_SECONDS
-        say "WAL Replay Catch-up Wait"
-        say "  이미 수신한 마지막 WAL까지 replay한 후 승격합니다. 이는 장애 Primary에만 존재했던 미전송 WAL의 존재 여부까지 증명하지는 않습니다."
-        failover_wait=$(ask "Wait seconds" "$failover_wait_default") || usage_die "Input cancelled."
-        validate_wait_seconds "$failover_wait" || usage_die "Wait seconds must be an integer between 1 and $MAX_WAIT_SECONDS."
-        if ! wait_local_replay_lsn "$FAILOVER_RECEIVE_LSN" "$failover_wait"; then
-            die "Manual Failover is blocked because pg_last_wal_replay_lsn() did not reach the last WAL already received by this Standby."
-        fi
-        FAILOVER_REPLAY_LSN=$(psql_call "SELECT COALESCE(pg_last_wal_replay_lsn()::text,'')" 2>/dev/null | sed -n '1p')
-        FAILOVER_REPLAY_GAP=$(psql_call "SELECT CASE WHEN pg_last_wal_receive_lsn() IS NULL OR pg_last_wal_replay_lsn() IS NULL THEN NULL ELSE pg_wal_lsn_diff(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn()) END" 2>/dev/null | sed -n '1p')
-        record_check "PASSED" "WAL Replay" "pg_last_wal_replay_lsn() reached pg_last_wal_receive_lsn()=$FAILOVER_RECEIVE_LSN"
-    else
-        warn "pg_last_wal_receive_lsn() is NULL. The script cannot establish a local last-received WAL target before promotion."
-        record_check "MANUAL CHECK" "WAL Receive Position" "pg_last_wal_receive_lsn() is NULL; no local receive target can be proven"
-    fi
-
-    warn "Because the former Primary is unavailable, this script cannot prove that no committed WAL exists only on that server. Manual Failover can therefore involve data loss, especially with asynchronous replication."
-    if ! confirm_word "ACCEPT_DATA_LOSS_RISK" "Acknowledge the possibility of transactions that were committed on the failed Primary but never reached this Standby."; then
-        cancel_operation "Manual Failover cancelled because potential data-loss risk was not accepted."
-    fi
-    record_check "WARNING" "Potential Data Loss" "operator explicitly accepted that unreceived WAL on the failed Primary cannot be ruled out"
-
-    show_manual_failover_execution_plan
-
-    if ! confirm_word "FAILOVER" "Final confirmation: promote this Standby to Primary. The fenced former Primary must not be restarted as Primary."; then
-        cancel_operation "Manual Failover cancelled before promotion."
-    fi
-
-    refresh_role || die "Could not revalidate Current Role immediately before Manual Failover."
-    [ "$LOCAL_ROLE" = "standby" ] || die "Manual Failover candidate is no longer a Standby."
-    failover_receiver_now=$(psql_call "SELECT COALESCE(status,'') FROM pg_stat_wal_receiver LIMIT 1" 2>/dev/null | sed -n '1p')
-    [ "$failover_receiver_now" != "streaming" ] || die "Manual Failover blocked: pg_stat_wal_receiver.status became streaming again before promotion."
-    failover_pause_now=$(pause_state 2>/dev/null || echo unknown)
-    case "$failover_pause_now" in "not paused"|f|false|"") ;; *) die "Manual Failover blocked: WAL replay became paused before promotion." ;; esac
-
-    CURRENT_PHASE="after_primary_stop"
-    failover_promote=$(psql_call "SELECT pg_promote()" 2>/dev/null | tr -d '[:space:]') || die "pg_promote() failed. The server remains in its current state; verify PostgreSQL logs and role before retrying."
-    [ "$failover_promote" = "t" ] || [ "$failover_promote" = "true" ] || die "pg_promote() did not report success. Verify the server role before taking any further action."
-    SWITCHOVER_PROMOTED=1
-    CURRENT_PHASE="after_promotion"
-
-    refresh_role || die "Promotion was requested but the new role could not be verified. Treat the former Primary as fenced and verify both servers manually."
-    [ "$LOCAL_ROLE" = "primary" ] || die "pg_promote() returned success but pg_is_in_recovery() still indicates Standby. Treat the former Primary as fenced and inspect PostgreSQL logs."
-
-    record_check "PASSED" "Manual Failover Promotion" "pg_promote() succeeded and pg_is_in_recovery()=false"
-    CURRENT_PHASE="completed"
-    section "Post-Failover Verification" "현재 서버가 Primary로 승격되었습니다. former Primary는 자동 재편입하지 않습니다."
-    kv "Current Role" "Primary"
-    kv "pg_is_in_recovery()" "$(psql_call "SELECT pg_is_in_recovery()" 2>/dev/null | sed -n '1p')"
-    kv "SELECT count(*) FROM pg_stat_replication" "$(psql_call "SELECT count(*) FROM pg_stat_replication" 2>/dev/null | tr -d '[:space:]')"
-    warn "Keep the former Primary fenced. Before rejoining it, compare timelines/control state and use operator-directed pg_rewind when prerequisites are satisfied, otherwise create a new Standby from a fresh base backup."
+old = '''    warn "Keep the former Primary fenced. Before rejoining it, compare timelines/control state and use operator-directed pg_rewind when prerequisites are satisfied, otherwise create a new Standby from a fresh base backup."
     manual_recovery_branch_notice
-}
-
 '''
-s = s.replace(anchor, failover + anchor, 1)
-
-old = '''        else\n            say "  1. WAL Receiver Control"\n            say "     Upstream에서 받는 WAL Replay와 WAL Receiver 연결의 중지·복원 작업을 선택합니다."\n            say ""\n            say "  2. Refresh Topology / Replication Status"\n            say "     Upstream/Downstream 관계, WAL 위치 및 Receiver 상태를 다시 조회합니다."\n            say ""\n            say "  3. Exit"\n            mm_choice=$(ask "Select operation" "2") || exit 0\n            case "$mm_choice" in\n                1) replication_control_menu ;;\n                2) replication_status ;;\n                3) exit 0 ;;\n                *) say "Invalid selection." ;;\n            esac\n        fi\n'''
-new = '''        else\n            say "  1. WAL Receiver Control"\n            say "     Upstream에서 받는 WAL Replay와 WAL Receiver 연결의 중지·복원 작업을 선택합니다."\n            say ""\n            say "  2. Manual Failover"\n            say "     장애 Primary의 자동 판정 없이, fencing을 확인한 뒤 현재 Standby를 명시적으로 Promote합니다."\n            say ""\n            say "  3. Refresh Topology / Replication Status"\n            say "     Upstream/Downstream 관계, WAL 위치 및 Receiver 상태를 다시 조회합니다."\n            say ""\n            say "  4. Exit"\n            mm_choice=$(ask "Select operation" "3") || exit 0\n            case "$mm_choice" in\n                1) replication_control_menu ;;\n                2) manual_failover ;;\n                3) replication_status ;;\n                4) exit 0 ;;\n                *) say "Invalid selection." ;;\n            esac\n        fi\n'''
+new = '''    say "  Former Primary Rejoin"
+    say "    Keep the former Primary fenced. Before rejoining it, compare timelines/control state."
+    say "    Use operator-directed pg_rewind only when its prerequisites and required WAL are satisfied; otherwise create a new Standby from a fresh base backup."
+    record_check "MANUAL CHECK" "Former Primary Rejoin" "former Primary remains fenced; operator-directed pg_rewind or new base backup is required before rejoin"
+'''
 assert old in s
 s = s.replace(old, new, 1)
 
