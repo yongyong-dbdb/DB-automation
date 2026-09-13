@@ -1,0 +1,75 @@
+name: Fix reverse slot state
+
+on:
+  push:
+    paths:
+      - '.github/workflows/fix-reverse-slot-state.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Apply patches and syntax validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
+          python3 .github/patches/clarify-reverse-physical-slot.py
+          python3 .github/patches/fix-remote-slot-state.py
+          sh -n "$target"
+          git diff --check
+      - name: Reverse slot state assertions
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
+          grep -F 'rss_state=absent' "$target"
+          grep -F 'rss_state=physical_inactive' "$target"
+          grep -F 'rss_state=physical_active' "$target"
+          grep -F 'rss_state=conflict' "$target"
+          grep -F 'returned no SLOT_STATE record' "$target"
+          grep -F 'response name mismatch' "$target"
+          ! grep -A45 '^remote_slot_state()' "$target" | grep -F "psql_call_var slot"
+      - name: Slot prompt assertions
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
+          grep -F 'Physical Replication Slot for Former Primary' "$target"
+          grep -F '기존 slot은 Current Primary에 존재하므로 New Primary에서 그대로 재사용할 수 없습니다.' "$target"
+          grep -F '동일 이름의 적합한 physical slot이 New Primary에 이미 있으면 검증 후 재사용하고, 없으면 promotion 후 생성합니다.' "$target"
+          grep -F 'New Primary slot for former Primary (empty = do not use a slot)' "$target"
+      - name: Mock remote slot states
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
+          # Static branch coverage for the four supported controller states.
+          for state in absent physical_inactive physical_active conflict; do
+            grep -F "$state)" "$target" >/dev/null
+          done
+      - name: Dependency scan
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
+          ! awk '!/^[[:space:]]*#/' "$target" | grep -E '(^|[^[:alnum:]_])(python|python3|jq|yq|expect|perl|node|npm|pip)([^[:alnum:]_]|$)'
+      - name: Commit target only
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add "$target"
+          git diff --cached --check
+          git diff --cached --quiet && exit 0
+          git commit -m 'fix: handle absent reverse physical slots'
+          git push origin HEAD:main
