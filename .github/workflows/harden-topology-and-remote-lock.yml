@@ -33,7 +33,7 @@ jobs:
           ! grep -F 'verify_upstream_connection()' "$target"
           grep -F 'fresh Primary pg_stat_replication and selected Standby pg_stat_wal_receiver agree' "$target"
           grep -F 'rst_remote_output=$(remote_invoke --remote-validate-candidate' "$target"
-          grep -F 'CANDIDATE_READY\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s' "$target"
+          grep -F "printf 'CANDIDATE_READY" "$target" | grep -F 'rvc_sender_port' | grep -F 'rvc_sender_slot' | grep -F 'rvc_downstreams'
           grep -F 'remote_lock_refresh()' "$target"
           grep -F 'lease_expires' "$target"
           grep -F -- '--remote-lock-refresh' "$target"
