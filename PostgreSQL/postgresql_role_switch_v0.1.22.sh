@@ -1388,7 +1388,17 @@ candidate_downstream_check() {
             [ -n "$cdc_user" ] || usage_die "Downstream SSH user is required."
             cdc_transport="ssh"
             cdc_target="$cdc_user@$cdc_host"
-            ssh -o BatchMode=yes -o ConnectTimeout=5 "$cdc_target" 'sh -c "exit 0"' >/dev/null 2>&1 || remote_die "Non-interactive SSH check failed for $cdc_target."
+            mktemp_safe || remote_die "Could not create temporary file for Downstream SSH validation."
+            cdc_ssh_err=$SAFE_TMP
+            cdc_check_cmd=$(remote_build_command --help)
+            if ! ssh -T -o BatchMode=yes -o ConnectTimeout=5 "$cdc_target" "$cdc_check_cmd" < "$SCRIPT_PATH" >/dev/null 2>"$cdc_ssh_err"; then
+                [ ! -s "$cdc_ssh_err" ] || cat "$cdc_ssh_err" >&2
+                remote_die "Non-interactive SSH check failed for $cdc_target."
+            fi
+            if grep -Ei 'command not found|syntax error|unexpected EOF|not found$' "$cdc_ssh_err" >/dev/null 2>&1; then
+                cat "$cdc_ssh_err" >&2
+                remote_die "Non-interactive SSH check failed for $cdc_target."
+            fi
         fi
 
         mktemp_safe || die "Could not create a Downstream instance file."
@@ -1443,7 +1453,17 @@ unselected_standby_check() {
             [ -n "$usc_user" ] || usage_die "Standby Server SSH user is required."
             usc_transport="ssh"
             usc_target="$usc_user@$usc_host"
-            ssh -o BatchMode=yes -o ConnectTimeout=5 "$usc_target" 'sh -c "exit 0"' >/dev/null 2>&1 || remote_die "Non-interactive SSH check failed for $usc_target."
+            mktemp_safe || remote_die "Could not create temporary file for Standby Server SSH validation."
+            usc_ssh_err=$SAFE_TMP
+            usc_check_cmd=$(remote_build_command --help)
+            if ! ssh -T -o BatchMode=yes -o ConnectTimeout=5 "$usc_target" "$usc_check_cmd" < "$SCRIPT_PATH" >/dev/null 2>"$usc_ssh_err"; then
+                [ ! -s "$usc_ssh_err" ] || cat "$usc_ssh_err" >&2
+                remote_die "Non-interactive SSH check failed for $usc_target."
+            fi
+            if grep -Ei 'command not found|syntax error|unexpected EOF|not found$' "$usc_ssh_err" >/dev/null 2>&1; then
+                cat "$usc_ssh_err" >&2
+                remote_die "Non-interactive SSH check failed for $usc_target."
+            fi
         fi
 
         mktemp_safe || die "Could not create a Standby Server instance file."
