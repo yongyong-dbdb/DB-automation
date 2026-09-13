@@ -1373,9 +1373,17 @@ remote_select_instance() {
 }
 
 verify_upstream_connection() {
-    vuc_result=$(remote_invoke --remote-verify-upstream "$REMOTE_PGDATA" "$SYSTEM_IDENTIFIER" "$PGPORT" 2>/dev/null) || classify_remote_failure "$?" "Could not verify the selected Standby Server's upstream Primary Server. Check primary_conninfo, credentials, pg_hba.conf and network."
-    [ "$vuc_result" = "UPSTREAM_VERIFIED" ] || die "The upstream server reached through primary_conninfo does not match the selected Primary Server system_identifier and port."
-    record_check "PASSED" "primary_conninfo Upstream" "live SQL connection verified system_identifier=$SYSTEM_IDENTIFIER and port=$PGPORT"
+    # Do not open a second libpq/replication connection here. The authoritative
+    # topology evidence is the live pg_stat_replication row on the Primary plus
+    # pg_stat_wal_receiver on the selected Standby. A separate probe can fail
+    # because of authentication/passfile rules even while physical streaming is
+    # healthy, producing a false negative.
+    [ "$REMOTE_SYSTEM_IDENTIFIER" = "$SYSTEM_IDENTIFIER" ] || die "Selected Standby system_identifier changed during validation."
+    [ "$REMOTE_ROLE" = "standby" ] || die "Selected Standby is no longer in recovery."
+    [ "$REMOTE_RECEIVER_STATUS" = "streaming" ] || die "Selected Standby pg_stat_wal_receiver.status is no longer streaming."
+    [ "$REMOTE_SENDER_PORT" = "$PGPORT" ] || die "Selected Standby pg_stat_wal_receiver.sender_port=$REMOTE_SENDER_PORT does not match current Primary port=$PGPORT."
+    [ "${REMOTE_RECEIVER_SLOT:-}" = "${CANDIDATE_SLOT:-}" ] || die "Selected Standby pg_stat_wal_receiver.slot_name changed during validation."
+    record_check "PASSED" "Streaming Topology Cross-check" "Primary pg_stat_replication and selected Standby pg_stat_wal_receiver agree on streaming state, system_identifier, sender_port=$PGPORT and physical slot=${CANDIDATE_SLOT:-<empty>}"
 }
 
 candidate_downstream_check() {
@@ -2756,67 +2764,6 @@ remote_preflight() {
     printf 'PREFLIGHT\tready\t%s\t%s\t%s\t%s\t%s\n' "$rpf_user" "$PG_CTL_BIN" "$PGDATA" "$rpf_available_bytes" "$rpf_required_bytes"
 }
 
-remote_verify_upstream() {
-    rvu_data=$1
-    rvu_system=$2
-    rvu_port=$3
-    remote_init_exact "$rvu_data"
-    [ "$LOCAL_ROLE" = "standby" ] || return 1
-    rvu_conninfo_output=$(psql_call "SHOW primary_conninfo" 2>/dev/null) || return 22
-    rvu_conninfo=$(printf '%s\n' "$rvu_conninfo_output" | sed -n '1p')
-    [ -n "$rvu_conninfo" ] || return 1
-
-    # primary_conninfo is a physical streaming-replication connection, not a
-    # normal SQL database connection. Reusing it with dbname=<local database>
-    # can fail even while WAL streaming is healthy because pg_hba.conf and
-    # .pgpass commonly use the special "replication" database match. Expand the
-    # original conninfo through dbname, then override replication=true so URI
-    # and keyword/value primary_conninfo formats are handled uniformly without
-    # exposing credentials in argv.
-    case "$rvu_conninfo" in
-        *'\n'*|*'\r'*) return 22 ;;
-    esac
-    rvu_nested=$(conninfo_quote_value "$rvu_conninfo") || return 22
-    rvu_dsn="dbname='$rvu_nested' replication=true"
-
-    mktemp_safe || return 22
-    rvu_input=$SAFE_TMP
-    # psql meta-command quoting interprets backslashes; escape the complete
-    # outer conninfo before placing it in the private command file.
-    rvu_quoted=$(printf '%s' "$rvu_dsn" | sed "s/\\\\/\\\\\\\\/g; s/'/''/g")
-    {
-        printf '\\connect -reuse-previous=off '\''%s'\''\n' "$rvu_quoted"
-        printf '\\echo __PG_ROLE_SWITCH_UPSTREAM_CONNECTED__\n'
-        printf 'IDENTIFY_SYSTEM;\n'
-        printf 'SHOW port;\n'
-    } > "$rvu_input" || return 22
-
-    rvu_output=$(PGCONNECT_TIMEOUT="${PGCONNECT_TIMEOUT:-10}" "$PSQL_BIN" -X -q -A -t -v ON_ERROR_STOP=1 -f "$rvu_input" 2>/dev/null)
-    rvu_code=$?
-    case "$rvu_code" in
-        0) printf '%s\n' "$rvu_output" | grep -Fx '__PG_ROLE_SWITCH_UPSTREAM_CONNECTED__' >/dev/null || return 22 ;;
-        2) return 21 ;;
-        *)
-            if printf '%s\n' "$rvu_output" | grep -Fx '__PG_ROLE_SWITCH_UPSTREAM_CONNECTED__' >/dev/null; then
-                return 22
-            fi
-            return 21
-            ;;
-    esac
-
-    # IDENTIFY_SYSTEM in replication protocol returns
-    # systemid|timeline|xlogpos|dbname in unaligned mode. SHOW port returns the
-    # numeric port as a separate line.
-    rvu_actual_system=$(printf '%s\n' "$rvu_output" | awk -F '|' 'NF >= 3 && $1 ~ /^[0-9]+$/ {print $1; exit}')
-    rvu_actual_port=$(printf '%s\n' "$rvu_output" | awk '/^[0-9]+$/ {print; exit}')
-    [ -n "$rvu_actual_system" ] && [ -n "$rvu_actual_port" ] || return 22
-    if [ "$rvu_actual_system" != "$rvu_system" ] || [ "$rvu_actual_port" != "$rvu_port" ]; then
-        printf 'UPSTREAM_MISMATCH\n'
-        return 0
-    fi
-    printf 'UPSTREAM_VERIFIED\n'
-}
-
 remote_timeout_default() {
     remote_init_exact "$1"
     rtd=$(psql_call "SELECT CASE WHEN setting::bigint = 0 THEN 120 ELSE GREATEST(30, LEAST(600, (setting::bigint / 1000) * 2)) END FROM pg_settings WHERE name='wal_receiver_timeout'" 2>/dev/null | tr -d '[:space:]') || rtd=120
@@ -3004,11 +2951,6 @@ case "${1:-}" in
     --remote-preflight)
         [ "$#" -eq 2 ] || exit 64
         remote_preflight "$2"
-        exit $?
-        ;;
-    --remote-verify-upstream)
-        [ "$#" -eq 4 ] || exit 64
-        remote_verify_upstream "$2" "$3" "$4"
         exit $?
         ;;
     --remote-timeout-default)
