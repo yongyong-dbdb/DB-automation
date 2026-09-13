@@ -1,9 +1,9 @@
 name: Patch PostgreSQL role switch manual failover
 
 on:
-  push:
+  pull_request:
     paths:
-      - '.github/workflows/patch-postgresql-role-switch-manual-failover.yml'
+      - '.github/patches/manual-failover-pr-trigger.txt'
 
 permissions:
   contents: write
