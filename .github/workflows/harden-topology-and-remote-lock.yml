@@ -1,0 +1,78 @@
+name: Harden topology and remote lock
+
+on:
+  push:
+    paths:
+      - '.github/workflows/harden-topology-and-remote-lock.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Apply patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
+          python3 .github/patches/harden-topology-and-remote-lock.py
+          sh -n "$target"
+          git diff --check
+      - name: Regression checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
+          ! grep -F 'SWITCHOVER_PRIMARY_STOPPED' "$target"
+          ! grep -F 'verify_upstream_connection()' "$target"
+          grep -F 'fresh Primary pg_stat_replication and selected Standby pg_stat_wal_receiver agree' "$target"
+          grep -F 'rst_remote_output=$(remote_invoke --remote-validate-candidate' "$target"
+          grep -F 'CANDIDATE_READY\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s' "$target"
+          grep -F 'remote_lock_refresh()' "$target"
+          grep -F 'lease_expires' "$target"
+          grep -F -- '--remote-lock-refresh' "$target"
+          grep -F 'refresh_candidate_lock' "$target"
+      - name: Mock remote lock lease behavior
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
+          tmp=$(mktemp -d)
+          trap 'rm -rf "$tmp"' EXIT
+          data="$tmp/data"
+          mkdir "$data"
+          awk '/^remote_lock_acquire\(\) \{/{p=1} /^remote_preflight\(\) \{/{p=0} p' "$target" > "$tmp/locks.sh"
+          . "$tmp/locks.sh"
+          remote_lock_acquire "$data" tok1 60
+          test -f "$data/.postgresql-role-switch.lock/lease_expires"
+          rc=0; remote_lock_acquire "$data" tok2 60 || rc=$?; test "$rc" -eq 2
+          remote_lock_refresh "$data" tok1 60
+          echo 0 > "$data/.postgresql-role-switch.lock/lease_expires"
+          remote_lock_acquire "$data" tok2 60
+          rc=0; remote_lock_refresh "$data" tok1 60 || rc=$?; test "$rc" -ne 0
+          remote_lock_release "$data" tok2
+          test ! -e "$data/.postgresql-role-switch.lock"
+      - name: Dependency scan
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
+          ! awk '!/^[[:space:]]*#/' "$target" | grep -E '(^|[^[:alnum:]_])(python|python3|jq|yq|expect|perl|node|npm|pip)([^[:alnum:]_]|$)'
+      - name: Commit target only
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add "$target"
+          git diff --cached --check
+          git diff --cached --quiet && exit 0
+          git commit -m 'fix: refresh topology evidence and recover stale remote locks'
+          git push origin HEAD:main
