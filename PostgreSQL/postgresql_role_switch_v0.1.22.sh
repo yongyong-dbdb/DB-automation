@@ -253,6 +253,16 @@ on_exit() {
                 # while the current Primary Server is still available.
                 rollback_preconfigured_primary
                 ;;
+            failover_precheck)
+                :
+                ;;
+            failover_pre_promote)
+                warn "Manual Failover stopped before promotion. Verify this server is still a Standby and keep the former Primary fenced until topology is confirmed."
+                ;;
+            failover_after_promotion)
+                warn "Manual Failover promotion was requested. Keep the former Primary fenced and do NOT restart it as Primary."
+                manual_recovery_branch_notice
+                ;;
             after_primary_stop)
                 if [ "$SWITCHOVER_PROMOTED" -eq 0 ]; then
                     warn "Switchover stopped after the former Primary was shut down but before promotion."
@@ -747,7 +757,7 @@ check_local_write_permissions() {
 check_local_execution_account() {
     clea_owner=$(ps -o user= -p "$POSTMASTER_PID" 2>/dev/null | awk '{print $1; exit}')
     clea_user=$(id -un 2>/dev/null || echo '')
-    [ -n "$clea_owner" ] && [ "$clea_user" = "$clea_owner" ] || die "Planned Switchover must run as the PostgreSQL server OS account ($clea_owner), not $clea_user; pg_ctl cannot safely administer this instance under another account."
+    [ -n "$clea_owner" ] && [ "$clea_user" = "$clea_owner" ] || die "This operation must run as the PostgreSQL server OS account ($clea_owner), not $clea_user; PostgreSQL instance administration cannot safely continue under another OS account."
     [ -n "$PG_CTL_BIN" ] && [ -x "$PG_CTL_BIN" ] || die "Matching pg_ctl is not executable by the PostgreSQL server OS account."
     [ -n "$PG_CONTROLDATA_BIN" ] && [ -x "$PG_CONTROLDATA_BIN" ] || die "Matching pg_controldata is not executable by the PostgreSQL server OS account."
     record_check "PASSED" "Local Execution Account" "server OS account=$clea_owner; pg_ctl and pg_controldata executable"
@@ -2266,7 +2276,7 @@ show_manual_failover_execution_plan() {
 }
 
 manual_failover() {
-    CURRENT_PHASE="precheck"
+    CURRENT_PHASE="failover_precheck"
     require_standby
     validate_supported_version
     check_local_execution_account
@@ -2342,11 +2352,11 @@ manual_failover() {
     failover_pause_now=$(pause_state 2>/dev/null || echo unknown)
     case "$failover_pause_now" in "not paused"|f|false|"") ;; *) die "Manual Failover blocked: WAL replay became paused before promotion." ;; esac
 
-    CURRENT_PHASE="after_primary_stop"
+    CURRENT_PHASE="failover_pre_promote"
     failover_promote=$(psql_call "SELECT pg_promote()" 2>/dev/null | tr -d '[:space:]') || die "pg_promote() failed. The server remains in its current state; verify PostgreSQL logs and role before retrying."
     [ "$failover_promote" = "t" ] || [ "$failover_promote" = "true" ] || die "pg_promote() did not report success. Verify the server role before taking any further action."
     SWITCHOVER_PROMOTED=1
-    CURRENT_PHASE="after_promotion"
+    CURRENT_PHASE="failover_after_promotion"
 
     refresh_role || die "Promotion was requested but the new role could not be verified. Treat the former Primary as fenced and verify both servers manually."
     [ "$LOCAL_ROLE" = "primary" ] || die "pg_promote() returned success but pg_is_in_recovery() still indicates Standby. Treat the former Primary as fenced and inspect PostgreSQL logs."
@@ -2357,8 +2367,10 @@ manual_failover() {
     kv "Current Role" "Primary"
     kv "pg_is_in_recovery()" "$(psql_call "SELECT pg_is_in_recovery()" 2>/dev/null | sed -n '1p')"
     kv "SELECT count(*) FROM pg_stat_replication" "$(psql_call "SELECT count(*) FROM pg_stat_replication" 2>/dev/null | tr -d '[:space:]')"
-    warn "Keep the former Primary fenced. Before rejoining it, compare timelines/control state and use operator-directed pg_rewind when prerequisites are satisfied, otherwise create a new Standby from a fresh base backup."
-    manual_recovery_branch_notice
+    say "  Former Primary Rejoin"
+    say "    Keep the former Primary fenced. Before rejoining it, compare timelines/control state."
+    say "    Use operator-directed pg_rewind only when its prerequisites and required WAL are satisfied; otherwise create a new Standby from a fresh base backup."
+    record_check "MANUAL CHECK" "Former Primary Rejoin" "former Primary remains fenced; operator-directed pg_rewind or new base backup is required before rejoin"
 }
 
 replication_control_menu() {
