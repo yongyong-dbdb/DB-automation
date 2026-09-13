@@ -1248,10 +1248,12 @@ choose_remote_transport() {
     REMOTE_TRANSPORT="ssh"
     REMOTE_SSH_HOST=$crt_host
     crt_user_default=$(id -un 2>/dev/null || echo "")
-    say "SSH User"
-    say "  Target PostgreSQL을 해당 서버에서 로컬 관리할 수 있는 OS 계정을 입력합니다."
-    REMOTE_SSH_USER=$(ask "SSH user" "$crt_user_default") || usage_die "Input cancelled."
-    [ -n "$REMOTE_SSH_USER" ] || usage_die "SSH user is required."
+    say "SSH OS User"
+    say "  원격 Standby Server에 SSH로 접속할 운영체제 계정을 입력합니다."
+    say "  PostgreSQL role이 아니라 Linux/Unix OS 계정입니다."
+    say "  이 계정은 대상 서버에서 해당 PostgreSQL 인스턴스를 관리할 수 있어야 합니다."
+    REMOTE_SSH_USER=$(ask "SSH OS user" "$crt_user_default") || usage_die "Input cancelled."
+    [ -n "$REMOTE_SSH_USER" ] || usage_die "SSH OS user is required."
     REMOTE_TARGET="$REMOTE_SSH_USER@$REMOTE_SSH_HOST"
 
     ssh -o BatchMode=yes -o ConnectTimeout=5 "$REMOTE_TARGET" 'sh -c "exit 0"' >/dev/null 2>&1 || remote_die "Non-interactive SSH check failed for $REMOTE_TARGET. This script does not configure SSH credentials."
@@ -2381,7 +2383,8 @@ remote_verify_upstream() {
     esac
     case "$rvu_dsn" in
         *'
-'*|*''*) return 22 ;; # Never allow a second psql meta-command.
+'*|*'
+'*) return 22 ;; # Never allow a second psql meta-command.
     esac
     mktemp_safe || return 22
     rvu_input=$SAFE_TMP
