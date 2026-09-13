@@ -1,0 +1,87 @@
+name: Harden PostgreSQL role switch phase2
+
+on:
+  push:
+    paths:
+      - '.github/workflows/harden-role-switch-phase2.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Apply patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
+          python3 .github/patches/harden-role-switch-phase2.py
+          sh -n "$target"
+          git diff --check
+      - name: Planned Switchover post-stop safety checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
+          python3 - <<'PY'
+          from pathlib import Path
+          s=Path('PostgreSQL/postgresql_role_switch_v0.1.22.sh').read_text()
+          catch=s.index('catchup_wait=$(ask "Wait seconds" "$remote_wait_default")')
+          stop=s.index('if ! stop_current_primary; then')
+          assert catch < stop
+          tail=s[stop:s.index('wait_local_replay_lsn()')]
+          forbidden=['$(ask ', 'choose_yes_no ', 'confirm_word ']
+          for token in forbidden:
+              assert token not in tail, f'operator input remains after Primary stop: {token}'
+          assert "must be exactly 'shut down'" in tail
+          assert 'promote_output=$(remote_invoke --remote-promote' in tail
+          PY
+      - name: Manual Failover final revalidation checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
+          grep -F 'Post-Promotion Policy Review' "$target"
+          grep -F 'synchronous_standby_names changed after policy review' "$target"
+          grep -F 'new WAL was received after the earlier catch-up' "$target"
+          grep -F 'downstream pg_stat_replication row(s) are no longer state=streaming' "$target"
+          grep -F 'recovery_target_timeline changed before promotion' "$target"
+          grep -F 'operation cancelled before state-changing operation' "$target"
+      - name: Dependency and remote-pipeline regression checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
+          runtime_lines=$(grep -Ev '^[[:space:]]*#' "$target" || true)
+          ! printf '%s\n' "$runtime_lines" | grep -E '(^|[^[:alnum:]_])(python|python3|jq|yq|expect|perl|node|npm|pip)([^[:alnum:]_]|$)'
+          ! grep -F 'promote_result=$(remote_invoke' "$target"
+          ! grep -F 'new_primary_sees_old=$(remote_invoke' "$target"
+          ! grep -F 'css_line=$(remote_invoke' "$target"
+          ! grep -F 'css_slot_state=$(remote_invoke' "$target"
+          ! grep -F 'lrsp_result=$(remote_invoke' "$target"
+      - name: Mock policy normalization
+        shell: bash
+        run: |
+          set -euo pipefail
+          trim() { printf '%s' "$1" | sed 's/\r$//; s/^[[:space:]]*//; s/[[:space:]]*$//'; }
+          test -z "$(trim '   ')"
+          test -z "$(trim $'\r')"
+          test "$(trim $' ANY 2 (a, b)\r')" = 'ANY 2 (a, b)'
+      - name: Commit and clean temporary files
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          rm -f .github/patches/harden-role-switch-phase2.py
+          rm -f .github/workflows/harden-role-switch-phase2.yml
+          git add -A PostgreSQL/postgresql_role_switch_v0.1.22.sh .github
+          git diff --cached --check
+          git commit -m 'fix: complete PostgreSQL role switch post-check hardening'
+          git push origin HEAD:main
