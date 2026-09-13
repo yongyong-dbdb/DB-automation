@@ -41,7 +41,8 @@ jobs:
           ! grep -F 'css_slot_state=$(remote_invoke' "$target"
           ! grep -F 'lrsp_result=$(remote_invoke' "$target"
           ! grep -F '*"shut down"*' "$target"
-          ! grep -E '(^|[^[:alnum:]_])(python|python3|jq|yq|expect|perl|node|npm|pip)([^[:alnum:]_]|$)' "$target"
+          runtime_lines=$(grep -Ev '^[[:space:]]*#' "$target" || true)
+          ! printf '%s\n' "$runtime_lines" | grep -E '(^|[^[:alnum:]_])(python|python3|jq|yq|expect|perl|node|npm|pip)([^[:alnum:]_]|$)'
       - name: Mock edge cases
         shell: bash
         run: |
