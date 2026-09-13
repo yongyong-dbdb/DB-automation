@@ -1642,7 +1642,8 @@ prepare_unselected_reparent_plan() {
     UNSELECTED_REPARENT_PLAN=$SAFE_TMP
     : > "$UNSELECTED_REPARENT_PLAN" || die "Could not initialize Unselected Standby reparent plan."
 
-    while IFS='|' read -r urp_transport urp_target urp_pgdata urp_app urp_client urp_user urp_old_slot urp_nested_count urp_relations; do
+    # Read plan metadata from fd 3 so interactive ask()/choose_yes_no() keep stdin on the operator terminal.
+    while IFS='|' read -r urp_transport urp_target urp_pgdata urp_app urp_client urp_user urp_old_slot urp_nested_count urp_relations <&3; do
         [ -n "$urp_pgdata" ] || continue
         say ""
         printf '  Reparent target: application_name=%s | client_addr=%s | user=%s | old slot=%s | nested downstreams=%s\n' "$urp_app" "$urp_client" "$urp_user" "${urp_old_slot:-<none>}" "$urp_nested_count"
@@ -1714,7 +1715,7 @@ prepare_unselected_reparent_plan() {
             esac
         done
         printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$urp_transport" "$urp_target" "$urp_pgdata" "$urp_app" "$urp_client" "$urp_user" "$urp_slot" "$urp_conninfo_file" "$urp_nested_count" "$urp_relations" >> "$UNSELECTED_REPARENT_PLAN" || die "Could not append Unselected Standby reparent plan."
-    done < "$UNSELECTED_REPARENT_CANDIDATES"
+    done 3< "$UNSELECTED_REPARENT_CANDIDATES"
     record_check "PASSED" "Unselected Standby Placement" "operator chose to reparent all unselected Direct Standbys to the New Primary"
 }
 
