@@ -2390,6 +2390,7 @@ case "${1:-}" in
         [ "$#" -eq 0 ] || usage_die "--check-only does not accept additional arguments."
         ;;
     --help|-h)
+        [ "$#" -eq 1 ] || usage_die "--help does not accept additional arguments."
         say "Usage: $0 [--check-only]"
         say "  --check-only  Run Planned Switchover validation without changing PostgreSQL settings, stopping a server, or promoting a Standby Server."
         exit 0
