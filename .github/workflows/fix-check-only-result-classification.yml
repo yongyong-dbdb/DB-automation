@@ -39,9 +39,9 @@ jobs:
         run: |
           set -euo pipefail
           target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
-          block=$(awk '/^finalize_result_report\(\) \{/{p=1} /^print_result_summary\(\) \{/{p=0} p' "$target")
-          printf '%s\n' "$block" | grep -F 'PASSED WITH MANUAL CHECKS'
-          awk '/if \[ "$CHECK_ONLY" -eq 1 \]/{p=1} p{print} /fi/{if(p){exit}}' "$target" | grep -F 'rc=$EXIT_MANUAL_CHECKS'
+          awk '/^finalize_result_report\(\) \{/{p=1} /^print_result_summary\(\) \{/{p=0} p' "$target" | grep -F 'PASSED WITH MANUAL CHECKS'
+          grep -A12 -F 'if [ "$CHECK_ONLY" -eq 1 ] && [ "$rc" -eq 0 ]' "$target" | grep -F 'rc=$EXIT_MANUAL_CHECKS'
+          grep -A12 -F 'if [ "$CHECK_ONLY" -eq 1 ] && [ "$rc" -eq 0 ]' "$target" | grep -F 'rc=1'
       - name: Dependency scan
         shell: bash
         run: |
