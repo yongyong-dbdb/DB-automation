@@ -3,7 +3,7 @@ import subprocess
 
 target = Path('PostgreSQL/postgresql_role_switch_v0.1.22.sh')
 base = subprocess.check_output([
-    'git','show','07f396e0f365724f3e455d5dc583be2d415fe253:PostgreSQL/postgresql_role_switch_v0.1.22.sh'
+    'git','show','315e9d2a3b68801e117dc1726f4383b5e2e7cbe8:PostgreSQL/postgresql_role_switch_v0.1.22.sh'
 ], text=True)
 s = base
 
