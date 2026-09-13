@@ -20,7 +20,17 @@ jobs:
         run: |
           set -euo pipefail
           target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
-          python3 -c "from pathlib import Path; p=Path('$target'); s=p.read_text(); old=\"    case \\\"\\$rvu_dsn\\\" in\\n        *'\\n'*|*'\\n'*) return 22 ;; # Never allow a second psql meta-command.\\n    esac\\n\"; new=\"    case \\\"\\$rvu_dsn\\\" in\\n        *'\\n'*) return 22 ;; # Never allow a second psql meta-command.\\n    esac\\n    rvu_cr=\\$(printf '\\\\r')\\n    case \\\"\\$rvu_dsn\\\" in\\n        *\\\"\\$rvu_cr\\\"*) return 22 ;; # Never allow a carriage return in the psql meta-command.\\n    esac\\n\"; assert old in s, 'malformed CR/LF guard not found'; p.write_text(s.replace(old,new,1))"
+          cat > /tmp/repair.py <<'PY'
+          from pathlib import Path
+          p = Path('PostgreSQL/postgresql_role_switch_v0.1.22.sh')
+          s = p.read_text()
+          old = "    case \"$rvu_dsn\" in\n        *'\n'*|*'\n'*) return 22 ;; # Never allow a second psql meta-command.\n    esac\n"
+          new = "    case \"$rvu_dsn\" in\n        *'\n'*) return 22 ;; # Never allow a second psql meta-command.\n    esac\n    rvu_cr=$(printf '\\r')\n    case \"$rvu_dsn\" in\n        *\"$rvu_cr\"*) return 22 ;; # Never allow a carriage return in the psql meta-command.\n    esac\n"
+          if old not in s:
+              raise SystemExit('malformed CR/LF guard not found')
+          p.write_text(s.replace(old, new, 1))
+          PY
+          python3 /tmp/repair.py
           sh -n "$target"
           git diff --check
           grep -F 'rvu_cr=$(printf '\''\r'\'')' "$target"
