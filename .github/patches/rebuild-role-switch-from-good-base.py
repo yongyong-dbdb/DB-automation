@@ -21,8 +21,8 @@ for i in range(helper_start+1, helper_end):
         line=line.replace(' -c "$pcv_sql"','')
         lines[i]="        printf '%s\\n' \"$pcv_sql\" | " + line.lstrip()
         changed += 1
-if changed != 4:
-    raise SystemExit(f'expected 4 psql_call_var command branches, rewrote {changed}')
+if changed != 5:
+    raise SystemExit(f'expected 5 psql_call_var command branches, rewrote {changed}')
 s='\n'.join(lines)+'\n'
 
 # 2) Explicit physical-slot options. Existing branch behavior is preserved;
