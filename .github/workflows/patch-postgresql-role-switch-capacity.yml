@@ -6,7 +6,7 @@ on:
     paths:
       - '.github/workflows/patch-postgresql-role-switch-capacity.yml'
       - '.github/patches/pg-role-switch-max-wal-senders.sh'
-      - '.github/patches/pg-role-switch-max-wal-senders-v4.sh'
+      - '.github/patches/pg-role-switch-max-wal-senders-v5.sh'
 
 permissions:
   contents: write
@@ -28,7 +28,7 @@ jobs:
           set -eu
           cd repo
           git checkout main
-          sh .github/patches/pg-role-switch-max-wal-senders-v4.sh
+          sh .github/patches/pg-role-switch-max-wal-senders-v5.sh
           TARGET='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
           sh -n "$TARGET"
           git diff --check -- "$TARGET"
