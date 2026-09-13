@@ -1756,7 +1756,11 @@ candidate_switchover_safety_precheck() {
         css_slot_output=$(remote_invoke --remote-slot-state "$REMOTE_PGDATA" "$css_reverse_slot" 2>/dev/null)
         css_slot_rc=$?
         [ "$css_slot_rc" -eq 0 ] || classify_remote_failure "$css_slot_rc" "Could not inspect reverse replication slot state on the selected Standby Server."
-        css_slot_state=$(printf '%s\n' "$css_slot_output" | awk -F '\t' '$1=="SLOT_STATE" {print $3; exit}')
+        css_slot_line=$(printf '%s\n' "$css_slot_output" | awk -F '\t' '$1=="SLOT_STATE" {print; exit}')
+        [ -n "$css_slot_line" ] || die "Reverse replication slot state check returned no SLOT_STATE record for '$css_reverse_slot'."
+        css_slot_name=$(printf '%s\n' "$css_slot_line" | awk -F '\t' '{print $2}')
+        css_slot_state=$(printf '%s\n' "$css_slot_line" | awk -F '\t' '{print $3}')
+        [ "$css_slot_name" = "$css_reverse_slot" ] || die "Reverse replication slot state response name mismatch: expected=$css_reverse_slot observed=${css_slot_name:-<empty>}"
         case "$css_slot_state" in
             absent) css_effective_reserve=1 ;;
             physical_inactive) css_effective_reserve=0 ;;
@@ -2246,18 +2250,22 @@ planned_switchover() {
     REVERSE_SLOT=""
     if [ -n "$CANDIDATE_SLOT" ]; then
         say ""
-        say "Physical Replication Slot"
-        say "  현재 Standby가 physical replication slot을 사용하고 있습니다. 역할 전환 후 former Primary용 slot도 새 Primary에 준비하는 것을 권장합니다."
+        say "Physical Replication Slot for Former Primary"
+        printf '  Current Primary에 있는 현재 slot_name=%s 는 Selected Standby가 현재 Primary에서 WAL을 받을 때 사용하는 slot입니다.\n' "$CANDIDATE_SLOT"
+        say "  Planned Switchover 후 replication 방향은 Selected Standby (New Primary) -> Former Primary (Standby)로 반전됩니다."
+        say "  기존 slot은 Current Primary에 존재하므로 New Primary에서 그대로 재사용할 수 없습니다."
+        say "  Former Primary가 slot을 사용하도록 하려면 New Primary에 former Primary용 physical replication slot이 별도로 필요합니다."
+        say "  동일 이름의 적합한 physical slot이 New Primary에 이미 있으면 검증 후 재사용하고, 없으면 promotion 후 생성합니다."
         slot_identity=${OLD_PRIMARY_APP:-$(hostname 2>/dev/null || echo former_primary)}
         slot_default=$(sanitize_identifier "${slot_identity}_slot")
-        REVERSE_SLOT=$(ask "New Primary physical replication slot name (empty = do not use a slot)" "$slot_default") || usage_die "Input cancelled."
+        REVERSE_SLOT=$(ask "New Primary slot for former Primary (empty = do not use a slot)" "$slot_default") || usage_die "Input cancelled."
     else
         say ""
         say "Physical Replication Slot"
         say "  선택한 Standby는 현재 active physical replication slot과 연결되어 있지 않습니다. 역할 전환 후에도 기본적으로 slot을 새로 만들지 않습니다."
         if choose_yes_no "Create a physical replication slot for the former Primary" "no"; then
             slot_identity=${OLD_PRIMARY_APP:-$(hostname 2>/dev/null || echo former_primary)}
-        slot_default=$(sanitize_identifier "${slot_identity}_slot")
+            slot_default=$(sanitize_identifier "${slot_identity}_slot")
             REVERSE_SLOT=$(ask "Physical replication slot name" "$slot_default") || usage_die "Input cancelled."
         fi
     fi
@@ -3071,7 +3079,32 @@ remote_slot_state() {
     rss_pgdata=$1
     rss_slot=$2
     remote_init_exact "$rss_pgdata"
-    rss_state=$(psql_call_var slot "$rss_slot" "SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name=:'slot') THEN 'absent' WHEN EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name=:'slot' AND slot_type='physical' AND active) THEN 'physical_active' WHEN EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name=:'slot' AND slot_type='physical' AND NOT active) THEN 'physical_inactive' ELSE 'conflict' END" 2>/dev/null | tr -d '[:space:]') || exit 3
+    # Replication slot names are restricted earlier to [a-z0-9_]. Revalidate on
+    # the remote side before embedding the value in SQL so the state query does
+    # not depend on psql variable interpolation across the SSH transport.
+    case "$rss_slot" in ''|*[!a-z0-9_]*) exit 64 ;; esac
+    rss_count=$(psql_call "SELECT count(*) FROM pg_replication_slots WHERE slot_name='$rss_slot'" 2>/dev/null | tr -d '[:space:]') || exit 3
+    case "$rss_count" in ''|*[!0-9]*) exit 3 ;; esac
+    if [ "$rss_count" -eq 0 ] 2>/dev/null; then
+        rss_state=absent
+    elif [ "$rss_count" -eq 1 ] 2>/dev/null; then
+        rss_row=$(psql_call "SELECT slot_type || E'\t' || active::text FROM pg_replication_slots WHERE slot_name='$rss_slot'" 2>/dev/null | sed -n '1p') || exit 3
+        rss_type=$(printf '%s\n' "$rss_row" | awk -F '\t' '{print $1}')
+        rss_active=$(printf '%s\n' "$rss_row" | awk -F '\t' '{print $2}')
+        if [ "$rss_type" != physical ]; then
+            rss_state=conflict
+        else
+            case "$rss_active" in
+                t|true) rss_state=physical_active ;;
+                f|false) rss_state=physical_inactive ;;
+                *) exit 3 ;;
+            esac
+        fi
+    else
+        # slot_name is unique by definition; more than one row indicates an
+        # unexpected catalog/protocol result and must never be treated as absent.
+        exit 3
+    fi
     printf 'SLOT_STATE\t%s\t%s\n' "$rss_slot" "$rss_state"
 }
 
