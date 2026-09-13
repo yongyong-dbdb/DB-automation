@@ -1,0 +1,55 @@
+name: Clarify unselected standby validation
+
+on:
+  push:
+    paths:
+      - '.github/workflows/clarify-unselected-standby-validation.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Apply patch and validate
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
+          python3 .github/patches/clarify-unselected-standby-validation.py
+          sh -n "$target"
+          git diff --check
+      - name: Prompt regression assertions
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
+          grep -F 'Unselected Standby Validation' "$target"
+          grep -F 'not a promotion candidate' "$target"
+          grep -F 'Selected Standby (New Primary) -> Former Primary (Standby) -> Unselected Standby' "$target"
+          grep -F "Unselected Standby validation SSH host or 'local'" "$target"
+          grep -F 'Unselected Standby validation SSH user' "$target"
+          ! grep -F 'Standby Server SSH host or' "$target"
+      - name: Dependency scan
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
+          ! awk '!/^[[:space:]]*#/' "$target" | grep -E '(^|[^[:alnum:]_])(python|python3|jq|yq|expect|perl|node|npm|pip)([^[:alnum:]_]|$)'
+      - name: Commit target only
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add "$target"
+          git diff --cached --check
+          git diff --cached --quiet && exit 0
+          git commit -m 'fix: clarify unselected standby validation prompts'
+          git push origin HEAD:main
