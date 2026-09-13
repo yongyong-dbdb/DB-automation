@@ -38,12 +38,12 @@ jobs:
         run: |
           set -euo pipefail
           target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
-          # Every psql interpolation token must live in a psql_call_var call site.
-          grep -n ":'" "$target" > /tmp/interpolation.txt || true
+          # Ignore comments; every executable interpolation token must be passed through psql_call_var.
+          awk '!/^[[:space:]]*#/' "$target" | grep -n ":'" > /tmp/interpolation.txt || true
           test -s /tmp/interpolation.txt
-          while IFS=: read -r line rest; do
-            sed -n "${line}p" "$target" | grep -F 'psql_call_var' >/dev/null || {
-              echo "unexpected psql interpolation outside psql_call_var at line $line" >&2
+          while IFS=: read -r _ rest; do
+            printf '%s\n' "$rest" | grep -F 'psql_call_var' >/dev/null || {
+              echo "unexpected executable psql interpolation outside psql_call_var: $rest" >&2
               exit 1
             }
           done < /tmp/interpolation.txt
