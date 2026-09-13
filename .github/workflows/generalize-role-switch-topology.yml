@@ -23,7 +23,7 @@ jobs:
           set -euo pipefail
           target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
           before=$(wc -l < "$target")
-          python3 .github/patches/generalize-role-switch-topology.py
+          python3 .github/patches/run-generalize-role-switch-topology.py
           sh -n "$target"
           git diff --check
           after=$(wc -l < "$target")
@@ -51,9 +51,6 @@ jobs:
           set -euo pipefail
           python3 - <<'PY'
           # CI-only graph model. Runtime script remains POSIX sh with no Python dependency.
-          # A planned switchover promotes one direct standby C. The former primary P
-          # becomes a direct child of C. Existing children of C stay with C. Existing
-          # unselected children of P stay with P. Descendant subtrees are preserved.
           cases = {
               'single': [('P','S1')],
               'fanout2': [('P','S1'),('P','S2')],
@@ -64,15 +61,12 @@ jobs:
               'wide_fanout': [('P','S1'),('P','S2'),('P','S3'),('P','S4')],
               'mixed_depth': [('P','S1'),('P','S2'),('S1','S3'),('S3','S4'),('S2','S5')],
           }
-
           def switch(edges, primary, candidate):
               edges=set(edges)
               assert (primary,candidate) in edges
-              # Only the P->C edge reverses. All other relationships are preserved.
               edges.remove((primary,candidate))
               edges.add((candidate,primary))
               return edges
-
           for name, edges in cases.items():
               initial=set(edges)
               candidate='S1'
@@ -80,11 +74,8 @@ jobs:
               assert (candidate,'P') in fwd
               for e in initial - {('P',candidate)}:
                   assert e in fwd, (name, 'lost preserved edge', e)
-              # Round trip: candidate is current primary, former P is direct standby.
               back=switch(fwd,candidate,'P')
               assert back == initial, (name, 'round trip mismatch', initial, back)
-
-          # Slot/no-slot and same-host/remote are orthogonal metadata dimensions.
           metadata_cases = [
               {'slot':True,'transport':'ssh'},
               {'slot':False,'transport':'ssh'},
