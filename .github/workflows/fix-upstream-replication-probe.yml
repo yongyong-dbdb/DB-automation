@@ -1,0 +1,56 @@
+name: Fix upstream replication protocol probe
+
+on:
+  push:
+    paths:
+      - '.github/workflows/fix-upstream-replication-probe.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Apply patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
+          python3 .github/patches/fix-upstream-replication-probe.py
+          sh -n "$target"
+          git diff --check
+      - name: Regression checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
+          grep -F 'replication=true' "$target"
+          grep -F 'IDENTIFY_SYSTEM;' "$target"
+          grep -F 'SHOW port;' "$target"
+          grep -F 'dbname=<local database>' "$target"
+          ! grep -F 'rvu_recovery=' "$target"
+          ! grep -F 'pg_control_system();' "$target"
+          ! grep -F 'PGDATABASE="$DB_NAME" PGCONNECT_TIMEOUT' "$target"
+      - name: Dependency scan
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
+          ! awk '!/^[[:space:]]*#/' "$target" | grep -E '(^|[^[:alnum:]_])(python|python3|jq|yq|expect|perl|node|npm|pip)([^[:alnum:]_]|$)'
+      - name: Commit target only
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add "$target"
+          git diff --cached --check
+          git diff --cached --quiet && exit 0
+          git commit -m 'fix: verify upstream with replication protocol'
+          git push origin HEAD:main
