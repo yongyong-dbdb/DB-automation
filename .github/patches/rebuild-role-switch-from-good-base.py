@@ -6,31 +6,24 @@ s = subprocess.check_output([
     'git','show','315e9d2a3b68801e117dc1726f4383b5e2e7cbe8:PostgreSQL/postgresql_role_switch_v0.1.22.sh'
 ], text=True)
 
-# 1) psql variable interpolation: keep the original function/body layout and
-# change only the four command invocations. psql :'name' substitution must be
-# processed by psql, so feed the SQL through stdin instead of -c.
-old_suffix=' -d "$DB_NAME" -c "$pcv_sql"'
-count=s.count(old_suffix)
-if count != 4:
-    raise SystemExit(f'expected 4 psql_call_var -c invocations, found {count}')
-s=s.replace(old_suffix, ' -d "$DB_NAME"')
-needle='        "$PSQL_BIN" -X -q -A -t -v ON_ERROR_STOP=1 -v "$pcv_name=$pcv_value"'
+# 1) Rewrite only executable lines inside psql_call_var(). Do not replace or
+# slice whole function ranges; this avoids deleting unrelated definitions.
 lines=s.splitlines()
-in_helper=False
-helper_done=False
-for i,line in enumerate(lines):
-    if line == 'psql_call_var() {':
-        in_helper=True
-        continue
-    if in_helper and line == '}':
-        in_helper=False
-        helper_done=True
-        continue
-    if in_helper and needle in line:
+try:
+    helper_start=lines.index('psql_call_var() {')
+    helper_end=lines.index('setting_exists() {', helper_start+1)
+except ValueError as e:
+    raise SystemExit(f'psql_call_var boundary not found: {e}')
+changed=0
+for i in range(helper_start+1, helper_end):
+    line=lines[i]
+    if '$PSQL_BIN' in line and '-c "$pcv_sql"' in line:
+        line=line.replace(' -c "$pcv_sql"','')
         lines[i]="        printf '%s\\n' \"$pcv_sql\" | " + line.lstrip()
+        changed += 1
+if changed != 4:
+    raise SystemExit(f'expected 4 psql_call_var command branches, rewrote {changed}')
 s='\n'.join(lines)+'\n'
-if not helper_done or s.count("printf '%s\\n' \"$pcv_sql\" | \"$PSQL_BIN\"") != 4:
-    raise SystemExit('psql_call_var stdin rewrite did not produce exactly four branches')
 
 # 2) Explicit physical-slot options. Existing branch behavior is preserved;
 # only make temporary=false explicit for newly-created reverse slots.
