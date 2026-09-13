@@ -363,6 +363,15 @@ sanitize_identifier() {
     printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_]/_/g; s/^_*//; s/_*$//'
 }
 
+validate_replication_slot_name() {
+    vrs_name=$1
+    [ -n "$vrs_name" ] || return 1
+    case "$vrs_name" in *[!a-z0-9_]*) return 1 ;; esac
+    vrs_max=$(psql_call "SHOW max_identifier_length" 2>/dev/null | tr -d '[:space:]') || return 1
+    case "$vrs_max" in ''|*[!0-9]*) return 1 ;; esac
+    [ "${#vrs_name}" -le "$vrs_max" ] 2>/dev/null
+}
+
 read_pid_line() {
     rp_file=$1
     rp_line=$2
@@ -1605,7 +1614,10 @@ logical_replication_slot_precheck() {
     psql_call "SELECT slot_name FROM pg_replication_slots WHERE slot_type='logical' AND failover AND NOT temporary ORDER BY slot_name" > "$lrsp_tmp" || die "Could not list logical failover slots."
     while IFS= read -r lrsp_slot; do
         [ -n "$lrsp_slot" ] || continue
-        lrsp_result=$(remote_invoke --remote-check-logical-slot "$REMOTE_PGDATA" "$lrsp_slot" 2>/dev/null | awk -F '\t' '$1=="LOGICAL_SLOT" {print $3; exit}')
+        lrsp_output=$(remote_invoke --remote-check-logical-slot "$REMOTE_PGDATA" "$lrsp_slot" 2>/dev/null)
+        lrsp_rc=$?
+        [ "$lrsp_rc" -eq 0 ] || classify_remote_failure "$lrsp_rc" "Could not validate logical failover slot '$lrsp_slot' on the selected Standby Server."
+        lrsp_result=$(printf '%s\n' "$lrsp_output" | awk -F '\t' '$1=="LOGICAL_SLOT" {print $3; exit}')
         if [ "$lrsp_result" != "ready" ]; then
             die "Logical failover slot '$lrsp_slot' is not synchronized and failover-ready on the selected Standby Server."
         fi
@@ -1631,7 +1643,10 @@ candidate_switchover_safety_precheck() {
     css_reserve_slots=${1:-0}
     css_reverse_slot=${2:-}
     case "$REMOTE_DOWNSTREAM_COUNT" in ''|*[!0-9]*) die "The selected Standby Server returned an invalid downstream count: ${REMOTE_DOWNSTREAM_COUNT:-<empty>}" ;; esac
-    css_line=$(remote_invoke --remote-switchover-safety "$REMOTE_PGDATA" 2>/dev/null | awk -F '\t' '$1=="SWITCHOVER_SAFETY" {print; exit}') || classify_remote_failure "$?" "Could not inspect the selected Standby Server's replication settings and replication slot state."
+    css_output=$(remote_invoke --remote-switchover-safety "$REMOTE_PGDATA" 2>/dev/null)
+    css_rc=$?
+    [ "$css_rc" -eq 0 ] || classify_remote_failure "$css_rc" "Could not inspect the selected Standby Server's replication settings and replication slot state."
+    css_line=$(printf '%s\n' "$css_output" | awk -F '\t' '$1=="SWITCHOVER_SAFETY" {print; exit}')
     [ -n "$css_line" ] || die "Selected Standby Server returned no replication settings and replication slot state."
     REMOTE_MAX_WAL_SENDERS=$(printf '%s\n' "$css_line" | awk -F '\t' '{print $2}')
     REMOTE_MAX_REPLICATION_SLOTS=$(printf '%s\n' "$css_line" | awk -F '\t' '{print $3}')
@@ -1644,18 +1659,41 @@ candidate_switchover_safety_precheck() {
     REMOTE_ARCHIVER_UNRESOLVED=$(printf '%s\n' "$css_line" | awk -F '\t' '{print $10}')
     REMOTE_WAL_LEVEL=$(printf '%s\n' "$css_line" | awk -F '\t' '{print $11}')
     REMOTE_LOGICAL_SLOT_COUNT=$(printf '%s\n' "$css_line" | awk -F '\t' '{print $12}')
+    REMOTE_MAX_CONNECTIONS=$(printf '%s\n' "$css_line" | awk -F '\t' '{print $13}')
+    REMOTE_MAX_PREPARED_TRANSACTIONS=$(printf '%s\n' "$css_line" | awk -F '\t' '{print $14}')
+    REMOTE_MAX_LOCKS_PER_TRANSACTION=$(printf '%s\n' "$css_line" | awk -F '\t' '{print $15}')
+    REMOTE_MAX_WORKER_PROCESSES=$(printf '%s\n' "$css_line" | awk -F '\t' '{print $16}')
 
-    for css_n in "$REMOTE_MAX_WAL_SENDERS" "$REMOTE_MAX_REPLICATION_SLOTS" "$REMOTE_REPLICATION_SLOT_COUNT" "$REMOTE_LOGICAL_SLOT_COUNT"; do
+    for css_n in "$REMOTE_MAX_WAL_SENDERS" "$REMOTE_MAX_REPLICATION_SLOTS" "$REMOTE_REPLICATION_SLOT_COUNT" "$REMOTE_LOGICAL_SLOT_COUNT" "$REMOTE_MAX_CONNECTIONS" "$REMOTE_MAX_PREPARED_TRANSACTIONS" "$REMOTE_MAX_LOCKS_PER_TRANSACTION" "$REMOTE_MAX_WORKER_PROCESSES"; do
         case "$css_n" in ''|*[!0-9]*) die "Selected Standby Server returned an invalid PostgreSQL replication setting or slot count: ${css_n:-<empty>}" ;; esac
     done
     case "$REMOTE_WAL_LEVEL" in minimal|replica|logical) ;; *) die "Selected Standby Server returned an invalid wal_level: ${REMOTE_WAL_LEVEL:-<empty>}" ;; esac
 
+    css_local_max_connections=$(psql_call "SHOW max_connections" 2>/dev/null | tr -d '[:space:]') || die "Could not inspect max_connections on the current Primary Server."
+    css_local_max_prepared_transactions=$(psql_call "SHOW max_prepared_transactions" 2>/dev/null | tr -d '[:space:]') || die "Could not inspect max_prepared_transactions on the current Primary Server."
+    css_local_max_locks_per_transaction=$(psql_call "SHOW max_locks_per_transaction" 2>/dev/null | tr -d '[:space:]') || die "Could not inspect max_locks_per_transaction on the current Primary Server."
+    css_local_max_wal_senders=$(psql_call "SHOW max_wal_senders" 2>/dev/null | tr -d '[:space:]') || die "Could not inspect max_wal_senders on the current Primary Server."
+    css_local_max_worker_processes=$(psql_call "SHOW max_worker_processes" 2>/dev/null | tr -d '[:space:]') || die "Could not inspect max_worker_processes on the current Primary Server."
+    for css_n in "$css_local_max_connections" "$css_local_max_prepared_transactions" "$css_local_max_locks_per_transaction" "$css_local_max_wal_senders" "$css_local_max_worker_processes"; do
+        case "$css_n" in ''|*[!0-9]*) die "Current Primary Server returned an invalid Hot Standby shared-memory parameter value: ${css_n:-<empty>}" ;; esac
+    done
+    [ "$css_local_max_connections" -ge "$REMOTE_MAX_CONNECTIONS" ] || die "Former Primary cannot safely become a Standby: max_connections=$css_local_max_connections is lower than the selected Standby Server's future Primary value=$REMOTE_MAX_CONNECTIONS."
+    [ "$css_local_max_prepared_transactions" -ge "$REMOTE_MAX_PREPARED_TRANSACTIONS" ] || die "Former Primary cannot safely become a Standby: max_prepared_transactions=$css_local_max_prepared_transactions is lower than the selected Standby Server's future Primary value=$REMOTE_MAX_PREPARED_TRANSACTIONS."
+    [ "$css_local_max_locks_per_transaction" -ge "$REMOTE_MAX_LOCKS_PER_TRANSACTION" ] || die "Former Primary cannot safely become a Standby: max_locks_per_transaction=$css_local_max_locks_per_transaction is lower than the selected Standby Server's future Primary value=$REMOTE_MAX_LOCKS_PER_TRANSACTION."
+    [ "$css_local_max_wal_senders" -ge "$REMOTE_MAX_WAL_SENDERS" ] || die "Former Primary cannot safely become a Standby: max_wal_senders=$css_local_max_wal_senders is lower than the selected Standby Server's future Primary value=$REMOTE_MAX_WAL_SENDERS."
+    [ "$css_local_max_worker_processes" -ge "$REMOTE_MAX_WORKER_PROCESSES" ] || die "Former Primary cannot safely become a Standby: max_worker_processes=$css_local_max_worker_processes is lower than the selected Standby Server's future Primary value=$REMOTE_MAX_WORKER_PROCESSES."
+    record_check "PASSED" "Hot Standby Shared Memory" "former Primary settings are >= selected Standby future-Primary settings for max_connections, max_prepared_transactions, max_locks_per_transaction, max_wal_senders and max_worker_processes"
+
     css_effective_reserve=$css_reserve_slots
     if [ "$css_reserve_slots" -eq 1 ] 2>/dev/null && [ -n "$css_reverse_slot" ]; then
-        css_slot_state=$(remote_invoke --remote-slot-state "$REMOTE_PGDATA" "$css_reverse_slot" 2>/dev/null | awk -F '\t' '$1=="SLOT_STATE" {print $3; exit}') || classify_remote_failure "$?" "Could not inspect reverse replication slot state on the selected Standby Server."
+        css_slot_output=$(remote_invoke --remote-slot-state "$REMOTE_PGDATA" "$css_reverse_slot" 2>/dev/null)
+        css_slot_rc=$?
+        [ "$css_slot_rc" -eq 0 ] || classify_remote_failure "$css_slot_rc" "Could not inspect reverse replication slot state on the selected Standby Server."
+        css_slot_state=$(printf '%s\n' "$css_slot_output" | awk -F '\t' '$1=="SLOT_STATE" {print $3; exit}')
         case "$css_slot_state" in
             absent) css_effective_reserve=1 ;;
-            physical) css_effective_reserve=0 ;;
+            physical_inactive) css_effective_reserve=0 ;;
+            physical_active) die "Replication slot '$css_reverse_slot' already exists and is active on the selected Standby Server. An active slot cannot be reassigned to the former Primary." ;;
             conflict) die "Replication slot '$css_reverse_slot' already exists on the selected Standby Server but slot_type is not physical. Choose another slot_name." ;;
             *) die "Unexpected replication slot state for $css_reverse_slot: ${css_slot_state:-<empty>}" ;;
         esac
@@ -1865,7 +1903,11 @@ show_switchover_execution_plan() {
     printf '     create %s/standby.signal\n' "$PGDATA"
     say ""
     say "  9. Start former Primary as Standby"
-    printf '     %s -D %s -w start\n' "$PG_CTL_BIN" "$PGDATA"
+    if [ -n "$POSTMASTER_OPTIONS" ]; then
+        printf '     %s -D %s -o <preserved-postmaster.opts> -w start\n' "$PG_CTL_BIN" "$PGDATA"
+    else
+        printf '     %s -D %s -w start\n' "$PG_CTL_BIN" "$PGDATA"
+    fi
     say ""
     say " 10. Verify pg_is_in_recovery(), pg_stat_wal_receiver.status and pg_stat_replication"
 }
@@ -2107,18 +2149,27 @@ planned_switchover() {
     fi
 
     if [ -n "${REVERSE_SLOT:-}" ]; then
+        validate_replication_slot_name "$REVERSE_SLOT" || die "Invalid physical replication slot name '$REVERSE_SLOT'. Use only lower-case letters, numbers and underscore, within PostgreSQL max_identifier_length."
         candidate_switchover_safety_precheck 1 "$REVERSE_SLOT"
     else
         candidate_switchover_safety_precheck 0
     fi
     startup_options_guard || die "Switchover cannot guarantee that the former Primary will restart with the same startup configuration."
 
+    remote_wait_output=$(remote_invoke --remote-timeout-default "$REMOTE_PGDATA" 2>/dev/null)
+    remote_wait_rc=$?
+    [ "$remote_wait_rc" -eq 0 ] || classify_remote_failure "$remote_wait_rc" "Could not determine the selected Standby Server replay wait timeout before Primary shutdown."
+    remote_wait_default=$(printf '%s\n' "$remote_wait_output" | awk -F '\t' '$1=="TIMEOUT" {print $2; exit}')
+    case "$remote_wait_default" in ''|*[!0-9]*) die "Selected Standby Server returned an invalid replay wait timeout: ${remote_wait_default:-<empty>}" ;; esac
+    [ "$remote_wait_default" -ge 1 ] 2>/dev/null || die "Selected Standby Server returned a non-positive replay wait timeout."
+    [ "$remote_wait_default" -le "$MAX_WAIT_SECONDS" ] 2>/dev/null || remote_wait_default=$MAX_WAIT_SECONDS
+
     show_client_session_check
     show_switchover_execution_plan
 
     CURRENT_PHASE="before_primary_stop"
     if ! confirm_word "SWITCHOVER" "Pre-Switchover checks completed. Review the execution plan above. The next step stages reverse replication settings and shuts down the current Primary."; then
-        die "Switchover cancelled before Primary shutdown."
+        cancel_operation "Switchover cancelled before Primary shutdown."
     fi
 
     preconfigure_former_primary "$REVERSE_CONNINFO" "$REVERSE_SLOT"
@@ -2145,14 +2196,11 @@ planned_switchover() {
     shutdown_lsn=$(stopped_primary_checkpoint_lsn 2>/dev/null || echo "")
     [ -n "$shutdown_lsn" ] || die "Could not read the final checkpoint location from pg_controldata. Former Primary remains stopped."
     case "$shutdown_state" in
-        *"shut down"*) ;;
-        *) die "Former Primary control state is not a clean shutdown state: $shutdown_state" ;;
+        "shut down") ;;
+        *) die "Former Primary control state must be exactly 'shut down' before promotion; observed: ${shutdown_state:-<empty>}" ;;
     esac
     info "Former Primary clean shutdown confirmed. Final checkpoint location: $shutdown_lsn"
 
-    remote_wait_default=$(remote_invoke --remote-timeout-default "$REMOTE_PGDATA" 2>/dev/null | awk -F '\t' '$1=="TIMEOUT" {print $2; exit}')
-    case "$remote_wait_default" in ''|*[!0-9]*) remote_wait_default=120 ;; esac
-    [ "$remote_wait_default" -le "$MAX_WAIT_SECONDS" ] 2>/dev/null || remote_wait_default=$MAX_WAIT_SECONDS
     say "WAL Replay Catch-up Wait"
     say "  선택한 Standby Server가 former Primary Server의 final checkpoint까지 replay할 최대 대기시간(초)을 입력합니다."
     catchup_wait=$(ask "Wait seconds" "$remote_wait_default") || usage_die "Input cancelled."
@@ -2163,7 +2211,10 @@ planned_switchover() {
     fi
     info "The selected Standby Server replayed through the former Primary Server's final checkpoint."
 
-    promote_result=$(remote_invoke --remote-promote "$REMOTE_PGDATA" 2>/dev/null | awk -F '\t' '$1=="PROMOTED" {print $2; exit}')
+    promote_output=$(remote_invoke --remote-promote "$REMOTE_PGDATA" 2>/dev/null)
+    promote_rc=$?
+    [ "$promote_rc" -eq 0 ] || classify_remote_failure "$promote_rc" "Promotion command on the selected Standby Server failed or could not be verified. The former Primary remains stopped."
+    promote_result=$(printf '%s\n' "$promote_output" | awk -F '\t' '$1=="PROMOTED" {print $2; exit}')
     [ "$promote_result" = "primary" ] || die "Promotion of the selected Standby Server could not be verified. Do not restart the former Primary Server until roles are checked manually."
     SWITCHOVER_PROMOTED=1
     CURRENT_PHASE="after_promotion"
@@ -2220,8 +2271,11 @@ planned_switchover() {
         info "All unselected Standby Servers are visible with pg_stat_replication.state=streaming on the former Primary Server."
     fi
 
-    new_primary_sees_old=$(remote_invoke --remote-count-standby "$REMOTE_PGDATA" "$OLD_PRIMARY_APP" 2>/dev/null | awk -F '\t' '$1=="COUNT" {print $2; exit}')
-    case "$new_primary_sees_old" in ''|*[!0-9]*) new_primary_sees_old=0 ;; esac
+    new_primary_count_output=$(remote_invoke --remote-count-standby "$REMOTE_PGDATA" "$OLD_PRIMARY_APP" 2>/dev/null)
+    new_primary_count_rc=$?
+    [ "$new_primary_count_rc" -eq 0 ] || classify_remote_failure "$new_primary_count_rc" "Could not verify the former Primary's streaming connection on the new Primary."
+    new_primary_sees_old=$(printf '%s\n' "$new_primary_count_output" | awk -F '\t' '$1=="COUNT" {print $2; exit}')
+    case "$new_primary_sees_old" in ''|*[!0-9]*) die "New Primary returned an invalid pg_stat_replication count for application_name=$OLD_PRIMARY_APP." ;; esac
     [ "$new_primary_sees_old" -eq 1 ] || die "New Primary pg_stat_replication has $new_primary_sees_old streaming row(s) for application_name=$OLD_PRIMARY_APP; expected exactly 1."
 
     if [ -n "${SWITCHOVER_RESTORE_FILE:-}" ] && ! rm -f "$SWITCHOVER_RESTORE_FILE"; then
@@ -2716,7 +2770,7 @@ remote_slot_state() {
     rss_pgdata=$1
     rss_slot=$2
     remote_init_exact "$rss_pgdata"
-    rss_state=$(psql_call_var slot "$rss_slot" "SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name=:'slot') THEN 'absent' WHEN EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name=:'slot' AND slot_type='physical') THEN 'physical' ELSE 'conflict' END" 2>/dev/null | tr -d '[:space:]') || exit 3
+    rss_state=$(psql_call_var slot "$rss_slot" "SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name=:'slot') THEN 'absent' WHEN EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name=:'slot' AND slot_type='physical' AND active) THEN 'physical_active' WHEN EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name=:'slot' AND slot_type='physical' AND NOT active) THEN 'physical_inactive' ELSE 'conflict' END" 2>/dev/null | tr -d '[:space:]') || exit 3
     printf 'SLOT_STATE\t%s\t%s\n' "$rss_slot" "$rss_state"
 }
 
@@ -2739,7 +2793,11 @@ remote_switchover_safety() {
     rss_unresolved=$(printf '%s\n' "$rss_arch" | awk -F '\t' '{print $5}')
     rss_wal_level=$(psql_call "SHOW wal_level" 2>/dev/null | tr -d '[:space:]') || exit 8
     rss_logical_slots=$(psql_call "SELECT count(*) FROM pg_replication_slots WHERE slot_type='logical'" 2>/dev/null | tr -d '[:space:]') || exit 9
-    printf 'SWITCHOVER_SAFETY\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$rss_mws" "$rss_mrs" "$rss_slots" "$rss_risky" "$rss_archived" "$rss_failed" "$rss_last_ok" "$rss_last_fail" "$rss_unresolved" "$rss_wal_level" "$rss_logical_slots"
+    rss_max_connections=$(psql_call "SHOW max_connections" 2>/dev/null | tr -d '[:space:]') || exit 10
+    rss_max_prepared_transactions=$(psql_call "SHOW max_prepared_transactions" 2>/dev/null | tr -d '[:space:]') || exit 11
+    rss_max_locks_per_transaction=$(psql_call "SHOW max_locks_per_transaction" 2>/dev/null | tr -d '[:space:]') || exit 12
+    rss_max_worker_processes=$(psql_call "SHOW max_worker_processes" 2>/dev/null | tr -d '[:space:]') || exit 13
+    printf 'SWITCHOVER_SAFETY\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$rss_mws" "$rss_mrs" "$rss_slots" "$rss_risky" "$rss_archived" "$rss_failed" "$rss_last_ok" "$rss_last_fail" "$rss_unresolved" "$rss_wal_level" "$rss_logical_slots" "$rss_max_connections" "$rss_max_prepared_transactions" "$rss_max_locks_per_transaction" "$rss_max_worker_processes"
 }
 remote_wait_streaming_downstreams() {
     rwsd_pgdata=$1
@@ -2798,10 +2856,13 @@ remote_create_slot() {
     rcs_slot=$2
     remote_init_exact "$rcs_pgdata"
     [ "$LOCAL_ROLE" = "primary" ] || exit 3
-    rcs_exists=$(psql_call_var slot "$rcs_slot" "SELECT count(*) FROM pg_replication_slots WHERE slot_name=:'slot' AND slot_type='physical'" 2>/dev/null | tr -d '[:space:]') || exit 4
-    if [ "$rcs_exists" -eq 0 ]; then
-        psql_call_var slot "$rcs_slot" "SELECT slot_name FROM pg_create_physical_replication_slot(:'slot', true)" >/dev/null || exit 5
-    fi
+    rcs_state=$(psql_call_var slot "$rcs_slot" "SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name=:'slot') THEN 'absent' WHEN EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name=:'slot' AND slot_type='physical' AND NOT active) THEN 'physical_inactive' WHEN EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name=:'slot' AND slot_type='physical' AND active) THEN 'physical_active' ELSE 'conflict' END" 2>/dev/null | tr -d '[:space:]') || exit 4
+    case "$rcs_state" in
+        absent) psql_call_var slot "$rcs_slot" "SELECT slot_name FROM pg_create_physical_replication_slot(:'slot', true)" >/dev/null || exit 5 ;;
+        physical_inactive) : ;;
+        physical_active|conflict) exit 6 ;;
+        *) exit 7 ;;
+    esac
     printf 'SLOT\t%s\n' "$rcs_slot"
 }
 
