@@ -1,0 +1,80 @@
+name: Rebuild role switch from known-good base
+
+on:
+  push:
+    paths:
+      - '.github/workflows/rebuild-role-switch-from-good-base.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  rebuild-and-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Rebuild target from known-good base
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
+          python3 .github/patches/rebuild-role-switch-from-good-base.py
+          sh -n "$target"
+          git diff --check
+      - name: Critical function-definition regression checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
+          for fn in select_local_instance validate_supported_version prepare_state_dir initialize_result_report planned_switchover preconfigure_former_primary rollback_preconfigured_primary remote_create_slot psql_call_var; do
+            grep -Eq "^${fn}\\(\\)[[:space:]]*\\{" "$target" || { echo "missing function: $fn" >&2; exit 1; }
+          done
+      - name: Guard against accidental bulk deletion
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
+          base_lines=$(git show 07f396e0f365724f3e455d5dc583be2d415fe253:"$target" | wc -l)
+          new_lines=$(wc -l < "$target")
+          echo "base_lines=$base_lines new_lines=$new_lines"
+          [ "$new_lines" -ge "$base_lines" ] || { echo 'rebuilt target is unexpectedly shorter than known-good base' >&2; exit 1; }
+      - name: psql variable interpolation regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
+          block=$(awk '/^psql_call_var\(\)/,/^}/' "$target")
+          printf '%s\n' "$block" | grep -F "printf '%s\\n' \"\$pcv_sql\" | \"\$PSQL_BIN\""
+          ! printf '%s\n' "$block" | grep -F -- '-c "$pcv_sql"'
+          grep -F "sourcefile = :'ac'" "$target" >/dev/null
+          grep -F "ALTER SYSTEM SET primary_conninfo = :'pc'" "$target" >/dev/null
+      - name: Atomic rollback-state regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
+          block=$(awk '/^preconfigure_former_primary\(\)/,/^}/' "$target")
+          printf '%s\n' "$block" | grep -F 'pfp_restore_tmp="$pfp_restore_file.tmp.$$"'
+          printf '%s\n' "$block" | grep -F 'mv "$pfp_restore_tmp" "$pfp_restore_file"'
+          printf '%s\n' "$block" | grep -F '[ -s "$pfp_restore_tmp" ]'
+      - name: Dependency scan
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
+          ! awk '!/^[[:space:]]*#/' "$target" | grep -E '(^|[^[:alnum:]_])(python|python3|jq|yq|expect|perl|node|npm|pip)([^[:alnum:]_]|$)'
+      - name: Commit repaired target only
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add "$target"
+          git diff --cached --check
+          git diff --cached --quiet && exit 0
+          git commit -m 'fix: restore missing role switch functions'
+          git push origin HEAD:main
