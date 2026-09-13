@@ -2192,23 +2192,29 @@ planned_switchover() {
     NEW_PRIMARY_DB_HOST=$(ask "Database host" "$np_host_default") || usage_die "Input cancelled."
     [ -n "$NEW_PRIMARY_DB_HOST" ] || usage_die "New Primary database host is required."
 
-    OLD_PRIMARY_APP_DEFAULT=$(psql_call "SHOW cluster_name" 2>/dev/null | sed -n '1p')
-    if [ -z "$OLD_PRIMARY_APP_DEFAULT" ]; then
-        OLD_PRIMARY_APP_DEFAULT=$(hostname 2>/dev/null || echo old_primary)
-    fi
+    # Preserve an unset application_name. Do not invent a hostname-based value
+    # during role reversal; an empty value means primary_conninfo omits the
+    # application_name parameter entirely. cluster_name is not the same setting
+    # and must not be repurposed as an implicit replication application_name.
+    OLD_PRIMARY_APP_DEFAULT=""
     say "application_name"
-    say "  역할 전환 후 former Primary가 새 Standby로 연결될 때 pg_stat_replication에 표시될 이름입니다."
-    OLD_PRIMARY_APP=$(ask "Former Primary application_name" "$OLD_PRIMARY_APP_DEFAULT") || usage_die "Input cancelled."
+    say "  역할 전환 후 former Primary가 새 Standby로 연결될 때 pg_stat_replication에 표시할 선택적 이름입니다."
+    say "  기존에 별도 application_name을 사용하지 않았다면 빈 값으로 유지합니다. Enter만 입력하면 primary_conninfo에 application_name을 추가하지 않습니다."
+    OLD_PRIMARY_APP=$(ask "Former Primary application_name (empty = omit)" "$OLD_PRIMARY_APP_DEFAULT") || usage_die "Input cancelled."
 
     ci_host=$(conninfo_quote_value "$NEW_PRIMARY_DB_HOST")
     ci_user=$(conninfo_quote_value "$CANDIDATE_REPL_USER")
-    ci_app=$(conninfo_quote_value "$OLD_PRIMARY_APP")
-    REVERSE_CONNINFO="host='$ci_host' port='$REMOTE_PORT' user='$ci_user' application_name='$ci_app'"
+    REVERSE_CONNINFO="host='$ci_host' port='$REMOTE_PORT' user='$ci_user'"
+    if [ -n "$OLD_PRIMARY_APP" ]; then
+        ci_app=$(conninfo_quote_value "$OLD_PRIMARY_APP")
+        REVERSE_CONNINFO="$REVERSE_CONNINFO application_name='$ci_app'"
+    fi
 
     say ""
     say "Additional libpq Connection Parameters"
     say "  SSL, passfile 등 현재 운영 환경에서 필요한 libpq 연결 파라미터를 추가할 수 있습니다."
-    say "  host, hostaddr, port, user, application_name은 자동 탐지/입력한 값을 사용하므로 여기서는 다시 지정하지 않습니다."
+    say "  host, hostaddr, port, user는 자동 탐지/입력한 값을 사용하므로 여기서는 다시 지정하지 않습니다."
+    say "  application_name은 위에서 비워 두었다면 여기서도 추가하지 않습니다."
     say "  비밀번호를 직접 입력하지 말고 .pgpass/passfile 또는 기존 승인 인증 방식을 사용하십시오."
     extra_conninfo=$(ask "Additional connection parameters (empty = none)" "") || usage_die "Input cancelled."
     if [ -n "$extra_conninfo" ]; then
@@ -2222,7 +2228,11 @@ planned_switchover() {
     say "primary_conninfo (Reverse Streaming Connection)"
     say "  former Primary가 새 Primary를 따라가는 Standby가 될 때 사용할 연결 정보를 준비합니다."
     say "  비밀번호는 스크립트에 하드코딩하지 않습니다. 필요한 경우 .pgpass/passfile, 인증서 또는 기존 승인 인증 방식을 사용하십시오."
-    printf '  Generated connection : host=%s port=%s user=%s application_name=%s\n' "$NEW_PRIMARY_DB_HOST" "$REMOTE_PORT" "$CANDIDATE_REPL_USER" "$OLD_PRIMARY_APP"
+    if [ -n "$OLD_PRIMARY_APP" ]; then
+        printf '  Generated connection : host=%s port=%s user=%s application_name=%s\n' "$NEW_PRIMARY_DB_HOST" "$REMOTE_PORT" "$CANDIDATE_REPL_USER" "$OLD_PRIMARY_APP"
+    else
+        printf '  Generated connection : host=%s port=%s user=%s | application_name=<omitted>\n' "$NEW_PRIMARY_DB_HOST" "$REMOTE_PORT" "$CANDIDATE_REPL_USER"
+    fi
 
     if check_reverse_streaming_authentication; then
         info "Reverse streaming HBA readiness was verified automatically."
@@ -2238,14 +2248,16 @@ planned_switchover() {
         say ""
         say "Physical Replication Slot"
         say "  현재 Standby가 physical replication slot을 사용하고 있습니다. 역할 전환 후 former Primary용 slot도 새 Primary에 준비하는 것을 권장합니다."
-        slot_default=$(sanitize_identifier "${OLD_PRIMARY_APP}_slot")
+        slot_identity=${OLD_PRIMARY_APP:-$(hostname 2>/dev/null || echo former_primary)}
+        slot_default=$(sanitize_identifier "${slot_identity}_slot")
         REVERSE_SLOT=$(ask "New Primary physical replication slot name (empty = do not use a slot)" "$slot_default") || usage_die "Input cancelled."
     else
         say ""
         say "Physical Replication Slot"
         say "  선택한 Standby는 현재 active physical replication slot과 연결되어 있지 않습니다. 역할 전환 후에도 기본적으로 slot을 새로 만들지 않습니다."
         if choose_yes_no "Create a physical replication slot for the former Primary" "no"; then
-            slot_default=$(sanitize_identifier "${OLD_PRIMARY_APP}_slot")
+            slot_identity=${OLD_PRIMARY_APP:-$(hostname 2>/dev/null || echo former_primary)}
+        slot_default=$(sanitize_identifier "${slot_identity}_slot")
             REVERSE_SLOT=$(ask "Physical replication slot name" "$slot_default") || usage_die "Input cancelled."
         fi
     fi
