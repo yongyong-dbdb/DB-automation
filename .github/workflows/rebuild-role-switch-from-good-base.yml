@@ -60,6 +60,14 @@ jobs:
           printf '%s\n' "$block" | grep -F 'pfp_restore_tmp="$pfp_restore_file.tmp.$$"'
           printf '%s\n' "$block" | grep -F 'mv "$pfp_restore_tmp" "$pfp_restore_file"'
           printf '%s\n' "$block" | grep -F '[ -s "$pfp_restore_tmp" ]'
+      - name: Slot-option regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
+          grep -F "pg_create_physical_replication_slot(:'slot', true, false)" "$target" >/dev/null
+          grep -F 'immediately_reserve=true, temporary=false' "$target" >/dev/null
+          grep -F 'physical_inactive -> reuse the existing physical slot' "$target" >/dev/null
       - name: Dependency scan
         shell: bash
         run: |
