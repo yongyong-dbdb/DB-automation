@@ -36,6 +36,7 @@ TAB=$(printf '\t')
 CHECK_ONLY=0
 EXIT_USAGE=2
 EXIT_REMOTE=3
+EXIT_CANCELLED=4
 MAX_WAIT_SECONDS=${PG_SWITCH_MAX_WAIT_SECONDS:-3600}
 RESULT_FILE=""
 RESULT_INITIALIZED=0
@@ -148,6 +149,14 @@ remote_die() {
     exit "$EXIT_REMOTE"
 }
 
+cancel_operation() {
+    LAST_ERROR=$*
+    record_check "CANCELLED" "Operation" "$*"
+    printf '[CANCELLED] %s\n' "$*" >&2
+    cleanup_tmp
+    exit "$EXIT_CANCELLED"
+}
+
 classify_remote_failure() {
     crf_code=$1
     shift
@@ -208,6 +217,9 @@ finalize_result_report() {
     elif [ "$frr_code" -eq "$EXIT_REMOTE" ]; then
         frr_status="FAILED"
         frr_detail="remote connection or execution error"
+    elif [ "$frr_code" -eq "$EXIT_CANCELLED" ]; then
+        frr_status="CANCELLED"
+        frr_detail=${LAST_ERROR:-operation cancelled by user}
     else
         frr_status="FAILED"
         frr_detail=${LAST_ERROR:-operation failed}
@@ -222,7 +234,7 @@ print_result_summary() {
     [ "$RESULT_INITIALIZED" -eq 1 ] 2>/dev/null || return 0
     say ""
     say "Validation Result Summary"
-    awk -F '\t' 'NF >= 2 && ($1=="PASSED" || $1=="WARNING" || $1=="FAILED" || $1=="MANUAL CHECK") {printf "  %-12s %-28s %s\n", "[" $1 "]", $2, $3}' "$RESULT_FILE" 2>/dev/null || true
+    awk -F '\t' 'NF >= 2 && ($1=="PASSED" || $1=="WARNING" || $1=="FAILED" || $1=="MANUAL CHECK" || $1=="CANCELLED") {printf "  %-12s %-28s %s\n", "[" $1 "]", $2, $3}' "$RESULT_FILE" 2>/dev/null || true
     printf '  Result File  : %s\n' "$RESULT_FILE"
 }
 
@@ -1256,7 +1268,17 @@ choose_remote_transport() {
     [ -n "$REMOTE_SSH_USER" ] || usage_die "SSH OS user is required."
     REMOTE_TARGET="$REMOTE_SSH_USER@$REMOTE_SSH_HOST"
 
-    ssh -o BatchMode=yes -o ConnectTimeout=5 "$REMOTE_TARGET" 'sh -c "exit 0"' >/dev/null 2>&1 || remote_die "Non-interactive SSH check failed for $REMOTE_TARGET. This script does not configure SSH credentials."
+    mktemp_safe || remote_die "Could not create temporary file for SSH validation."
+    crt_ssh_err=$SAFE_TMP
+    crt_check_cmd=$(remote_build_command --help)
+    if ! ssh -T -o BatchMode=yes -o ConnectTimeout=5 "$REMOTE_TARGET" "$crt_check_cmd" < "$SCRIPT_PATH" >/dev/null 2>"$crt_ssh_err"; then
+        [ ! -s "$crt_ssh_err" ] || cat "$crt_ssh_err" >&2
+        remote_die "Non-interactive SSH check failed for $REMOTE_TARGET. This script does not configure SSH credentials."
+    fi
+    if grep -Ei 'command not found|syntax error|unexpected EOF|not found$' "$crt_ssh_err" >/dev/null 2>&1; then
+        cat "$crt_ssh_err" >&2
+        remote_die "Non-interactive SSH check failed for $REMOTE_TARGET. This script does not configure SSH credentials."
+    fi
 }
 
 remote_select_instance() {
@@ -1674,7 +1696,7 @@ external_restart_fencing_guard() {
     say "External HA / Service Restart / Fencing"
     say "  이 스크립트의 data_directory 잠금은 외부 HA manager, service manager, watchdog 또는 별도 운영 자동화가 former Primary를 다시 Primary로 기동하는 것을 차단하지 못합니다."
     if ! choose_yes_no "Former Primary의 자동 재기동/자동 failover가 중지되어 있고 fencing 또는 동등한 split-brain 방지 절차가 준비되어 있습니까" "no"; then
-        die "Switchover aborted because external restart/failover/fencing control was not confirmed."
+        cancel_operation "Switchover cancelled because external restart/failover/fencing control was not confirmed."
     fi
     record_check "MANUAL CHECK" "External HA / Fencing" "operator confirmed automatic restart/failover is controlled and split-brain prevention is in place"
 }
