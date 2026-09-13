@@ -1,15 +1,15 @@
 name: Patch PostgreSQL role switch manual failover
 
 on:
-  issues:
-    types: [opened]
+  push:
+    paths:
+      - '.github/patches/manual_failover_patch.py'
 
 permissions:
   contents: write
 
 jobs:
   patch:
-    if: github.event.issue.title == 'TEMP: apply PostgreSQL manual failover patch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -25,6 +25,9 @@ jobs:
           git diff --check
           grep -F 'show_switchover_execution_plan' "$target"
           grep -F 'Manual Failover Execution Plan' "$target"
+          grep -F 'CURRENT_PHASE="failover_precheck"' "$target"
+          grep -F 'CURRENT_PHASE="failover_pre_promote"' "$target"
+          grep -F 'CURRENT_PHASE="failover_after_promotion"' "$target"
           grep -F 'confirm_word "PRIMARY_UNAVAILABLE"' "$target"
           grep -F 'confirm_word "PRIMARY_FENCED"' "$target"
           grep -F 'confirm_word "ACCEPT_DATA_LOSS_RISK"' "$target"
@@ -38,5 +41,5 @@ jobs:
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add PostgreSQL/postgresql_role_switch_v0.1.22.sh
           git diff --cached --quiet && exit 0
-          git commit -m 'feat: add manual failover and switchover execution plan'
+          git commit -m 'fix: separate manual failover runtime phases'
           git push origin HEAD:main
