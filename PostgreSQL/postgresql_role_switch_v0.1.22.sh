@@ -45,7 +45,6 @@ SIGNAL_NAME=""
 
 TMP_FILES=""
 CURRENT_PHASE="initial"
-SWITCHOVER_PRIMARY_STOPPED=0
 SWITCHOVER_PROMOTED=0
 SWITCHOVER_CONFIG_CHANGED=0
 LOCK_HELD=0
@@ -410,7 +409,7 @@ remove_lock_directory() {
     rld_dir=$1
     [ -n "$rld_dir" ] || return 1
     case "$rld_dir" in "$LOCK_ROOT"/*) ;; *) return 1 ;; esac
-    for rld_name in owner pid started_at system_identifier data_directory; do
+    for rld_name in owner pid started_at system_identifier data_directory lease_expires; do
         [ ! -e "$rld_dir/$rld_name" ] || unlink "$rld_dir/$rld_name" 2>/dev/null || return 1
     done
     rmdir "$rld_dir" 2>/dev/null
@@ -1247,13 +1246,22 @@ remote_invoke() {
 
 acquire_candidate_lock() {
     REMOTE_LOCK_TOKEN="$SYSTEM_IDENTIFIER-$$-$(date +%s 2>/dev/null || echo unknown)"
-    # Assume ownership before the call so a lost SSH response still triggers a
-    # best-effort release. Failed release leaves the candidate locked closed.
+    # The remote lock uses a renewable lease. This lets a later controller
+    # safely reclaim a lock left by a crashed process without guessing from PID
+    # values that are meaningful only on another host.
+    REMOTE_LOCK_LEASE_SECONDS=$((MAX_WAIT_SECONDS + 600))
     REMOTE_LOCK_HELD=1
-    if ! remote_invoke --remote-lock-acquire "$REMOTE_PGDATA" "$REMOTE_LOCK_TOKEN" >/dev/null; then
-        die "Could not acquire the selected Standby instance lock. Inspect its data_directory before retrying."
+    if ! remote_invoke --remote-lock-acquire "$REMOTE_PGDATA" "$REMOTE_LOCK_TOKEN" "$REMOTE_LOCK_LEASE_SECONDS" >/dev/null; then
+        die "Could not acquire the selected Standby instance lock. Another controller may still hold a valid lease, or legacy/incomplete lock metadata requires inspection."
     fi
-    record_check "PASSED" "Candidate Instance Lock" "exclusive lock acquired on selected Standby data_directory"
+    record_check "PASSED" "Candidate Instance Lock" "exclusive renewable lease acquired on selected Standby data_directory"
+}
+
+refresh_candidate_lock() {
+    [ "$REMOTE_LOCK_HELD" -eq 1 ] 2>/dev/null || return 0
+    if ! remote_invoke --remote-lock-refresh "$REMOTE_PGDATA" "$REMOTE_LOCK_TOKEN" "$REMOTE_LOCK_LEASE_SECONDS" >/dev/null; then
+        die "Candidate instance lock lease could not be refreshed. Refusing to continue because exclusive ownership can no longer be proven."
+    fi
 }
 
 invoke_on_transport() {
@@ -1370,20 +1378,6 @@ remote_select_instance() {
         record_check "MANUAL CHECK" "Standby Server pg_wal Free Space" "available_bytes=${rsi_available_bytes:-unknown}; twice_max_wal_size=${rsi_required_bytes:-unknown} is a screening threshold, not a safe retention limit"
     fi
     record_check "PASSED" "Remote Execution Environment" "data_directory=$REMOTE_PGDATA, port=$REMOTE_PORT"
-}
-
-verify_upstream_connection() {
-    # Do not open a second libpq/replication connection here. The authoritative
-    # topology evidence is the live pg_stat_replication row on the Primary plus
-    # pg_stat_wal_receiver on the selected Standby. A separate probe can fail
-    # because of authentication/passfile rules even while physical streaming is
-    # healthy, producing a false negative.
-    [ "$REMOTE_SYSTEM_IDENTIFIER" = "$SYSTEM_IDENTIFIER" ] || die "Selected Standby system_identifier changed during validation."
-    [ "$REMOTE_ROLE" = "standby" ] || die "Selected Standby is no longer in recovery."
-    [ "$REMOTE_RECEIVER_STATUS" = "streaming" ] || die "Selected Standby pg_stat_wal_receiver.status is no longer streaming."
-    [ "$REMOTE_SENDER_PORT" = "$PGPORT" ] || die "Selected Standby pg_stat_wal_receiver.sender_port=$REMOTE_SENDER_PORT does not match current Primary port=$PGPORT."
-    [ "${REMOTE_RECEIVER_SLOT:-}" = "${CANDIDATE_SLOT:-}" ] || die "Selected Standby pg_stat_wal_receiver.slot_name changed during validation."
-    record_check "PASSED" "Streaming Topology Cross-check" "Primary pg_stat_replication and selected Standby pg_stat_wal_receiver agree on streaming state, system_identifier, sender_port=$PGPORT and physical slot=${CANDIDATE_SLOT:-<empty>}"
 }
 
 candidate_downstream_check() {
@@ -1855,12 +1849,23 @@ revalidate_switchover_topology() {
         die "pg_stat_replication changed: total=${rst_direct_total:-unknown}, state=streaming=${rst_direct_streaming:-unknown}, expected=$DIRECT_STANDBY_COUNT."
     fi
 
-    if ! remote_invoke --remote-validate-candidate "$REMOTE_PGDATA" "$SYSTEM_IDENTIFIER" "$PGPORT" "${CANDIDATE_SLOT:-}" "$REMOTE_DOWNSTREAM_COUNT" >/dev/null; then
+    refresh_candidate_lock
+    rst_remote_output=$(remote_invoke --remote-validate-candidate "$REMOTE_PGDATA" "$SYSTEM_IDENTIFIER" "$PGPORT" "${CANDIDATE_SLOT:-}" "$REMOTE_DOWNSTREAM_COUNT" 2>/dev/null)
+    rst_remote_rc=$?
+    if [ "$rst_remote_rc" -ne 0 ]; then
         rollback_preconfigured_primary
-        die "The selected Standby Server's Current Role, system_identifier, pg_stat_wal_receiver, recovery settings, or pg_stat_replication result changed."
+        classify_remote_failure "$rst_remote_rc" "The selected Standby Server's Current Role, system_identifier, pg_stat_wal_receiver, recovery settings, or pg_stat_replication result changed."
     fi
-    verify_upstream_connection
-    record_check "PASSED" "pg_stat_wal_receiver" "sender_port=$PGPORT, status=streaming"
+    rst_remote_line=$(printf '%s\n' "$rst_remote_output" | awk -F '\t' '$1=="CANDIDATE_READY" {print; exit}')
+    [ -n "$rst_remote_line" ] || { rollback_preconfigured_primary; die "Selected Standby revalidation returned no CANDIDATE_READY record."; }
+    REMOTE_SYSTEM_IDENTIFIER=$(printf '%s\n' "$rst_remote_line" | awk -F '\t' '{print $3}')
+    REMOTE_ROLE=$(printf '%s\n' "$rst_remote_line" | awk -F '\t' '{print $4}')
+    REMOTE_RECEIVER_STATUS=$(printf '%s\n' "$rst_remote_line" | awk -F '\t' '{print $5}')
+    REMOTE_SENDER_PORT=$(printf '%s\n' "$rst_remote_line" | awk -F '\t' '{print $6}')
+    REMOTE_RECEIVER_SLOT=$(printf '%s\n' "$rst_remote_line" | awk -F '\t' '{print $7}')
+    REMOTE_DOWNSTREAM_COUNT=$(printf '%s\n' "$rst_remote_line" | awk -F '\t' '{print $8}')
+    record_check "PASSED" "Streaming Topology Cross-check" "fresh Primary pg_stat_replication and selected Standby pg_stat_wal_receiver agree on streaming state, system_identifier=$REMOTE_SYSTEM_IDENTIFIER, sender_port=$REMOTE_SENDER_PORT and physical slot=${REMOTE_RECEIVER_SLOT:-<empty>}"
+    record_check "PASSED" "pg_stat_wal_receiver" "fresh status=$REMOTE_RECEIVER_STATUS, sender_port=$REMOTE_SENDER_PORT, slot_name=${REMOTE_RECEIVER_SLOT:-<empty>}"
 }
 
 stop_current_primary() {
@@ -1871,7 +1876,6 @@ stop_current_primary() {
     else
         "$PG_CTL_BIN" -D "$PGDATA" -m fast -w stop || return 1
     fi
-    SWITCHOVER_PRIMARY_STOPPED=1
     CURRENT_PHASE="after_primary_stop"
     return 0
 }
@@ -2258,6 +2262,7 @@ planned_switchover() {
     [ "$promote_result" = "primary" ] || die "Promotion of the selected Standby Server could not be verified. Do not restart the former Primary Server until roles are checked manually."
     SWITCHOVER_PROMOTED=1
     CURRENT_PHASE="after_promotion"
+    refresh_candidate_lock
     info "Promotion verified: Current Role=Primary."
 
     if [ "$REMOTE_DOWNSTREAM_COUNT" -gt 0 ]; then
@@ -2719,14 +2724,53 @@ remote_init_exact() {
 remote_lock_acquire() {
     rla_data=$1
     rla_token=$2
+    rla_lease=$3
     [ -n "$rla_token" ] && [ -d "$rla_data" ] && [ -w "$rla_data" ] || return 1
+    case "$rla_lease" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$rla_lease" -ge 60 ] 2>/dev/null || return 1
     rla_dir="$rla_data/.postgresql-role-switch.lock"
     [ ! -L "$rla_dir" ] || return 1
-    mkdir "$rla_dir" 2>/dev/null || return 1
+    rla_now=$(date +%s 2>/dev/null) || return 1
+    case "$rla_now" in ''|*[!0-9]*) return 1 ;; esac
+
+    if ! mkdir "$rla_dir" 2>/dev/null; then
+        [ ! -L "$rla_dir" ] && [ -d "$rla_dir" ] || return 1
+        rla_owner=$(sed -n '1p' "$rla_dir/owner" 2>/dev/null || true)
+        rla_saved_data=$(sed -n '1p' "$rla_dir/data_directory" 2>/dev/null || true)
+        rla_expires=$(sed -n '1p' "$rla_dir/lease_expires" 2>/dev/null || true)
+        case "$rla_owner" in remote:*) ;; *) return 1 ;; esac
+        [ "$rla_saved_data" = "$rla_data" ] || return 1
+        case "$rla_expires" in ''|*[!0-9]*) return 1 ;; esac
+        [ "$rla_now" -gt "$rla_expires" ] 2>/dev/null || return 2
+        # Expired lease: remove only the exact metadata files this script owns.
+        for rla_name in owner pid started_at data_directory lease_expires; do
+            [ ! -e "$rla_dir/$rla_name" ] || unlink "$rla_dir/$rla_name" 2>/dev/null || return 1
+        done
+        rmdir "$rla_dir" 2>/dev/null || return 1
+        mkdir "$rla_dir" 2>/dev/null || return 2
+    fi
+
+    rla_expires=$((rla_now + rla_lease))
     printf 'remote:%s\n' "$rla_token" > "$rla_dir/owner" || return 1
     printf '0\n' > "$rla_dir/pid" || return 1
     printf '%s\n' "$rla_data" > "$rla_dir/data_directory" || return 1
     printf '%s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo unknown)" > "$rla_dir/started_at" || return 1
+    printf '%s\n' "$rla_expires" > "$rla_dir/lease_expires" || return 1
+}
+
+remote_lock_refresh() {
+    rlf_data=$1
+    rlf_token=$2
+    rlf_lease=$3
+    case "$rlf_lease" in ''|*[!0-9]*) return 1 ;; esac
+    rlf_dir="$rlf_data/.postgresql-role-switch.lock"
+    [ ! -L "$rlf_dir" ] && [ -d "$rlf_dir" ] || return 1
+    [ "$(sed -n '1p' "$rlf_dir/owner" 2>/dev/null)" = "remote:$rlf_token" ] || return 1
+    [ "$(sed -n '1p' "$rlf_dir/data_directory" 2>/dev/null)" = "$rlf_data" ] || return 1
+    rlf_now=$(date +%s 2>/dev/null) || return 1
+    case "$rlf_now" in ''|*[!0-9]*) return 1 ;; esac
+    rlf_expires=$((rlf_now + rlf_lease))
+    printf '%s\n' "$rlf_expires" > "$rlf_dir/lease_expires" || return 1
 }
 
 remote_lock_release() {
@@ -2736,7 +2780,11 @@ remote_lock_release() {
     rlr_dir="$rlr_data/.postgresql-role-switch.lock"
     [ ! -L "$rlr_dir" ] && [ -d "$rlr_dir" ] || return 1
     [ "$(sed -n '1p' "$rlr_dir/owner" 2>/dev/null)" = "remote:$rlr_token" ] || return 1
-    remove_lock_directory "$rlr_dir"
+    [ "$(sed -n '1p' "$rlr_dir/data_directory" 2>/dev/null)" = "$rlr_data" ] || return 1
+    for rlr_name in owner pid started_at data_directory lease_expires; do
+        [ ! -e "$rlr_dir/$rlr_name" ] || unlink "$rlr_dir/$rlr_name" 2>/dev/null || return 1
+    done
+    rmdir "$rlr_dir" 2>/dev/null
 }
 
 remote_preflight() {
@@ -2780,9 +2828,12 @@ remote_validate_candidate() {
     [ "$LOCAL_ROLE" = "standby" ] || exit 3
     [ "$SYSTEM_IDENTIFIER" = "$rvc_expected_sysid" ] || exit 4
     rvc_receiver=$(psql_call "SELECT COALESCE(status,'') || E'\\t' || COALESCE(sender_port::text,'') || E'\\t' || COALESCE(slot_name,'') FROM pg_stat_wal_receiver LIMIT 1" 2>/dev/null | sed -n '1p') || exit 5
-    [ "$(printf '%s\n' "$rvc_receiver" | awk -F '\t' '{print $1}')" = "streaming" ] || exit 6
-    [ "$(printf '%s\n' "$rvc_receiver" | awk -F '\t' '{print $2}')" = "$rvc_expected_port" ] || exit 7
-    [ "$(printf '%s\n' "$rvc_receiver" | awk -F '\t' '{print $3}')" = "$rvc_expected_slot" ] || exit 8
+    rvc_status=$(printf '%s\n' "$rvc_receiver" | awk -F '\t' '{print $1}')
+    rvc_sender_port=$(printf '%s\n' "$rvc_receiver" | awk -F '\t' '{print $2}')
+    rvc_sender_slot=$(printf '%s\n' "$rvc_receiver" | awk -F '\t' '{print $3}')
+    [ "$rvc_status" = "streaming" ] || exit 6
+    [ "$rvc_sender_port" = "$rvc_expected_port" ] || exit 7
+    [ "$rvc_sender_slot" = "$rvc_expected_slot" ] || exit 8
     rvc_pause=$(pause_state 2>/dev/null || echo unknown)
     case "$rvc_pause" in "not paused"|f|false|"") ;; *) exit 9 ;; esac
     rvc_delay=$(psql_call "SELECT setting FROM pg_settings WHERE name='recovery_min_apply_delay'" 2>/dev/null | tr -d '[:space:]') || exit 10
@@ -2793,7 +2844,7 @@ remote_validate_candidate() {
     [ "$rvc_downstreams" = "$rvc_expected_downstreams" ] || exit 15
     rvc_bad=$(psql_call "SELECT count(*) FROM pg_stat_replication r WHERE state <> 'backup' AND state <> 'streaming' AND NOT EXISTS (SELECT 1 FROM pg_replication_slots s WHERE s.active_pid=r.pid AND s.slot_type='logical')" 2>/dev/null | tr -d '[:space:]') || exit 16
     [ "$rvc_bad" = "0" ] || exit 17
-    printf 'CANDIDATE_READY\t%s\n' "$rvc_pgdata"
+    printf 'CANDIDATE_READY\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$rvc_pgdata" "$SYSTEM_IDENTIFIER" "$LOCAL_ROLE" "$rvc_status" "$rvc_sender_port" "$rvc_sender_slot" "$rvc_downstreams"
 }
 
 remote_slot_state() {
@@ -2939,8 +2990,13 @@ case "${1:-}" in
         exit $?
         ;;
     --remote-lock-acquire)
-        [ "$#" -eq 3 ] || exit 64
-        remote_lock_acquire "$2" "$3"
+        [ "$#" -eq 4 ] || exit 64
+        remote_lock_acquire "$2" "$3" "$4"
+        exit $?
+        ;;
+    --remote-lock-refresh)
+        [ "$#" -eq 4 ] || exit 64
+        remote_lock_refresh "$2" "$3" "$4"
         exit $?
         ;;
     --remote-lock-release)
