@@ -1573,6 +1573,8 @@ current_primary_slot_wal_status_guard() {
 
 candidate_switchover_safety_precheck() {
     css_reserve_slots=${1:-0}
+    css_reverse_slot=${2:-}
+    case "$REMOTE_DOWNSTREAM_COUNT" in ''|*[!0-9]*) die "The selected Standby Server returned an invalid downstream count: ${REMOTE_DOWNSTREAM_COUNT:-<empty>}" ;; esac
     css_line=$(remote_invoke --remote-switchover-safety "$REMOTE_PGDATA" 2>/dev/null | awk -F '\t' '$1=="SWITCHOVER_SAFETY" {print; exit}') || classify_remote_failure "$?" "Could not inspect the selected Standby Server's switchover capacity and safety state."
     [ -n "$css_line" ] || die "Selected Standby Server returned no switchover safety data."
     REMOTE_MAX_WAL_SENDERS=$(printf '%s\n' "$css_line" | awk -F '\t' '{print $2}')
@@ -1590,7 +1592,17 @@ candidate_switchover_safety_precheck() {
     done
     css_required_senders=$((REMOTE_DOWNSTREAM_COUNT + 1))
     [ "$REMOTE_MAX_WAL_SENDERS" -ge "$css_required_senders" ] || die "Selected Standby Server max_wal_senders=$REMOTE_MAX_WAL_SENDERS cannot serve $REMOTE_DOWNSTREAM_COUNT existing downstream Standby Server(s) plus the former Primary Server; required >= $css_required_senders."
-    css_required_slots=$((REMOTE_REPLICATION_SLOT_COUNT + css_reserve_slots))
+    css_effective_reserve=$css_reserve_slots
+    if [ "$css_reserve_slots" -eq 1 ] 2>/dev/null && [ -n "$css_reverse_slot" ]; then
+        css_slot_state=$(remote_invoke --remote-slot-state "$REMOTE_PGDATA" "$css_reverse_slot" 2>/dev/null | awk -F '\t' '$1=="SLOT_STATE" {print $3; exit}') || classify_remote_failure "$?" "Could not inspect reverse replication slot state on the selected Standby Server."
+        case "$css_slot_state" in
+            absent) css_effective_reserve=1 ;;
+            physical) css_effective_reserve=0 ;;
+            conflict) die "Reverse slot name $css_reverse_slot already exists on the selected Standby Server but is not a physical replication slot. Choose another slot name." ;;
+            *) die "Unexpected reverse slot state for $css_reverse_slot: ${css_slot_state:-<empty>}" ;;
+        esac
+    fi
+    css_required_slots=$((REMOTE_REPLICATION_SLOT_COUNT + css_effective_reserve))
     [ "$REMOTE_MAX_REPLICATION_SLOTS" -ge "$css_required_slots" ] || die "Selected Standby Server max_replication_slots=$REMOTE_MAX_REPLICATION_SLOTS cannot accommodate existing slots=$REMOTE_REPLICATION_SLOT_COUNT plus requested new reverse slots=$css_reserve_slots; required >= $css_required_slots."
 
     if [ "$REMOTE_RISKY_PHYSICAL_SLOT_COUNT" = "-1" ]; then
@@ -1601,7 +1613,7 @@ candidate_switchover_safety_precheck() {
         record_check "PASSED" "Candidate Physical Slot WAL Retention" "no physical slot has wal_status=unreserved/lost"
     fi
     record_check "PASSED" "Candidate WAL Sender Capacity" "max_wal_senders=$REMOTE_MAX_WAL_SENDERS required=$css_required_senders"
-    record_check "PASSED" "Candidate Replication Slot Capacity" "max_replication_slots=$REMOTE_MAX_REPLICATION_SLOTS used=$REMOTE_REPLICATION_SLOT_COUNT reserved_for_reverse=$css_reserve_slots"
+    record_check "PASSED" "Candidate Replication Slot Capacity" "max_replication_slots=$REMOTE_MAX_REPLICATION_SLOTS used=$REMOTE_REPLICATION_SLOT_COUNT reserved_for_reverse=$css_effective_reserve"
 }
 
 local_archiver_health_guard() {
@@ -1958,7 +1970,7 @@ planned_switchover() {
     fi
 
     if [ -n "${REVERSE_SLOT:-}" ]; then
-        candidate_switchover_safety_precheck 1
+        candidate_switchover_safety_precheck 1 "$REVERSE_SLOT"
     else
         candidate_switchover_safety_precheck 0
     fi
@@ -2410,6 +2422,14 @@ remote_validate_candidate() {
     printf 'CANDIDATE_READY\t%s\n' "$rvc_pgdata"
 }
 
+remote_slot_state() {
+    rss_pgdata=$1
+    rss_slot=$2
+    remote_init_exact "$rss_pgdata"
+    rss_state=$(psql_call_var slot "$rss_slot" "SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name=:'slot') THEN 'absent' WHEN EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name=:'slot' AND slot_type='physical') THEN 'physical' ELSE 'conflict' END" 2>/dev/null | tr -d '[:space:]') || exit 3
+    printf 'SLOT_STATE\t%s\t%s\n' "$rss_slot" "$rss_state"
+}
+
 remote_switchover_safety() {
     rss_pgdata=$1
     remote_init_exact "$rss_pgdata"
@@ -2563,6 +2583,11 @@ case "${1:-}" in
     --remote-validate-candidate)
         [ "$#" -eq 6 ] || exit 64
         remote_validate_candidate "$2" "$3" "$4" "$5" "$6"
+        exit $?
+        ;;
+    --remote-slot-state)
+        [ "$#" -eq 3 ] || exit 64
+        remote_slot_state "$2" "$3"
         exit $?
         ;;
     --remote-switchover-safety)
