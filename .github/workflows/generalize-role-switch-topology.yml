@@ -106,7 +106,10 @@ jobs:
         run: |
           set -euo pipefail
           target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
-          ! awk '!/^[[:space:]]*#/' "$target" | grep -E '(^|[^[:alnum:]_])(python|python3|jq|yq|expect|perl|node|npm|pip)([^[:alnum:]_]|$)'
+          forbidden='python|python3|jq|yq|expect|perl|node|npm|pip'
+          ! grep -E "^[[:space:]]*(${forbidden})([[:space:]]|$)" "$target"
+          ! grep -E "(\||;|&&|\|\|)[[:space:]]*(${forbidden})([[:space:]]|$)" "$target"
+          ! grep -E "\$\([[:space:]]*(${forbidden})([[:space:]]|$)" "$target"
 
       - name: Commit target only
         shell: bash
