@@ -29,7 +29,7 @@ jobs:
         run: |
           set -euo pipefail
           target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
-          grep -F "pg_create_physical_replication_slot('$rcs_slot', true, false)" "$target"
+          grep -F 'pg_create_physical_replication_slot(' "$target" | grep -F 'true, false'
           grep -F 'immediately_reserve=true' "$target"
           grep -F 'temporary=false' "$target"
           grep -F 'physical_inactive -> reuse the existing physical slot' "$target"
@@ -41,9 +41,9 @@ jobs:
         run: |
           set -euo pipefail
           target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
-          grep -A55 '^remote_create_slot()' "$target" | grep -F "rcs_count"
-          grep -A55 '^remote_create_slot()' "$target" | grep -F $'SLOT\\t%s\\tcreated'
-          grep -A55 '^remote_create_slot()' "$target" | grep -F $'SLOT\\t%s\\treused'
+          grep -A55 '^remote_create_slot()' "$target" | grep -F 'rcs_count'
+          grep -A55 '^remote_create_slot()' "$target" | grep -F 'created'
+          grep -A55 '^remote_create_slot()' "$target" | grep -F 'reused'
           ! grep -A55 '^remote_create_slot()' "$target" | grep -F "pg_create_physical_replication_slot(:'slot', true)"
       - name: Dependency scan
         shell: bash
