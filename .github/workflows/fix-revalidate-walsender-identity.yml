@@ -1,0 +1,76 @@
+name: Fix WAL sender identity revalidation
+
+on:
+  push:
+    paths:
+      - '.github/workflows/fix-revalidate-walsender-identity.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Apply patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
+          python3 .github/patches/fix-revalidate-walsender-identity.py
+          sh -n "$target"
+          git diff --check
+      - name: Revalidation regression checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
+          grep -F "A WAL sender PID is connection-scoped" "$target"
+          grep -F "state='streaming'" "$target"
+          grep -F "s.slot_type='physical'" "$target"
+          grep -F 'rst_match_count' "$target"
+          grep -F 'Multiple pg_stat_replication rows match the selected Standby identity' "$target"
+          grep -F 'WAL sender reconnected' "$target"
+          ! grep -F 'WHERE pid=:' "$target"
+      - name: Mock identity decisions
+        shell: bash
+        run: |
+          set -euo pipefail
+          decide() {
+            count=$1
+            oldpid=$2
+            newpid=$3
+            case "$count" in
+              1) [ -n "$newpid" ] || return 1 ;;
+              0|'') return 2 ;;
+              *) return 3 ;;
+            esac
+            [ "$oldpid" = "$newpid" ] || return 4
+            return 0
+          }
+          decide 1 100 100
+          rc=0; decide 1 100 200 || rc=$?; test "$rc" -eq 4
+          rc=0; decide 0 100 '' || rc=$?; test "$rc" -eq 2
+          rc=0; decide 2 100 200 || rc=$?; test "$rc" -eq 3
+      - name: Dependency scan
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
+          ! grep -E '(^|[^[:alnum:]_])(python|python3|jq|yq|expect|perl|node|npm|pip)([^[:alnum:]_]|$)' "$target"
+      - name: Commit and clean temporary files
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          rm -f .github/patches/fix-revalidate-walsender-identity.py
+          rm -f .github/workflows/fix-revalidate-walsender-identity.yml
+          git add -A PostgreSQL/postgresql_role_switch_v0.1.22.sh .github
+          git diff --cached --check
+          git commit -m 'fix: revalidate standby without pinning WAL sender pid'
+          git push origin HEAD:main
