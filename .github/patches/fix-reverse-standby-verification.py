@@ -62,7 +62,11 @@ new='''remote_count_standby() {
     remote_init_exact "$rcs2_pgdata"
     [ -n "$rcs2_app" ] || return 1
     if [ -n "$rcs2_slot" ]; then
-        rcs2_output=$(printf '%s\\n' "SELECT count(*) FROM pg_stat_replication r WHERE r.application_name=:'app' AND r.state='streaming' AND EXISTS (SELECT 1 FROM pg_replication_slots s WHERE s.active_pid=r.pid AND s.slot_type='physical' AND s.slot_name=:'slot')" | "$PSQL_BIN" -X -q -A -t -v ON_ERROR_STOP=1 -v "app=$rcs2_app" -v "slot=$rcs2_slot" ${PGUSER_LOCAL:+-U "$PGUSER_LOCAL"} ${SOCKET_DIR:+-h "$SOCKET_DIR"} ${PGPORT:+-p "$PGPORT"} -d "$DB_NAME" 2>/dev/null) || return 1
+        # Replication slot names are already validated by the controller as
+        # lower-case letters, digits and underscore, so embedding the value in
+        # this single-quoted SQL literal is safe. application_name still uses
+        # psql variable quoting because it is free-form text.
+        rcs2_output=$(psql_call_var app "$rcs2_app" "SELECT count(*) FROM pg_stat_replication r WHERE r.application_name=:'app' AND r.state='streaming' AND EXISTS (SELECT 1 FROM pg_replication_slots s WHERE s.active_pid=r.pid AND s.slot_type='physical' AND s.slot_name='$rcs2_slot')" 2>/dev/null) || return 1
     else
         rcs2_output=$(psql_call_var app "$rcs2_app" "SELECT count(*) FROM pg_stat_replication r WHERE application_name=:'app' AND state='streaming' AND NOT EXISTS (SELECT 1 FROM pg_replication_slots s WHERE s.active_pid=r.pid AND s.slot_type='logical')" 2>/dev/null) || return 1
     fi
