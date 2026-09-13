@@ -2383,8 +2383,11 @@ remote_verify_upstream() {
     esac
     case "$rvu_dsn" in
         *'
-'*|*'
 '*) return 22 ;; # Never allow a second psql meta-command.
+    esac
+    rvu_cr=$(printf '\r')
+    case "$rvu_dsn" in
+        *"$rvu_cr"*) return 22 ;; # Never allow a carriage return in the psql meta-command.
     esac
     mktemp_safe || return 22
     rvu_input=$SAFE_TMP
