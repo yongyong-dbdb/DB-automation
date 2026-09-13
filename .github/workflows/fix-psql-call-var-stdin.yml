@@ -1,0 +1,73 @@
+name: Fix psql variable interpolation
+
+on:
+  push:
+    paths:
+      - '.github/workflows/fix-psql-call-var-stdin.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Apply patch and validate
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
+          python3 .github/patches/fix-psql-call-var-stdin.py
+          sh -n "$target"
+          git diff --check
+      - name: psql_call_var regression assertions
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
+          block=$(awk '/^psql_call_var\(\)/,/^}/' "$target")
+          printf '%s\n' "$block" | grep -F "printf '%s\\n' \"\$pcv_sql\" | \"\$PSQL_BIN\""
+          ! printf '%s\n' "$block" | grep -F -- '-c "$pcv_sql"'
+          printf '%s\n' "$block" | grep -F -- '-v "$pcv_name=$pcv_value"'
+      - name: Variable interpolation call-site audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
+          # Every psql interpolation token must live in a psql_call_var call site.
+          grep -n ":'" "$target" > /tmp/interpolation.txt || true
+          test -s /tmp/interpolation.txt
+          while IFS=: read -r line rest; do
+            sed -n "${line}p" "$target" | grep -F 'psql_call_var' >/dev/null || {
+              echo "unexpected psql interpolation outside psql_call_var at line $line" >&2
+              exit 1
+            }
+          done < /tmp/interpolation.txt
+          # Critical rollback/staging and LSN/logical-slot paths remain covered by the helper.
+          grep -F "sourcefile = :'ac'" "$target" >/dev/null
+          grep -F "ALTER SYSTEM SET primary_conninfo = :'pc'" "$target" >/dev/null
+          grep -F "ALTER SYSTEM SET primary_slot_name = :'ps'" "$target" >/dev/null
+          grep -F "pg_last_wal_replay_lsn() >= :'target'::pg_lsn" "$target" >/dev/null
+          grep -F "slot_name=:'slot'" "$target" >/dev/null
+      - name: Dependency scan
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
+          ! awk '!/^[[:space:]]*#/' "$target" | grep -E '(^|[^[:alnum:]_])(python|python3|jq|yq|expect|perl|node|npm|pip)([^[:alnum:]_]|$)'
+      - name: Commit target only
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add "$target"
+          git diff --cached --check
+          git diff --cached --quiet && exit 0
+          git commit -m 'fix: make psql variable interpolation executable'
+          git push origin HEAD:main
