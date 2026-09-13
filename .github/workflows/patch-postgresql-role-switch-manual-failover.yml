@@ -1,15 +1,15 @@
 name: Patch PostgreSQL role switch manual failover
 
 on:
-  pull_request:
-    paths:
-      - '.github/patches/manual-failover-pr-trigger.txt'
+  issues:
+    types: [opened]
 
 permissions:
   contents: write
 
 jobs:
   patch:
+    if: github.event.issue.title == 'TEMP: apply PostgreSQL manual failover patch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
