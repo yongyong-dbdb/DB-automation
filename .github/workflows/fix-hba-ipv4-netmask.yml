@@ -1,0 +1,75 @@
+name: Fix HBA IPv4 netmask
+
+on:
+  push:
+    paths:
+      - '.github/workflows/fix-hba-ipv4-netmask.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Apply patch and syntax checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
+          python3 .github/patches/fix-hba-ipv4-netmask.py
+          sh -n "$target"
+          git diff --check
+      - name: HBA regression assertions
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
+          grep -F 'ipv4_matches_netmask()' "$target"
+          grep -F 'The "all" database token does not match physical replication' "$target"
+          grep -F 'first potentially matching rule' "$target"
+          ! grep -A220 '^remote_hba_check()' "$target" | grep -F 'inet_same_family'
+          ! grep -A220 '^remote_hba_check()' "$target" | grep -F 'address::inet & netmask::inet'
+      - name: POSIX IPv4 netmask mock cases
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
+          tmp=$(mktemp)
+          trap 'rm -f "$tmp"' EXIT
+          awk '/^ipv4_octets_valid\(\) \{/{p=1} /^remote_hba_check\(\) \{/{p=0} p' "$target" > "$tmp"
+          . "$tmp"
+          ipv4_matches_netmask 128.10.41.133 0.0.0.0 0.0.0.0
+          ipv4_matches_netmask 128.10.41.133 128.10.41.0 255.255.0.0
+          ipv4_matches_netmask 128.10.41.133 128.10.41.133 255.255.255.255
+          rc=0; ipv4_matches_netmask 128.10.41.133 128.11.0.0 255.255.0.0 || rc=$?; test "$rc" -eq 1
+          rc=0; ipv4_matches_netmask 128.10.41.133 999.0.0.0 255.255.0.0 || rc=$?; test "$rc" -eq 2
+      - name: PostgreSQL 12-18 common column assertions
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
+          grep -F 'FROM pg_hba_file_rules ORDER BY line_number' "$target"
+          ! grep -A220 '^remote_hba_check()' "$target" | grep -E 'rule_number|file_name'
+      - name: Dependency scan
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
+          ! awk '!/^[[:space:]]*#/' "$target" | grep -E '(^|[^[:alnum:]_])(python|python3|jq|yq|expect|perl|node|npm|pip)([^[:alnum:]_]|$)'
+      - name: Commit target only
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add "$target"
+          git diff --cached --check
+          git diff --cached --quiet && exit 0
+          git commit -m 'fix: evaluate HBA IPv4 netmasks correctly'
+          git push origin HEAD:main
