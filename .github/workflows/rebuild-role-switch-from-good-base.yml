@@ -16,7 +16,7 @@ jobs:
         with:
           ref: main
           fetch-depth: 0
-      - name: Rebuild target from known-good base
+      - name: Rebuild target from known-good base safely
         shell: bash
         run: |
           set -euo pipefail
