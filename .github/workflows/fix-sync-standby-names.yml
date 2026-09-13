@@ -1,0 +1,37 @@
+name: Fix synchronous_standby_names normalization
+
+on:
+  push:
+    paths:
+      - '.github/workflows/fix-sync-standby-names.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Apply patch and validate
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
+          python3 .github/patches/fix-sync-standby-names.py
+          sh -n "$target"
+          git diff --check
+          grep -F 'Both servers have synchronous_standby_names=<empty>' "$target"
+          grep -F 's/[[:space:]]*$//' "$target"
+      - name: Commit patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add PostgreSQL/postgresql_role_switch_v0.1.22.sh
+          git diff --cached --quiet && exit 0
+          git commit -m 'fix: normalize synchronous_standby_names before comparison'
+          git push origin HEAD:main
