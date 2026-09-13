@@ -21,7 +21,7 @@ jobs:
         run: |
           set -euo pipefail
           target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
-          python3 .github/patches/harden-switchover-topology-roundtrip.py
+          python3 .github/patches/run-harden-switchover-topology-roundtrip.py
           sh -n "$target"
           git diff --check
       - name: Phase and restore-state regression
