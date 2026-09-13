@@ -1,0 +1,102 @@
+name: Validate inactive physical slot review
+
+on:
+  push:
+    paths:
+      - '.github/workflows/add-inactive-physical-slot-review.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Apply patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
+          python3 .github/patches/add-inactive-physical-slot-review.py
+          sh -n "$target"
+          git diff --check
+
+      - name: Slot review assertions
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
+          grep -F 'review_inactive_physical_slots() {' "$target"
+          grep -F "slot_type='physical' AND NOT active AND NOT temporary" "$target"
+          grep -F 'inactive_since=' "$target"
+          grep -F 'synchronized_standby_slots' "$target"
+          grep -F 'DROP_SLOT_$rips_slot' "$target"
+          grep -F "SELECT pg_drop_replication_slot(:'slot')" "$target"
+          grep -F 'Current Role=Standby' "$target"
+          grep -F 'deletion intentionally deferred until Primary role' "$target"
+          grep -F '2) replication_status; review_inactive_physical_slots ;;' "$target"
+          grep -F '3) replication_status; review_inactive_physical_slots ;;' "$target"
+
+      - name: Safety regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
+          # Never auto-drop: every drop must remain behind both yes/no and exact-word confirmation.
+          python3 - <<'PY'
+          from pathlib import Path
+          s=Path('PostgreSQL/postgresql_role_switch_v0.1.22.sh').read_text()
+          start=s.index('review_inactive_physical_slots() {')
+          end=s.index('\nreplication_control_menu() {', start)
+          b=s[start:end]
+          assert 'choose_yes_no "Drop inactive physical slot' in b
+          assert 'confirm_word "$rips_confirm"' in b
+          assert 'refresh_role' in b and '[ "$LOCAL_ROLE" = "primary" ]' in b
+          assert "slot_type='physical' AND NOT temporary AND NOT active" in b
+          assert "pg_drop_replication_slot(:'slot')" in b
+          # Standby branch must return before candidate deletion loop.
+          standby=b.index('if [ "$LOCAL_ROLE" = "standby" ]')
+          drop=b.index("pg_drop_replication_slot(:'slot')")
+          assert standby < drop
+          print('inactive-slot safety checks passed')
+          PY
+          ! grep -E '128\.10\.41\.|133|134|135|136' "$target"
+          forbidden='python|python3|jq|yq|expect|perl|node|npm|pip'
+          ! grep -E "^[[:space:]]*(${forbidden})([[:space:]]|$)" "$target"
+          ! grep -E "(\||;|&&|\|\|)[[:space:]]*(${forbidden})([[:space:]]|$)" "$target"
+          ! grep -E "\$\([[:space:]]*(${forbidden})([[:space:]]|$)" "$target"
+
+      - name: Version-column regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
+          python3 - <<'PY'
+          from pathlib import Path
+          s=Path('PostgreSQL/postgresql_role_switch_v0.1.22.sh').read_text()
+          start=s.index('review_inactive_physical_slots() {')
+          end=s.index('\nreplication_control_menu() {', start)
+          b=s[start:end]
+          assert 'if [ "$PG_MAJOR" -ge 17 ]' in b
+          assert 'elif [ "$PG_MAJOR" -ge 13 ]' in b
+          assert 'inactive_since' in b
+          assert 'wal_status' in b and 'safe_wal_size' in b
+          print('version-column branches present')
+          PY
+
+      - name: Commit target only
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add "$target"
+          git diff --cached --check
+          git commit -m 'feat: review inactive physical slots safely'
+          git push origin HEAD:main
