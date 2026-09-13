@@ -47,7 +47,7 @@ jobs:
           set -euo pipefail
           target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
           block=$(awk '/^psql_call_var\(\)/,/^}/' "$target")
-          printf '%s\n' "$block" | grep -F "printf '%s\\n' \"\$pcv_sql\" | \"\$PSQL_BIN\""
+          [ "$(printf '%s\n' "$block" | grep -F -c "printf '%s\\n' \"\$pcv_sql\" | \"\$PSQL_BIN\"")" -eq 5 ]
           ! printf '%s\n' "$block" | grep -F -- '-c "$pcv_sql"'
           grep -F "sourcefile = :'ac'" "$target" >/dev/null
           grep -F "ALTER SYSTEM SET primary_conninfo = :'pc'" "$target" >/dev/null
