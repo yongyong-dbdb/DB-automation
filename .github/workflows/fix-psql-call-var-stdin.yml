@@ -38,8 +38,8 @@ jobs:
         run: |
           set -euo pipefail
           target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
-          # Ignore comments; every executable interpolation token must be passed through psql_call_var.
-          awk '!/^[[:space:]]*#/' "$target" | grep -n ":'" > /tmp/interpolation.txt || true
+          # Match only psql literal-variable syntax :'name', not ordinary SQL string literals like ':'.
+          awk '!/^[[:space:]]*#/' "$target" | grep -En ":'[A-Za-z_][A-Za-z0-9_]*'" > /tmp/interpolation.txt || true
           test -s /tmp/interpolation.txt
           while IFS=: read -r _ rest; do
             printf '%s\n' "$rest" | grep -F 'psql_call_var' >/dev/null || {
