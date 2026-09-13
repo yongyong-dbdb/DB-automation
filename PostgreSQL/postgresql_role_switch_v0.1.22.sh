@@ -1761,6 +1761,7 @@ candidate_switchover_safety_precheck() {
         css_slot_name=$(printf '%s\n' "$css_slot_line" | awk -F '\t' '{print $2}')
         css_slot_state=$(printf '%s\n' "$css_slot_line" | awk -F '\t' '{print $3}')
         [ "$css_slot_name" = "$css_reverse_slot" ] || die "Reverse replication slot state response name mismatch: expected=$css_reverse_slot observed=${css_slot_name:-<empty>}"
+        REVERSE_SLOT_PRECHECK_STATE=$css_slot_state
         case "$css_slot_state" in
             absent) css_effective_reserve=1 ;;
             physical_inactive) css_effective_reserve=0 ;;
@@ -1999,7 +2000,17 @@ show_switchover_execution_plan() {
     say "     SELECT pg_promote();"
     say ""
     say "  7. Create/verify reverse physical replication slot when configured"
-    [ -z "${REVERSE_SLOT:-}" ] || printf "     SELECT pg_create_physical_replication_slot('%s', true);\n" "$REVERSE_SLOT"
+    if [ -n "${REVERSE_SLOT:-}" ]; then
+        printf '     Precheck state: %s\n' "${REVERSE_SLOT_PRECHECK_STATE:-unknown}"
+        say "     Revalidate pg_replication_slots on the promoted New Primary before changing anything."
+        say "     absent            -> create persistent slot with immediately_reserve=true, temporary=false"
+        printf "        SELECT pg_create_physical_replication_slot('%s', true, false);\n" "$REVERSE_SLOT"
+        say "     physical_inactive -> reuse the existing physical slot; do not recreate it"
+        say "     physical_active   -> abort; an active slot is not reassigned"
+        say "     conflict          -> abort; same slot_name is not a reusable physical slot"
+    else
+        say "     No reverse physical replication slot configured."
+    fi
     say ""
     say "  8. Create standby.signal on former Primary"
     printf '     create %s/standby.signal\n' "$PGDATA"
@@ -3190,14 +3201,33 @@ remote_create_slot() {
     rcs_slot=$2
     remote_init_exact "$rcs_pgdata"
     [ "$LOCAL_ROLE" = "primary" ] || exit 3
-    rcs_state=$(psql_call_var slot "$rcs_slot" "SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name=:'slot') THEN 'absent' WHEN EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name=:'slot' AND slot_type='physical' AND NOT active) THEN 'physical_inactive' WHEN EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name=:'slot' AND slot_type='physical' AND active) THEN 'physical_active' ELSE 'conflict' END" 2>/dev/null | tr -d '[:space:]') || exit 4
-    case "$rcs_state" in
-        absent) psql_call_var slot "$rcs_slot" "SELECT slot_name FROM pg_create_physical_replication_slot(:'slot', true)" >/dev/null || exit 5 ;;
-        physical_inactive) : ;;
-        physical_active|conflict) exit 6 ;;
+    case "$rcs_slot" in ''|*[!a-z0-9_]*) exit 64 ;; esac
+
+    # Revalidate on the promoted New Primary. Never rely only on the earlier
+    # precheck because slot state can change between validation and promotion.
+    rcs_count=$(psql_call "SELECT count(*) FROM pg_replication_slots WHERE slot_name='$rcs_slot'" 2>/dev/null | tr -d '[:space:]') || exit 4
+    case "$rcs_count" in ''|*[!0-9]*) exit 4 ;; esac
+    if [ "$rcs_count" -eq 0 ] 2>/dev/null; then
+        # immediately_reserve=true reserves WAL immediately; temporary=false
+        # creates the persistent physical slot required after this SSH session ends.
+        psql_call "SELECT slot_name FROM pg_create_physical_replication_slot('$rcs_slot', true, false)" >/dev/null || exit 5
+        printf 'SLOT\t%s\tcreated\timmediately_reserve=true\ttemporary=false\n' "$rcs_slot"
+        return 0
+    fi
+    [ "$rcs_count" -eq 1 ] 2>/dev/null || exit 7
+
+    rcs_row=$(psql_call "SELECT slot_type || E'\\t' || active::text FROM pg_replication_slots WHERE slot_name='$rcs_slot'" 2>/dev/null | sed -n '1p') || exit 4
+    rcs_type=$(printf '%s\n' "$rcs_row" | awk -F '\t' '{print $1}')
+    rcs_active=$(printf '%s\n' "$rcs_row" | awk -F '\t' '{print $2}')
+    [ "$rcs_type" = physical ] || exit 6
+    case "$rcs_active" in
+        f|false)
+            printf 'SLOT\t%s\treused\timmediately_reserve=existing\ttemporary=false\n' "$rcs_slot"
+            return 0
+            ;;
+        t|true) exit 6 ;;
         *) exit 7 ;;
     esac
-    printf 'SLOT\t%s\n' "$rcs_slot"
 }
 
 remote_check_logical_slot() {
