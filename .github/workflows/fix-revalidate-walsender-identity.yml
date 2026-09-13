@@ -62,15 +62,15 @@ jobs:
           set -euo pipefail
           target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
           ! awk '!/^[[:space:]]*#/' "$target" | grep -E '(^|[^[:alnum:]_])(python|python3|jq|yq|expect|perl|node|npm|pip)([^[:alnum:]_]|$)'
-      - name: Commit and clean temporary files
+      - name: Commit target only
         shell: bash
         run: |
           set -euo pipefail
+          target='PostgreSQL/postgresql_role_switch_v0.1.22.sh'
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          rm -f .github/patches/fix-revalidate-walsender-identity.py
-          rm -f .github/workflows/fix-revalidate-walsender-identity.yml
-          git add -A PostgreSQL/postgresql_role_switch_v0.1.22.sh .github
+          git add "$target"
           git diff --cached --check
+          git diff --cached --quiet && exit 0
           git commit -m 'fix: revalidate standby without pinning WAL sender pid'
           git push origin HEAD:main
