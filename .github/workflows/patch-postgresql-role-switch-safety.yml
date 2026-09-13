@@ -17,7 +17,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          git -c http.extraheader="AUTHORIZATION: bearer ${GH_TOKEN}" clone "https://github.com/${GITHUB_REPOSITORY}.git" repo
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" repo
       - name: Apply and validate patch
         working-directory: repo
         run: sh .github/patch-postgresql-role-switch-safety.sh
