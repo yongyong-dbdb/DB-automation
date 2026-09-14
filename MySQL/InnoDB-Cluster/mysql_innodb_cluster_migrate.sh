@@ -1,10 +1,10 @@
 #!/bin/sh
-# mysql_innodb_cluster_migrate.sh v1.0.39
+# mysql_innodb_cluster_migrate.sh v1.0.44
 # POSIX sh. Oracle MySQL GA 8.0+; runtime AdminAPI capability detection. Requires preinstalled mysql/mysqlsh; never installs packages.
 # Automation for prepared MySQL instances / existing Group Replication -> InnoDB Cluster.
 set -eu
 umask 077
-VERSION=1.0.39
+VERSION=1.0.44
 ROOT=${MYSQL_IC_WORK_ROOT:-"$(pwd)/mysql_innodb_cluster_work"}
 MYSQL=${MYSQL_IC_MYSQL:-mysql}
 MYSQLSH=${MYSQL_IC_MYSQLSH:-mysqlsh}
@@ -31,11 +31,11 @@ secret(){
     printf '%s: ' "$1" >&2
     if [ -t 0 ]; then
         o=$(stty -g) || return 1
-        trap 'saved_rc=$?; stty "$o" 2>/dev/null || :; cleanup "$saved_rc"' 0 1 2 15
+        trap 'stty "$o" 2>/dev/null || :; exit 130' 1 2 15
         stty -echo
         IFS= read -r a; read_rc=$?
         stty "$o" 2>/dev/null || :
-        trap cleanup 0 1 2 15
+        trap cleanup 1 2 15
         [ "$read_rc" -eq 0 ] || return "$read_rc"
     else
         IFS= read -r a || return 1
@@ -236,10 +236,10 @@ detect_login_paths(){
                 /^\[/ { if (hit) exit; hit=($0==target); next }
                 hit { print }
             ' "$dump" > "$block"
-            cfg_user=$(awk -F '=' '/^[[:space:]]*user[[:space:]]*=/ {gsub(/^[[:space:]\"]+|[[:space:]\"]+$/,"",$2); print $2; exit}' "$block")
-            cfg_host=$(awk -F '=' '/^[[:space:]]*host[[:space:]]*=/ {gsub(/^[[:space:]\"]+|[[:space:]\"]+$/,"",$2); print $2; exit}' "$block")
+            cfg_user=$(awk -F '=' '/^[[:space:]]*user[[:space:]]*=/ {gsub(/^[[:space:"]+|[[:space:"]+$/,"",$2); print $2; exit}' "$block")
+            cfg_host=$(awk -F '=' '/^[[:space:]]*host[[:space:]]*=/ {gsub(/^[[:space:"]+|[[:space:"]+$/,"",$2); print $2; exit}' "$block")
             cfg_port=$(awk -F '=' '/^[[:space:]]*port[[:space:]]*=/ {gsub(/^[[:space:]]+|[[:space:]]+$/,"",$2); print $2; exit}' "$block")
-            cfg_socket=$(awk -F '=' '/^[[:space:]]*socket[[:space:]]*=/ {gsub(/^[[:space:]\"]+|[[:space:]\"]+$/,"",$2); print $2; exit}' "$block")
+            cfg_socket=$(awk -F '=' '/^[[:space:]]*socket[[:space:]]*=/ {gsub(/^[[:space:"]+|[[:space:"]+$/,"",$2); print $2; exit}' "$block")
             rm -f "$block"
             if [ -n "$cfg_socket" ]; then transport=socket; elif [ -n "$cfg_host" ]; then transport=tcp; else transport=unknown; fi
             if MYSQL_TEST_LOGIN_FILE="$lf" "$MYSQL" --login-path="$lp" --batch --skip-column-names -e 'SELECT @@server_uuid,@@port,@@socket;' >/dev/null 2>&1; then
@@ -351,7 +351,6 @@ register_node(){
     esac
     cred "$i"
     uuid=$(sql "$i" 'SELECT @@server_uuid;'); ver=$(sql "$i" 'SELECT VERSION();'); port=$(sql "$i" 'SELECT @@port;'); host=$(sql "$i" 'SELECT @@hostname;')
-    # AdminAPI endpoint default order: GR MEMBER_HOST -> report_host -> selected TCP bootstrap host.
     report_host=$(sql "$i" "SELECT COALESCE(@@report_host,'');")
     gr_member_host=$(sql "$i" "SELECT COALESCE((SELECT MEMBER_HOST FROM performance_schema.replication_group_members WHERE MEMBER_ID='$(q "$uuid")' LIMIT 1),'');")
     gr_member_port=$(sql "$i" "SELECT COALESCE((SELECT MEMBER_PORT FROM performance_schema.replication_group_members WHERE MEMBER_ID='$(q "$uuid")' LIMIT 1),0);")
@@ -551,6 +550,7 @@ common_hosts_for_user(){
     done
     cat "$TMP/common_user_hosts"
 }
+
 password_policy_report(){
     i=$1
     log "Current validate_password policy on node $i:"
@@ -581,6 +581,7 @@ admin_account_presence_report(){
         log 'ERROR_CODE=PARTIAL_ADMIN_ACCOUNT_STATE'
     fi
 }
+
 rollback_created_admin_accounts(){
     u=$1; h=$2
     present_nodes=''
@@ -607,6 +608,7 @@ rollback_created_admin_accounts(){
     done
     log 'Rollback verification: newly created clusterAdmin account removed from all registered nodes.'
 }
+
 adminapi_bootstrap_exec(){
     i=$1; js=$2; out=$3
     detect_login_paths
@@ -643,6 +645,7 @@ adminapi_bootstrap_exec(){
         MYSQL_TEST_LOGIN_FILE="$lf" "$MYSQLSH" --login-path="$lp" --mysql --no-wizard --js -f "$js" >"$out" 2>&1
         return $?
     fi
+
     if [ "$(get "$i" auth_mode)" = password ]; then
         u=$(get "$i" user); h=$(get "$i" host); p=$(get "$i" port)
         cred "$i"
@@ -661,18 +664,22 @@ adminapi_bootstrap_exec(){
     log "ADMINAPI_BOOTSTRAP_AUTH=password NODE=$i ENDPOINT=$h:$p"
     cat "$pwfile" | "$MYSQLSH" --mysql --uri "$uri" --passwords-from-stdin --js -f "$js" >"$out" 2>&1
 }
+
 configure_admin(){ require_discovery_schema;
     [ -f "$ROOT/meta/complete" ] || die 'Run discover first'
     SUPPRESS_NEXT_STEP=yes sql_precheck
+    SUPPRESS_NEXT_STEP=no
     event_ack
     assert_identity
     metadata_absence_guard
+
     log 'Cluster admin preparation:'
     log '  create   : create a dedicated AdminAPI account using dba.configureInstance(clusterAdmin=...).'
     log '             MySQL Shell grants only the privileges required for InnoDB Cluster administration for this version.'
     log '  existing : reuse an existing account. The script validates it and never broadens privileges automatically.'
     show_existing_admin_candidates
     prompt_block 'Cluster admin account action' 'Choose whether to create a dedicated AdminAPI account or reuse an identical existing account.' 'create | existing' 'create'; action=$(choice 'Select cluster admin action' create create existing)
+
     au=$(ask_explained 'Cluster admin account name' 'Dedicated MySQL account used by MySQL Shell AdminAPI.' 'icadmin | <ADMIN_USER>' 'Cluster admin user name' 'icadmin')
     case $au in ''|*[!A-Za-z0-9_.-]*) die 'Invalid cluster admin user';; esac
     common_hosts=$(common_hosts_for_user "$au")
@@ -700,6 +707,7 @@ configure_admin(){ require_discovery_schema;
     ap=$(secret_explained 'Cluster admin password' 'Password for the dedicated AdminAPI account; it must satisfy the active MySQL password policy.' 'Cluster admin password')
     [ -n "$ap" ] || die 'Cluster admin password cannot be empty'
     printf '%s\n' "$ap" > "$TMP/admin.pw"; chmod 600 "$TMP/admin.pw"
+
     case $action in
         create)
             existing_nodes=''
@@ -833,6 +841,7 @@ EOF
             return 0
             ;;
     esac
+
     put meta admin_user "$au"; put meta admin_host_pattern "$ah"; : > "$ROOT/meta/admin_configured"
     unset ap
     log 'ADMIN_CONFIGURED=OK'
@@ -859,6 +868,7 @@ gr_writeability_guard(){
         esac
     done
 }
+
 state_snapshot(){
     tag=$1
     mkdir -p "$ROOT/snapshots/$tag"
@@ -871,6 +881,7 @@ state_snapshot(){
     done
     grmembers 1 > "$ROOT/snapshots/$tag/gr_members.tsv"
 }
+
 snapshot_critical_equal(){
     before=$1; after=$2
     for i in $(ids); do
@@ -887,6 +898,7 @@ snapshot_critical_equal(){
         die 'Group Replication membership/roles changed during administrative preparation.'
     }
 }
+
 gtid_convergence_guard(){
     baseline=$(gtids 1)
     for i in $(ids); do
@@ -908,6 +920,7 @@ gtid_convergence_guard(){
     done
     die 'GTID convergence/errant-GTID check did not stabilize. Quiesce writes or inspect GTID sets; this script never resets or rewrites GTIDs.'
 }
+
 strict_exact_gtid_guard(){
     ref=$(gtids 1)
     for i in $(ids); do
@@ -917,6 +930,7 @@ strict_exact_gtid_guard(){
         [ "$a" = 1 ] && [ "$b" = 1 ] || die "Node $i GTID set is not exactly equal to node 1. Strict validation requires application writes to be quiesced."
     done
 }
+
 all_node_gr_consistency_guard(){
     ref="$TMP/gr_ref.tsv"
     grmembers 1 > "$ref"
@@ -929,6 +943,7 @@ all_node_gr_consistency_guard(){
         [ "$(gr_mode "$i")" = "$ref_mode" ] || die "Node $i primary mode differs from node 1"
     done
 }
+
 identity_uniqueness_guard(){
     : > "$TMP/uuids"; : > "$TMP/server_ids"; : > "$TMP/endpoints"
     for i in $(ids); do
@@ -940,6 +955,7 @@ identity_uniqueness_guard(){
     [ "$(sort "$TMP/server_ids" | uniq | wc -l | tr -d ' ')" = "$(get meta count)" ] || die 'Duplicate server_id detected among registered members'
     [ "$(sort "$TMP/endpoints" | uniq | wc -l | tr -d ' ')" = "$(get meta count)" ] || die 'Duplicate AdminAPI host:port endpoint detected among registered members'
 }
+
 cross_node_variable_guard(){
     ref_lctn=$(sql 1 'SELECT @@GLOBAL.lower_case_table_names;')
     ref_dte=$(sql 1 'SELECT @@GLOBAL.default_table_encryption;')
@@ -955,31 +971,52 @@ cross_node_variable_guard(){
         [ -z "$euc" ] || [ "$euc" = "$expected" ] || die "Node $i group_replication_enforce_update_everywhere_checks=$euc but $expected is expected for $(get meta gr_mode)."
     done
 }
+
 writeability_persistence_check(){
     for i in $(ids); do
         pv="$ROOT/node_${i}.read_only.persisted.tsv"
         vi="$ROOT/node_${i}.read_only.variables_info.tsv"
         sql "$i" "SELECT VARIABLE_NAME,VARIABLE_VALUE FROM performance_schema.persisted_variables WHERE VARIABLE_NAME IN ('read_only','super_read_only') ORDER BY VARIABLE_NAME;" > "$pv"
         sql "$i" "SELECT VARIABLE_NAME,VARIABLE_SOURCE,COALESCE(VARIABLE_PATH,''),COALESCE(CAST(SET_TIME AS CHAR),''),COALESCE(SET_USER,''),COALESCE(SET_HOST,'') FROM performance_schema.variables_info WHERE VARIABLE_NAME IN ('read_only','super_read_only') ORDER BY VARIABLE_NAME;" > "$vi"
-        if [ -s "$pv" ]; then
+
+        pro=$(awk -F '\t' '$1=="read_only"{print $2; exit}' "$pv")
+        if [ -n "$pro" ]; then
             cat "$pv" >&2
-            die "Node $i has persisted read_only/super_read_only override(s). Remove/review them before InnoDB Cluster migration; the script never RESET PERSIST automatically."
+            die "ERROR_CODE=PERSISTED_READ_ONLY_OVERRIDE NODE=$i VALUE=$pro. Persisted read_only is not managed automatically by this migration; review/remove it explicitly before relying on role-based writeability."
         fi
-        bad=$(awk -F '\t' '$2 != "DYNAMIC" && $2 != "COMPILED" {print}' "$vi")
-        if [ -n "$bad" ]; then
-            printf '%s\n' "$bad" >&2
-            die "Node $i read_only/super_read_only is sourced from startup/static configuration and can override AdminAPI role-based writeability after restart."
+
+        psro=$(awk -F '\t' '$1=="super_read_only"{print $2; exit}' "$pv")
+        if [ -n "$psro" ]; then
+            case $(printf '%s' "$psro" | tr '[:lower:]' '[:upper:]') in
+                ON|1)
+                    log "Node $i startup safeguard accepted: persisted super_read_only=ON. Group Replication/AdminAPI runtime role state remains authoritative while ONLINE."
+                    ;;
+                *)
+                    cat "$pv" >&2
+                    die "ERROR_CODE=PERSISTED_SUPER_READ_ONLY_UNSAFE NODE=$i VALUE=$psro. Only persisted super_read_only=ON is accepted as a startup write-protection safeguard."
+                    ;;
+            esac
+        fi
+
+        bad_ro=$(awk -F '\t' '$1=="read_only" && $2 != "DYNAMIC" && $2 != "COMPILED" {print}' "$vi")
+        if [ -n "$bad_ro" ]; then
+            printf '%s\n' "$bad_ro" >&2
+            die "ERROR_CODE=STATIC_READ_ONLY_OVERRIDE NODE=$i. read_only is sourced from startup/static configuration and can conflict with role-based writeability."
         fi
     done
 }
+
 multi_primary_schema_guard(){
     [ "$(get meta gr_mode)" = multi-primary ] || return 0
     iso=$(sql 1 'SELECT @@GLOBAL.transaction_isolation;')
     log "MULTI_PRIMARY_TRANSACTION_ISOLATION=$iso"
-    out="$ROOT/multi_primary_cascade_fk.tsv"
-    sql 1 "SELECT CONSTRAINT_SCHEMA,TABLE_NAME,CONSTRAINT_NAME,REFERENCED_TABLE_NAME,UPDATE_RULE,DELETE_RULE FROM information_schema.REFERENTIAL_CONSTRAINTS WHERE CONSTRAINT_SCHEMA NOT IN ('mysql','sys','performance_schema','information_schema') AND (UPDATE_RULE='CASCADE' OR DELETE_RULE='CASCADE') ORDER BY CONSTRAINT_SCHEMA,TABLE_NAME,CONSTRAINT_NAME;" > "$out"
-    [ ! -s "$out" ] || { cat "$out" >&2; die 'ERROR_CODE=MULTI_PRIMARY_CASCADE_FK_DETECTED'; }
+    for i in 1; do
+        out="$ROOT/multi_primary_cascade_fk.tsv"
+        sql "$i" "SELECT CONSTRAINT_SCHEMA,TABLE_NAME,CONSTRAINT_NAME,REFERENCED_TABLE_NAME,UPDATE_RULE,DELETE_RULE FROM information_schema.REFERENTIAL_CONSTRAINTS WHERE CONSTRAINT_SCHEMA NOT IN ('mysql','sys','performance_schema','information_schema') AND (UPDATE_RULE='CASCADE' OR DELETE_RULE='CASCADE') ORDER BY CONSTRAINT_SCHEMA,TABLE_NAME,CONSTRAINT_NAME;" > "$out"
+        [ ! -s "$out" ] || { cat "$out" >&2; die 'ERROR_CODE=MULTI_PRIMARY_CASCADE_FK_DETECTED'; }
+    done
 }
+
 event_precheck(){
     mode=$(get meta gr_mode)
     [ "$mode" != none ] || mode=single-primary
@@ -1097,10 +1134,151 @@ add_recovery_method(){
 configure(){ require_discovery_schema; [ -f "$ROOT/meta/prechecked" ] || die 'Run precheck first'; assert_identity; log 'CONFIGURE_RESTART=false'; confirm CONFIGURE-INSTANCES; for i in $(ids); do out="$ROOT/node_${i}.configure.txt"; mysqlsh_admin_exec "$i" 'dba.configureInstance(undefined,{restart:false});' "$out" || { cat "$out" >&2; die "ERROR_CODE=CONFIGURE_INSTANCE_FAILED NODE=$i"; }; done; : > "$ROOT/meta/configured"; log 'CONFIGURE_INSTANCE=OK'; next_step precheck; }
 cluster_name(){ n=$(ask_explained 'InnoDB Cluster name' 'Logical name stored in InnoDB Cluster metadata.' '<CLUSTER_NAME>' 'InnoDB Cluster name' ''); case $n in ''|*[!A-Za-z0-9_.-]*) die 'Cluster name may contain only alphanumeric, _, . and -';; esac; [ "${#n}" -le 63 ] || die 'Cluster name exceeds 63 characters'; printf '%s' "$n"; }
 create(){ require_discovery_schema; [ "$(get meta gr_state)" = none ] || die "ERROR_CODE=CREATE_REQUIRES_NO_GR CURRENT=$(get meta gr_state)"; mutation_safety_gate; meta_exists 1 && die 'InnoDB Cluster metadata already exists'; total=$(grmembers 1 | awk 'NF{n++} END{print n+0}'); [ "$total" -eq 0 ] || die 'Seed belongs to Group Replication. Use adopt; create never performs implicit adoption.'; name=$(cluster_name); opts=$(create_options); log "Will create new InnoDB Cluster '$name' using node 1 as seed."; log "Selected options: ${opts:-AdminAPI defaults}"; log 'No force:true option is ever used.'; confirm "CREATE-$name"; if [ -n "$opts" ]; then code="var c=dba.createCluster(\"$(jsq "$name")\", {$opts}); print('IC_CREATED='+c.name);"; else code="var c=dba.createCluster(\"$(jsq "$name")\"); print('IC_CREATED='+c.name);"; fi; out="$ROOT/create.txt"; mysqlsh_admin_exec 1 "$code" "$out" || { cat "$out" >&2; die 'createCluster failed'; }; put meta cluster_name "$name"; : > "$ROOT/meta/created"; n=2; while [ "$n" -le "$(get meta count)" ]; do method=$(add_recovery_method); log "About to add node $n using recoveryMethod=$method. Existing data on the target can be replaced if clone is selected."; if [ "$method" = clone ]; then log "WARNING: clone replaces the recipient dataset on node $n."; confirm "CLONE-WILL-REPLACE-NODE-$n"; fi; confirm "ADD-NODE-$n"; uri="$(get meta admin_user)@$(admin_host_for "$n"):$(admin_port_for "$n")"; addopts=''; [ "$method" = __omit__ ] || addopts="recoveryMethod:\"$method\""; if has_add_option localAddress; then log "Node $n localAddress is its internal Group Replication communication endpoint."; la=$(ask_explained "Node $n Group Replication localAddress" 'Internal host:port endpoint used by this member for Group Replication communication.' '<HOSTNAME>:<PORT> | <IP_ADDRESS>:<PORT>' "Node $n localAddress (blank = AdminAPI default)" ''); [ -z "$la" ] || { [ -z "$addopts" ] || addopts="$addopts, "; addopts="$addopts localAddress:\"$(jsq "$la")\""; }; fi; if [ -n "$addopts" ]; then code="var c=dba.getCluster(\"$(jsq "$name")\"); c.addInstance(\"$(jsq "$uri")\", {$addopts}); print(JSON.stringify(c.status({extended:1})));"; else code="var c=dba.getCluster(\"$(jsq "$name")\"); c.addInstance(\"$(jsq "$uri")\"); print(JSON.stringify(c.status({extended:1})));"; fi; mysqlsh_admin_exec 1 "$code" "$ROOT/add_${n}.txt" || { cat "$ROOT/add_${n}.txt" >&2; die "addInstance failed for node $n"; }; n=$((n+1)); done; validate; }
-adopt(){ require_discovery_schema; [ "$(get meta gr_state)" = online ] || die "ERROR_CODE=ADOPT_REQUIRES_ONLINE_GR CURRENT=$(get meta gr_state)"; mutation_safety_gate; meta_exists 1 && die 'InnoDB Cluster metadata already exists; refusing to overwrite/adopt again'; members=$(grmembers 1); total=$(printf '%s\n' "$members" | awk 'NF{n++} END{print n+0}'); online=$(printf '%s\n' "$members" | awk '$4=="ONLINE"{n++} END{print n+0}'); [ "$total" -ge 3 ] || die 'ERROR_CODE=GR_MEMBER_COUNT_LT_3'; [ "$online" -eq "$total" ] || die 'All GR members must be ONLINE before adoption'; [ "$total" -eq "$(get meta count)" ] || die 'Registered instances do not exactly match GR membership';
-for i in $(ids); do grep -q "^$(get "$i" uuid)[[:space:]]" "$ROOT/gr_members.before" || die "Node $i UUID was not in prechecked GR membership"; done
+
+adopt(){ require_discovery_schema; [ "$(get meta gr_state)" = online ] || die "ERROR_CODE=ADOPT_REQUIRES_ONLINE_GR CURRENT=$(get meta gr_state)"; mutation_safety_gate; meta_exists 1 && die 'InnoDB Cluster metadata already exists; refusing to overwrite/adopt again'; members=$(grmembers 1); total=$(printf '%s\n' "$members" | awk 'NF{n++} END{print n+0}'); online=$(printf '%s\n' "$members" | awk '$4=="ONLINE"{n++} END{print n+0}'); [ "$total" -ge 3 ] || die 'ERROR_CODE=GR_MEMBER_COUNT_LT_3'; [ "$online" -eq "$total" ] || die 'All GR members must be ONLINE before adoption'; [ "$total" -eq "$(get meta count)" ] || die 'Registered instances do not exactly match GR membership'; for i in $(ids); do grep -q "^$(get "$i" uuid)[[:space:]]" "$ROOT/gr_members.before" || die "Node $i UUID was not in prechecked GR membership"; done
 name=$(cluster_name); mode=$(gr_role_guard 1); [ "$mode" = "$(get meta gr_mode)" ] || die 'GR topology mode changed after precheck; rerun discover/precheck with a new work root.'; log "Will adopt existing $mode GR ($total ONLINE members) as InnoDB Cluster '$name'."; log 'The existing single-primary/multi-primary mode will be preserved. This script does not switch topology during adoption.'; log 'This creates InnoDB Cluster metadata and transfers management responsibility to AdminAPI; it does not rebuild the GR group.'; confirm "ADOPT-$name"; code="var c=dba.createCluster(\"$(jsq "$name")\", {adoptFromGR:true}); print('IC_ADOPTED='+c.name); print(JSON.stringify(c.status({extended:1})));"; out="$ROOT/adopt.txt"; mysqlsh_admin_exec 1 "$code" "$out" || { cat "$out" >&2; die 'adoptFromGR failed'; }; post_mode=$(gr_role_guard 1); [ "$post_mode" = "$mode" ] || die "URGENT: GR mode changed during adoption ($mode -> $post_mode); stop and inspect before any further action"; all_node_gr_consistency_guard; gtid_convergence_guard; state_snapshot post_adopt; cmp "$ROOT/snapshots/pre_mutation/gr_members.tsv" "$ROOT/snapshots/post_adopt/gr_members.tsv" >/dev/null 2>&1 || { diff -u "$ROOT/snapshots/pre_mutation/gr_members.tsv" "$ROOT/snapshots/post_adopt/gr_members.tsv" >&2 || :; die 'URGENT: GR membership/roles changed during adoption'; }; put meta cluster_name "$name"; put meta adopted_gr_mode "$mode"; : > "$ROOT/meta/adopted"; log "Adoption completed with topology preserved ($mode). Evidence: $out"; validate; }
-validate(){ require_discovery_schema; [ -f "$ROOT/meta/complete" ] || die 'Run discover first'; assert_identity; meta_exists 1 || die 'mysql_innodb_cluster_metadata is absent'; writeability_persistence_check; name=''; [ ! -f "$ROOT/meta/cluster_name" ] || name=$(get meta cluster_name); code='var c=dba.getCluster(); print("IC_CLUSTER_NAME="+c.name); print("IC_STATUS="+JSON.stringify(c.status({extended:2}))); print("IC_DESCRIBE="+JSON.stringify(c.describe()));'; out="$ROOT/validate.txt"; mysqlsh_admin_exec 1 "$code" "$out" || { cat "$out" >&2; die 'dba.getCluster/status failed'; }; members=$(grmembers 1); printf '%s\n' "$members" > "$ROOT/gr_members.after"; total=$(printf '%s\n' "$members" | awk 'NF{n++} END{print n+0}'); online=$(printf '%s\n' "$members" | awk '$4=="ONLINE"{n++} END{print n+0}'); [ "$online" -eq "$total" ] || die "Cluster GR members not fully ONLINE ($online/$total)"; [ "$total" -eq "$(get meta count)" ] || die 'ERROR_CODE=CLUSTER_MEMBER_COUNT_CHANGED'; primary=$(printf '%s\n' "$members" | awk '$5=="PRIMARY"{n++} END{print n+0}'); mode=$(gr_role_guard 1); all_node_gr_consistency_guard; gtid_convergence_guard; gr_writeability_guard; if [ -f "$ROOT/meta/adopted_gr_mode" ]; then [ "$mode" = "$(get meta adopted_gr_mode)" ] || die "ERROR_CODE=ADOPTED_GR_MODE_CHANGED BEFORE=$(get meta adopted_gr_mode) AFTER=$mode"; fi; for i in $(ids); do gtids "$i" > "$ROOT/node_${i}.gtid.after"; done; : > "$ROOT/meta/validated"; log "VALIDATION PASSED: metadata present, $online/$total ONLINE, mode=$mode primary_count=$primary. Evidence: $ROOT"; next_step status; }
+final_operational_validation(){
+    members=$1; total=$2; online=$3; mode=$4; primary_count=$5
+    report="$ROOT/final_validation.txt"
+    admin_out="$ROOT/final_adminapi.txt"
+    code='var c=dba.getCluster(); var s=c.status({extended:2}); var d=c.describe(); var o=c.options({all:true}); var r=c.listRouters(); var t=s.defaultReplicaSet.topology||{}; var ie=0; Object.keys(t).forEach(function(k){if(t[k].instanceErrors){ie+=t[k].instanceErrors.length;} println("IC_TOPOLOGY="+k+"\t"+(t[k].memberRole||"")+"\t"+(t[k].memberState||t[k].status||"")+"\t"+(t[k].mode||""));}); var rc=0; if(r){if(r.routers){rc=Object.keys(r.routers).length;}else{rc=Object.keys(r).length;}} println("IC_CLUSTER_NAME="+c.name); println("IC_CLUSTER_STATUS="+s.defaultReplicaSet.status); println("IC_STATUS_TEXT="+s.defaultReplicaSet.statusText); println("IC_PRIMARY="+s.defaultReplicaSet.primary); println("IC_TOPOLOGY_MODE="+s.defaultReplicaSet.topologyMode); println("IC_INSTANCE_ERRORS="+ie); println("IC_DESCRIBE_ENDPOINTS="+(d.defaultReplicaSet.topology||[]).map(function(x){return x.address;}).sort().join(",")); println("IC_ROUTER_COUNT="+rc); println("IC_ROUTERS="+JSON.stringify(r)); println("IC_OPTIONS="+JSON.stringify(o));'
+    mysqlsh_admin_exec 1 "$code" "$admin_out" || { cat "$admin_out" >&2; die 'ERROR_CODE=FINAL_ADMINAPI_VALIDATION_FAILED'; }
+
+    cluster_name=$(sed -n 's/^IC_CLUSTER_NAME=//p' "$admin_out" | tail -1)
+    cluster_status=$(sed -n 's/^IC_CLUSTER_STATUS=//p' "$admin_out" | tail -1)
+    primary_ep=$(sed -n 's/^IC_PRIMARY=//p' "$admin_out" | tail -1)
+    topology_mode=$(sed -n 's/^IC_TOPOLOGY_MODE=//p' "$admin_out" | tail -1)
+    instance_errors=$(sed -n 's/^IC_INSTANCE_ERRORS=//p' "$admin_out" | tail -1)
+    describe_eps=$(sed -n 's/^IC_DESCRIBE_ENDPOINTS=//p' "$admin_out" | tail -1)
+    router_count=$(sed -n 's/^IC_ROUTER_COUNT=//p' "$admin_out" | tail -1)
+    adminapi_topology="$ROOT/cluster_status_topology.tsv"
+    sed -n 's/^IC_TOPOLOGY=//p' "$admin_out" > "$adminapi_topology"
+    case $instance_errors in ''|*[!0-9]*) instance_errors=unknown;; esac
+    case $router_count in ''|*[!0-9]*) router_count=unknown;; esac
+
+    gr_eps=$(printf '%s\n' "$members" | awk 'NF{print $2":"$3}' | sort | paste -sd, -)
+    if [ "$describe_eps" = "$gr_eps" ]; then drift='MATCH'; drift_result='PASS'; else drift='MISMATCH'; drift_result='FAIL'; fi
+
+    member_runtime="$ROOT/member_runtime_state.tsv"
+    : > "$member_runtime"
+    for i in $(ids); do
+        u=$(get "$i" uuid)
+        row=$(printf '%s\n' "$members" | awk -v u="$u" '$1==u{print; exit}')
+        mh=$(printf '%s\n' "$row" | awk '{print $2}'); mp=$(printf '%s\n' "$row" | awk '{print $3}')
+        ms=$(printf '%s\n' "$row" | awk '{print $4}'); mr=$(printf '%s\n' "$row" | awk '{print $5}')
+        ro=$(sql "$i" 'SELECT @@GLOBAL.read_only;'); sro=$(sql "$i" 'SELECT @@GLOBAL.super_read_only;')
+        if [ "$ro" = 0 ] && [ "$sro" = 0 ]; then rwmode='R/W'; elif [ "$sro" = 1 ]; then rwmode='R/O'; else rwmode='CHECK'; fi
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$mh" "$mp" "$ms" "$mr" "$rwmode" "$ro" "$sro" >> "$member_runtime"
+    done
+
+    queue_file="$ROOT/gr_queue_conflict_snapshot.tsv"
+    sql 1 "SELECT m.MEMBER_HOST,m.MEMBER_PORT,m.MEMBER_STATE,m.MEMBER_ROLE,s.COUNT_TRANSACTIONS_IN_QUEUE,s.COUNT_TRANSACTIONS_REMOTE_IN_APPLIER_QUEUE,s.COUNT_TRANSACTIONS_CHECKED,s.COUNT_CONFLICTS_DETECTED,s.COUNT_TRANSACTIONS_ROWS_VALIDATING,s.COUNT_TRANSACTIONS_LOCAL_PROPOSED,s.COUNT_TRANSACTIONS_LOCAL_ROLLBACK,s.COUNT_TRANSACTIONS_REMOTE_APPLIED,COALESCE(s.LAST_CONFLICT_FREE_TRANSACTION,'') FROM performance_schema.replication_group_members m JOIN performance_schema.replication_group_member_stats s ON m.MEMBER_ID=s.MEMBER_ID ORDER BY m.MEMBER_HOST,m.MEMBER_PORT;" > "$queue_file"
+    cert_queue=$(awk -F '\t' '{s+=$5} END{print s+0}' "$queue_file")
+    apply_queue=$(awk -F '\t' '{s+=$6} END{print s+0}' "$queue_file")
+    conflicts=$(awk -F '\t' '{s+=$8} END{print s+0}' "$queue_file")
+    if [ "$cert_queue" -eq 0 ] && [ "$apply_queue" -eq 0 ]; then queue_result='PASS(snapshot)'; else queue_result='WARN(snapshot)'; fi
+    if [ "$conflicts" -eq 0 ]; then conflict_result='PASS(snapshot)'; else conflict_result='WARN(cumulative)'; fi
+
+    error_total=0; error_unavailable=''
+    for i in $(ids); do
+        ef="$ROOT/node_${i}.recent_gr_error_log.tsv"
+        if sql "$i" "SELECT LOGGED,PRIO,ERROR_CODE,SUBSYSTEM,DATA FROM performance_schema.error_log WHERE LOGGED >= NOW() - INTERVAL 24 HOUR AND PRIO IN ('Error','Warning') AND (LOWER(DATA) LIKE '%group replication%' OR LOWER(DATA) LIKE '%group_replication%' OR LOWER(DATA) LIKE '%distributed recovery%' OR LOWER(DATA) LIKE '%rejoin%' OR LOWER(DATA) LIKE '%expel%' OR LOWER(DATA) LIKE '%quorum%') ORDER BY LOGGED DESC;" > "$ef" 2>/dev/null; then
+            ec=$(awk 'END{print NR+0}' "$ef"); error_total=$((error_total+ec))
+        else
+            error_unavailable="${error_unavailable}${error_unavailable:+ }$i"
+            : > "$ef"
+        fi
+    done
+    if [ -n "$error_unavailable" ]; then error_result="CHECK(unavailable nodes:$error_unavailable)"; elif [ "$error_total" -eq 0 ]; then error_result='PASS(24h snapshot)'; else error_result="WARN(24h matches:$error_total)"; fi
+
+    if [ "$router_count" = unknown ]; then router_result='CHECK'; router_endpoint='NOT_TESTED';
+    elif [ "$router_count" -eq 0 ]; then router_result='N/A(no registered Router)'; router_endpoint='N/A';
+    else router_result="PASS(registered:$router_count)"; router_endpoint='EXTERNAL_CHECK_REQUIRED'; fi
+
+    if [ "$cluster_status" = OK ]; then cluster_result='PASS'; else cluster_result='FAIL'; fi
+    if [ "$online" -eq "$total" ]; then member_result='PASS'; else member_result='FAIL'; fi
+    if [ "$mode" = single-primary ] && [ "$primary_count" -eq 1 ]; then role_result='PASS'; elif [ "$mode" = multi-primary ] && [ "$primary_count" -eq "$total" ]; then role_result='PASS'; else role_result='FAIL'; fi
+    if [ "$instance_errors" = 0 ]; then instance_result='PASS'; elif [ "$instance_errors" = unknown ]; then instance_result='CHECK'; else instance_result='FAIL'; fi
+
+    final='PASS'
+    case "$cluster_result:$member_result:$role_result:$drift_result:$instance_result" in *FAIL*) final='FAIL';; *CHECK*) final='PASS_WITH_CHECKS';; esac
+    case "$queue_result:$conflict_result:$error_result:$router_result:$router_endpoint" in *WARN*|*CHECK*|*EXTERNAL_CHECK_REQUIRED*) [ "$final" = PASS ] && final='PASS_WITH_WARNINGS';; esac
+
+    {
+        printf '%s\n' '========================================================'
+        printf '%s\n' ' InnoDB Cluster validation (script-generated report)'
+        printf '%s\n' '========================================================'
+        printf '\nCluster.status({extended:2})\n'
+        printf '  clusterName                         : %s\n' "$cluster_name"
+        printf '  defaultReplicaSet.status            : %s [SCRIPT_CHECK=%s]\n' "$cluster_status" "$cluster_result"
+        printf '  defaultReplicaSet.topologyMode      : %s [SCRIPT_CHECK=%s]\n' "$topology_mode" "$role_result"
+        printf '  defaultReplicaSet.primary           : %s\n' "$primary_ep"
+        printf '  instanceErrors                      : %s [SCRIPT_CHECK=%s]\n' "$instance_errors" "$instance_result"
+        printf '\nCluster.status({extended:2}).defaultReplicaSet.topology\n'
+        printf '  address                         memberRole   memberState  mode\n'
+        awk -F '\t' '{printf "  %-31s %-12s %-12s %s\n",$1,$2,$3,$4}' "$adminapi_topology"
+        printf '\nperformance_schema.replication_group_members / system variables\n'
+        printf '  MEMBER_HOST:MEMBER_PORT          MEMBER_ROLE  MEMBER_STATE  @@GLOBAL.read_only  @@GLOBAL.super_read_only\n'
+        awk -F '\t' '{printf "  %-21s:%-5s %-12s %-13s %-20s %s\n",$1,$2,$4,$3,$6,$7}' "$member_runtime"
+        printf '  MEMBER_STATE=ONLINE              : %s/%s [SCRIPT_CHECK=%s]\n' "$online" "$total" "$member_result"
+        printf '\nperformance_schema.replication_group_member_stats\n'
+        printf '  COUNT_TRANSACTIONS_IN_QUEUE                  : %s [SCRIPT_CHECK=%s]\n' "$cert_queue" "$queue_result"
+        printf '  COUNT_TRANSACTIONS_REMOTE_IN_APPLIER_QUEUE   : %s [SCRIPT_CHECK=%s]\n' "$apply_queue" "$queue_result"
+        printf '  COUNT_CONFLICTS_DETECTED                     : %s [SCRIPT_CHECK=%s]\n' "$conflicts" "$conflict_result"
+        printf '\nGTID functions / variables\n'
+        printf '  @@GLOBAL.gtid_executed with GTID_SUBSET() bidirectional comparison : EQUAL [SCRIPT_CHECK=PASS]\n'
+        printf '\nCluster.describe() / performance_schema.replication_group_members\n'
+        printf '  defaultReplicaSet.topology addresses vs MEMBER_HOST:MEMBER_PORT : %s [SCRIPT_CHECK=%s]\n' "$drift" "$drift_result"
+        printf '\nCluster.options({all:true})\n'
+        printf '  captured output                      : %s\n' "$ROOT/final_adminapi.txt"
+        printf '\nCluster.listRouters()\n'
+        printf '  routers                              : %s [SCRIPT_CHECK=%s]\n' "$router_count" "$router_result"
+        printf '  SCRIPT_CHECK_ROUTING_TO_defaultReplicaSet.primary : %s\n' "$router_endpoint"
+        printf '\nperformance_schema.error_log\n'
+        printf '  SCRIPT_FILTER_MATCHES(last 24h)      : %s\n' "$error_result"
+        printf '\n--------------------------------------------------------\n'
+        printf 'SCRIPT_RESULT                          : %s\n' "$final"
+        printf '%s\n' '--------------------------------------------------------'
+        printf 'SCRIPT_EVIDENCE_DIRECTORY              : %s\n' "$ROOT"
+        printf 'SCRIPT_NOTE                            : replication_group_member_stats values are point-in-time/cumulative observations; trend evaluation is an operational check.\n'
+        [ "$router_endpoint" != EXTERNAL_CHECK_REQUIRED ] || printf 'SCRIPT_NOTE                            : verify MySQL Router application routing to defaultReplicaSet.primary=%s.\n' "$primary_ep"
+    } > "$report"
+    cat "$report" >&2
+
+    [ "$cluster_result" = PASS ] || die "ERROR_CODE=CLUSTER_STATUS_NOT_OK STATUS=$cluster_status"
+    [ "$member_result" = PASS ] || die 'ERROR_CODE=FINAL_MEMBER_STATE_FAILED'
+    [ "$role_result" = PASS ] || die 'ERROR_CODE=FINAL_ROLE_VALIDATION_FAILED'
+    [ "$drift_result" = PASS ] || die 'ERROR_CODE=METADATA_GR_TOPOLOGY_DRIFT'
+    [ "$instance_result" != FAIL ] || die "ERROR_CODE=INSTANCE_ERRORS_PRESENT COUNT=$instance_errors"
+}
+
+validate(){
+    require_discovery_schema
+    [ -f "$ROOT/meta/complete" ] || die 'Run discover first'
+    assert_identity
+    meta_exists 1 || die 'mysql_innodb_cluster_metadata is absent'
+    writeability_persistence_check
+    name=''; [ ! -f "$ROOT/meta/cluster_name" ] || name=$(get meta cluster_name)
+    code='var c=dba.getCluster(); print("IC_CLUSTER_NAME="+c.name); print("IC_STATUS="+JSON.stringify(c.status({extended:2}))); print("IC_DESCRIBE="+JSON.stringify(c.describe()));'
+    out="$ROOT/validate.txt"
+    mysqlsh_admin_exec 1 "$code" "$out" || { cat "$out" >&2; die 'dba.getCluster/status failed'; }
+    members=$(grmembers 1); printf '%s\n' "$members" > "$ROOT/gr_members.after"
+    total=$(printf '%s\n' "$members" | awk 'NF{n++} END{print n+0}')
+    online=$(printf '%s\n' "$members" | awk '$4=="ONLINE"{n++} END{print n+0}')
+    [ "$online" -eq "$total" ] || die "Cluster GR members not fully ONLINE ($online/$total)"
+    [ "$total" -eq "$(get meta count)" ] || die 'ERROR_CODE=CLUSTER_MEMBER_COUNT_CHANGED'
+    primary=$(printf '%s\n' "$members" | awk '$5=="PRIMARY"{n++} END{print n+0}')
+    mode=$(gr_role_guard 1)
+    all_node_gr_consistency_guard
+    gtid_convergence_guard
+    gr_writeability_guard
+    if [ -f "$ROOT/meta/adopted_gr_mode" ]; then [ "$mode" = "$(get meta adopted_gr_mode)" ] || die "ERROR_CODE=ADOPTED_GR_MODE_CHANGED BEFORE=$(get meta adopted_gr_mode) AFTER=$mode"; fi
+    for i in $(ids); do gtids "$i" > "$ROOT/node_${i}.gtid.after"; done
+    final_operational_validation "$members" "$total" "$online" "$mode" "$primary"
+    : > "$ROOT/meta/validated"
+    log "VALIDATION PASSED: metadata present, $online/$total ONLINE, mode=$mode primary_count=$primary. Evidence: $ROOT"
+    next_step status
+}
 status(){ require_discovery_schema; [ -f "$ROOT/meta/complete" ] || die 'Run discover first'; assert_identity; log '--- Group Replication members ---'; grmembers 1; if meta_exists 1; then out="$ROOT/status.txt"; mysqlsh_admin_exec 1 'var c=dba.getCluster(); print(JSON.stringify(c.status({extended:1}))); print(JSON.stringify(c.describe()));' "$out" || { cat "$out" >&2; return 1; }; cat "$out"; else log 'InnoDB Cluster metadata: ABSENT'; fi; }
 all(){ if [ ! -f "$ROOT/meta/complete" ]; then discover; fi; sql_precheck; if admin_ready; then precheck; else log 'ALL stopped: run configure-admin explicitly, then precheck. No account/configuration mutation is implicit.'; fi; }
 case $STEP in help|-h|--help) help;; discover) discover;; capabilities) show_capabilities;; sql-precheck) sql_precheck;; strict-gtid) require_discovery_schema; [ -f "$ROOT/meta/complete" ] || die 'Run discover first'; assert_identity; strict_exact_gtid_guard; log 'STRICT GTID CHECK PASSED';; gr-restart-precheck) gr_restart_precheck;; configure-admin) configure_admin;; precheck) precheck;; configure) configure;; plan) plan;; create) create;; adopt) adopt;; validate) validate;; status) status;; all) all;; *) help; die "Unknown command: $STEP";; esac
