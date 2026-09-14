@@ -236,10 +236,10 @@ detect_login_paths(){
                 /^\[/ { if (hit) exit; hit=($0==target); next }
                 hit { print }
             ' "$dump" > "$block"
-            cfg_user=$(awk -F '=' '/^[[:space:]]*user[[:space:]]*=/ {gsub(/^[[:space:"]+|[[:space:"]+$/,"",$2); print $2; exit}' "$block")
-            cfg_host=$(awk -F '=' '/^[[:space:]]*host[[:space:]]*=/ {gsub(/^[[:space:"]+|[[:space:"]+$/,"",$2); print $2; exit}' "$block")
+            cfg_user=$(awk -F '=' '/^[[:space:]]*user[[:space:]]*=/ {gsub(/^[[:space:]\"]+|[[:space:]\"]+$/,"",$2); print $2; exit}' "$block")
+            cfg_host=$(awk -F '=' '/^[[:space:]]*host[[:space:]]*=/ {gsub(/^[[:space:]\"]+|[[:space:]\"]+$/,"",$2); print $2; exit}' "$block")
             cfg_port=$(awk -F '=' '/^[[:space:]]*port[[:space:]]*=/ {gsub(/^[[:space:]]+|[[:space:]]+$/,"",$2); print $2; exit}' "$block")
-            cfg_socket=$(awk -F '=' '/^[[:space:]]*socket[[:space:]]*=/ {gsub(/^[[:space:"]+|[[:space:"]+$/,"",$2); print $2; exit}' "$block")
+            cfg_socket=$(awk -F '=' '/^[[:space:]]*socket[[:space:]]*=/ {gsub(/^[[:space:]\"]+|[[:space:]\"]+$/,"",$2); print $2; exit}' "$block")
             rm -f "$block"
             if [ -n "$cfg_socket" ]; then transport=socket; elif [ -n "$cfg_host" ]; then transport=tcp; else transport=unknown; fi
             if MYSQL_TEST_LOGIN_FILE="$lf" "$MYSQL" --login-path="$lp" --batch --skip-column-names -e 'SELECT @@server_uuid,@@port,@@socket;' >/dev/null 2>&1; then
