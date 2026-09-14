@@ -1,55 +1,70 @@
 # MySQL Community RPM Bundle 설치 자동화
 
-`mysql_install_auto.sh`는 Oracle MySQL Community RPM Bundle을 기준으로 신규 MySQL 인스턴스 설치를 자동화하는 POSIX `/bin/sh` 스크립트다.
+`mysql_install_auto.sh`는 사용자가 미리 준비한 Oracle MySQL Community RPM Bundle(`*.rpm-bundle.tar`)을 이용해 신규 MySQL 인스턴스를 구성하는 POSIX `/bin/sh` 스크립트다.
 
-현재 스크립트 버전: **v1.0.11**
+현재 스크립트 버전: **v1.0.23**
 
-## 목적
+## 핵심 원칙
 
-- `bundle.tar` 내부 RPM 메타데이터 기반 대상 MySQL Version/Release/Architecture 자동 판별
-- 특정 Version, Port, Socket, Data Directory, option file, Service, OS 계정 하드코딩 최소화
-- 동일 서버 다중 인스턴스 및 별도 서버 환경 고려
-- 실제 변경 전 Precheck/Dry-run/Plan 출력
-- 기존 MySQL 인스턴스와의 충돌 사전 검증
-- Custom Path/Port 사용 시 SELinux 정책 적용 선택
-- 설치 실패 시 인스턴스 단위 Rollback
-- 설치 후 Service/PID/User/Binary/Port/Socket/Error Log/SELinux 검증
+- 인터넷 연결이 없는 폐쇄망(air-gapped) 환경을 기본 고려한다.
+- `dnf`, `yum`, `apt`, `curl`, `wget`, `pip`, `npm` 등을 호출해 외부 패키지나 Runtime을 설치하지 않는다.
+- Bundle 파일명에 Version을 하드코딩하지 않고 내부 RPM 메타데이터에서 Version/Release/Architecture/Vendor를 판별한다.
+- `my.cnf`, Instance Root, Data/Log/Socket/PID/`secure_file_priv` 경로는 사용자가 직접 지정한다.
+- 스크립트가 경로 네이밍 패턴을 추측하거나 강제하지 않는다.
+- 입력된 경로를 기반으로 독립 실행 가능한 전용 `my.cnf`를 자동 생성한다.
+- 동일 서버 다중 인스턴스와 서로 다른 MySQL Version 공존을 고려한다.
+- 기존 인스턴스와 기존 RPM 설치본을 임의 Upgrade/Downgrade하지 않는다.
+- SELinux는 비활성화하지 않으며, 정책 적용 여부는 사용자가 선택한다.
+- 기동 방식도 사용자가 선택한다.
 
 ## 지원 범위
 
 - Oracle MySQL Community RPM Bundle
 - RHEL 호환 EL RPM 환경
-- `systemd` 기반 서비스 관리
 - MySQL 8.x / 9.x
-- 동일 서버 복수 `mysqld` 환경
-- 별도 `my.cnf`, Data Directory, Log, Socket/PID Directory 구성
-- Classic Protocol 및 선택적 MySQL X Protocol
-- SELinux Enforcing/Permissive 환경
-- 외부 Repository 미사용 Local RPM 설치와 활성 OS Repository 사용 방식
+- x86_64 및 Bundle/Host RPM Architecture가 일치하는 환경
+- systemd 기반 Linux
+- 동일 서버 복수 `mysqld`
+- 동일 Version 추가 인스턴스
+- 다른 Version의 side-by-side 인스턴스
+- SELinux Enforcing / Permissive / Disabled
+- 폐쇄망 설치
 
-스크립트 자체는 Python, Node.js 등의 외부 Runtime을 요구하지 않는다.
+Ubuntu/Debian APT/DEB 설치는 현재 범위가 아니다.
 
-## 실행 조건
+## 실행 전 Host 요구사항
 
-- `root` 실행
-- `rpm`, `tar`, `systemctl` 사용 가능 상태
-- 실제 Package 설치 시 `dnf` 또는 `yum` 사용 가능 상태
-- SELinux 정책 적용 선택 시 `semanage`, `restorecon` 사용 가능 상태
-- Oracle MySQL Community RPM Bundle 사전 준비
+스크립트는 필요한 도구를 자동 설치하지 않는다. 필요한 항목이 없으면 경고 또는 Block 후 종료한다.
 
-예시 Bundle:
+기본:
 
 ```text
-mysql-8.0.46-1.el8.x86_64.rpm-bundle.tar
+/bin/sh
+rpm
+tar
+systemctl
 ```
 
-파일명에 Version이 포함되어 있을 필요는 없다. 실제 Version은 Bundle 내부 `mysql-community-server` RPM 메타데이터에서 판별한다.
+다른 MySQL Version을 기존 RPM과 공존시키는 side-by-side 모드:
+
+```text
+rpm2cpio
+cpio
+ldd
+```
+
+SELinux 정책 자동 적용 선택 시:
+
+```text
+semanage
+restorecon
+```
+
+이 도구들이 없더라도 스크립트가 Repository에 접속하거나 패키지를 설치하지 않는다.
 
 ## 실행 모드
 
-### 1. Precheck
-
-변경 없이 Bundle/Host/기존 Package/실행 중인 인스턴스 상태 확인.
+### Precheck
 
 ```sh
 sh mysql_install_auto.sh \
@@ -57,9 +72,9 @@ sh mysql_install_auto.sh \
   --precheck-only
 ```
 
-### 2. Dry-run
+Bundle/Host/Package/기존 인스턴스를 검사하고 변경하지 않는다.
 
-사용자 입력과 충돌 검증까지 수행하고 최종 `my.cnf` 및 systemd Plan 출력. 실제 Package/Config/Directory/SELinux/systemd 변경 없음.
+### Dry-run
 
 ```sh
 sh mysql_install_auto.sh \
@@ -67,64 +82,71 @@ sh mysql_install_auto.sh \
   --dry-run
 ```
 
-### 3. Install
+사용자 입력, 충돌 검사, 최종 `my.cnf`, systemd Unit 또는 direct-start command까지 출력하지만 실제 변경하지 않는다.
 
-최종 Plan 확인 후 사용자 승인 시 실제 설치 및 인스턴스 초기화 수행.
+### Install
 
 ```sh
 sh mysql_install_auto.sh \
   --bundle /path/mysql-8.0.xx-1.el8.x86_64.rpm-bundle.tar
 ```
 
-## 처리 흐름
+최종 Plan 확인과 사용자 승인 후 실제 설치한다.
 
-1. RPM Bundle 자동 탐지 또는 경로 입력
-2. Bundle 압축 해제 및 RPM 메타데이터 판별
-3. Version/Release/Architecture/Vendor 검증
-4. Host OS/Architecture 호환성 검증
-5. RPM Signature 검증
-6. 기존 MySQL/MariaDB/Percona Package 및 실행 프로세스 검증
-7. 기존 MySQL Package와 Bundle Version 비교
-8. 실행 중인 `mysqld`, TCP Port, Unix Socket 확인
-9. 기존/중지 systemd Unit의 `--defaults-file` 및 option file 확인
-10. 사용자 입력 수집
-11. Port/Socket/Path/Service/SELinux 충돌 검증
-12. Minimum 또는 Production Profile 선택
-13. 최종 설치 Plan 및 생성 예정 `my.cnf` 출력
-14. 사용자 승인
-15. Package 신규 설치 또는 동일 Version Package 재사용
-16. OS 계정 확인/선택적 생성
-17. Directory 및 option file 생성
-18. SELinux Context/Port Policy 선택적 적용
-19. `mysqld --validate-config` 기반 Config 검증
-20. `mysqld --initialize` 기반 Data Directory 초기화
-21. 전용 systemd Unit 생성 및 기동
-22. Service/PID/User/Binary/Port/Socket/Error Log/SELinux 사후 검증
+## Package 처리 모드
 
-## 주요 사용자 입력
+### 1. Fresh install
 
-- MySQL OS 계정
-- Instance Root Directory
-- systemd Service Name
-- 별도 `my.cnf` 경로
+Host에 `mysql-community-server`가 없으면 Bundle RPM만 대상으로 `rpm --test` 후 설치한다.
+
+OS 의존성이 부족하면 외부 Repository를 사용하지 않고 누락 dependency를 출력한 뒤 중단한다.
+
+### 2. Same-version reuse
+
+Host에 Bundle과 동일한 `mysql-community-server` Version/Release/Architecture가 이미 있으면 기존 공용 Binary를 재사용하고 별도 인스턴스만 생성한다.
+
+### 3. Different-version coexistence
+
+기존 Oracle MySQL RPM Version과 Bundle Version이 다르면 기존 RPM을 교체하지 않는다.
+
+예:
+
+```text
+Installed RPM : MySQL 9.7.2
+Bundle        : MySQL 8.0.46
+```
+
+이 경우 Bundle RPM payload를 사용자가 지정한 **Private MySQL Software Root**에 추출하고 신규 인스턴스가 해당 전용 `mysqld`를 사용한다.
+
+개념 예:
+
+```text
+/usr/sbin/mysqld                                  -> MySQL 9.7.2 (기존 RPM)
+/opt/mysql-8.0.46-mysql4/payload/usr/sbin/mysqld -> MySQL 8.0.46 (신규 private tree)
+```
+
+RPM DB와 `/usr/sbin/mysqld`는 변경하지 않는다.
+
+## 사용자 입력 경로
+
+다음 경로는 스크립트가 패턴화하지 않고 사용자가 직접 지정한다.
+
+- Instance Root
+- Different-version coexistence 시 Private MySQL Software Root
+- `my.cnf`
 - Data Directory
 - Log Directory
 - Socket/PID Directory
 - `secure_file_priv` Directory
-- MySQL SQL Port
-- TCP 사용 여부 및 `bind-address`
-- MySQL X Protocol 사용 여부, Port 및 Bind Address
-- `minimum` / `production` Profile
-- SELinux Context/Port Policy 적용 여부
-- Package 신규 설치 시 Local-only / Enabled Repository 의존성 처리 방식
 
-## my.cnf Profile
+입력 경로의 기존 parent, write/execute 가능성, read-only filesystem, 충돌 여부를 검사한다.
 
-### Minimum
+## 자동 생성되는 my.cnf
 
-신규 인스턴스 기동에 필요한 최소 항목 중심 구성.
+Minimum Profile은 독립 기동에 필요한 기본 항목을 생성한다.
 
 ```text
+basedir        # side-by-side 모드일 때
 user
 port
 datadir
@@ -133,141 +155,153 @@ pid-file
 log-error
 secure-file-priv
 bind-address 또는 skip-networking
-mysqlx 관련 설정
+mysqlx 관련 항목
 ```
 
-### Production
+`[client]`에도 신규 인스턴스의 Port/Socket을 기록한다.
 
-Minimum 항목에 운영 기본값 선택 항목 추가.
+생성 후 대상 Version의 실제 `mysqld`로 `--validate-config`와 `--print-defaults` 검증을 수행한다.
+
+## 기동 방식
+
+사용자가 선택한다.
+
+### 1. systemd custom unit
+
+Oracle RPM/systemd Linux에서 권장되는 방식이다.
 
 ```text
-innodb_flush_log_at_trx_commit=1
-sync_binlog=1
-max_connections=<USER_INPUT>
-local_infile=OFF
+systemctl start <service>
 ```
 
-추가 선택:
+Boot enable 여부도 사용자가 선택한다.
 
-- Dedicated Server/VM: `innodb_dedicated_server=ON`
-- 공유 Host: `innodb_buffer_pool_size` 직접 입력 또는 MySQL 기본값 유지
-- Slow Query Log 사용 여부
-- `long_query_time` 입력
+### 2. mysqld --daemonize
 
-이미 다른 `mysqld` 또는 기존 MySQL Config가 발견된 Host에서 `innodb_dedicated_server` 선택 시 추가 확인 수행.
+전용 `--defaults-file`을 사용하는 direct-start 방식이다.
 
-## 다중 인스턴스 충돌 검증
+SELinux Enforcing/Permissive 상태에서 direct mode를 선택하면 `mysqld_t`가 아닌 다른 process domain으로 실행될 가능성을 경고하고 계속 진행 여부를 다시 확인한다.
 
-동일 서버에 여러 MySQL 인스턴스가 존재할 수 있음을 기본 전제로 검증.
+SELinux 정책 적용 여부와 direct-start 사용 여부는 서로 별개의 사용자 선택이다.
 
-검사 대상:
-
-- 실행 중인 모든 `mysqld` PID
-- Classic Protocol Port
-- MySQL X Protocol Port
-- Unix Socket / Socket Lock
-- PID File
-- Data Directory
-- Error Log / Slow Query Log / Initialization Log
-- `secure_file_priv` Directory
-- option file
-- systemd Service Name
-- 실행 중인 프로세스의 `--defaults-file`
-- 중지된 MySQL systemd Unit의 `--defaults-file`
-- `/etc/sysconfig/mysql*`의 설정파일 지정
-- SELinux Port Type 충돌
-
-사용 중이거나 기존 Config에 예약된 Port 입력 시 다른 Port 재입력 요구.
-
-## Package 안전장치
-
-RPM 설치 환경에서는 `/usr/sbin/mysqld` 등의 공용 Binary가 서버 전체 인스턴스에 영향을 줄 수 있다.
-
-현재 설치된 `mysql-community-server` Version과 Bundle Version이 다르면 자동 Package 교체 차단.
-
-예시:
-
-```text
-Installed : mysql-community-server 9.7.2
-Bundle    : mysql-community-server 8.0.46
-Result    : BLOCK
-```
-
-기존 다중 인스턴스의 공용 Binary를 신규 Bundle Version으로 임의 Upgrade/Downgrade하지 않는 목적.
+`mysqld_safe`, `mysql.server`는 현재 Oracle RPM/systemd 설치기 범위에서는 선택 불가 안내만 제공한다.
 
 ## SELinux
 
-SELinux 비활성화 작업 없음.
+SELinux를 자동으로 비활성화하지 않는다.
 
-SELinux 활성 환경에서 사용자가 정책 적용을 선택한 경우 Custom Path와 Port에 필요한 MySQL Context 적용.
+SELinux가 Enforcing/Permissive이면 다음을 사용자에게 묻는다.
 
-| 대상 | SELinux Type |
+```text
+Apply MySQL SELinux file/port contexts ...? yes/no
+```
+
+`yes` 선택 시 Host의 기존 MySQL SELinux 정책을 기준으로 다음 Context를 적용한다.
+
+| 대상 | Type |
 |---|---|
 | Data Directory | `mysqld_db_t` |
 | Log Directory | `mysqld_log_t` |
 | Socket/PID Directory | `mysqld_var_run_t` |
-| `secure_file_priv` Directory | `mysqld_db_t` |
-| 별도 option file | Host의 `/etc/my.cnf` 정책 기준 자동 판별 |
-| 비기본 SQL/X Port | `mysqld_port_t` |
+| `secure_file_priv` | `mysqld_db_t` |
+| 별도 option file | Host `/etc/my.cnf` 정책에서 판별 |
+| SQL/X Port | `mysqld_port_t` |
+| private `mysqld` | Host `/usr/sbin/mysqld` executable type에서 판별 |
+| private MySQL library tree | Host MySQL library type에서 판별 |
 
-다른 서비스의 특정 SELinux Port Type 또는 기존 local fcontext 발견 시 자동 재할당 차단.
+기존 local fcontext 또는 다른 서비스의 특정 Port Type과 충돌하면 자동 재할당하지 않는다.
+
+## 다중 인스턴스 충돌 검사
+
+- 실행 중인 모든 `mysqld`
+- 기존 option file
+- systemd Unit의 `--defaults-file`
+- `/etc/sysconfig/mysql*`
+- SQL Port
+- MySQL X Port
+- Unix Socket / `.lock`
+- PID File
+- Data Directory
+- Error/Slow/Initialization Log
+- `secure_file_priv`
+- Service Name
+- Private Software Root
+- SELinux Port Type
+
+`ss`가 없는 최소 설치 Host에서는 Linux `/proc`를 이용한 Port/Unix Socket fallback 검사를 사용한다.
+
+## 초기화 및 사후 검증
+
+신규 Data Directory는 대상 Version의 `mysqld --initialize`로 초기화한다.
+
+기동 후 다음을 검증한다.
+
+- Service 또는 PID 존재
+- 실행 OS User
+- 실제 `/proc/<pid>/exe`와 목표 `mysqld` 일치
+- Unix Socket
+- SQL Port
+- 선택적 MySQL X Port/Socket
+- Error Log
+- SELinux file/port context
+- systemd + SELinux 정책 적용 환경의 `mysqld_t` process domain
+- 실제 MySQL Version
+
+Temporary root password 자체는 화면에 노출하지 않고 `initialize.log` 위치만 안내한다.
 
 ## Rollback
 
-실제 설치 단계 진입 후 실패 발생 시 이번 실행에서 생성·변경한 인스턴스 자원 중심 Rollback 수행.
-
-대상:
+실패 시 이번 실행에서 만든 인스턴스 자원을 중심으로 Rollback한다.
 
 - 생성한 systemd Unit
-- 생성한 Config
-- 생성한 Log/Socket/PID 파일
+- 생성한 `my.cnf`
+- Log/Socket/PID
 - 신규 Data Directory 내용
 - 신규 Directory
 - 신규 OS 계정/그룹
-- 이번 실행에서 추가한 SELinux fcontext
-- 이번 실행에서 추가한 `mysqld_port_t`
-- 기존 빈 Directory를 사용한 경우 기존 UID/GID/Mode/SELinux Context 복원
+- 이번 실행에서 추가한 SELinux fcontext/Port
+- side-by-side private software tree
+- 기존 빈 Directory를 사용한 경우 원래 metadata 복원
 
-RPM Transaction은 다른 인스턴스 또는 공유 의존성에 영향을 줄 수 있으므로 자동 제거하지 않음.
+기존 공유 RPM을 자동 제거하는 Rollback은 수행하지 않는다.
+
+## 실제 검증 완료 사례
+
+v1.0.23 기준 테스트 Host에서 기존 MySQL 9.7.2 인스턴스 3개가 실행 중인 상태에서 MySQL 8.0.46 RPM Bundle을 사용해 다른 Version 인스턴스를 추가했다.
+
+```text
+3306 -> /usr/sbin/mysqld                         MySQL 9.7.2
+3307 -> /usr/sbin/mysqld                         MySQL 9.7.2
+3308 -> /usr/sbin/mysqld                         MySQL 9.7.2
+3309 -> private software root .../usr/sbin/mysqld MySQL 8.0.46
+```
+
+검증 결과:
+
+- 기존 9.7.2 RPM DB 유지
+- 기존 `/usr/sbin/mysqld` 9.7.2 유지
+- 기존 3개 인스턴스 Active 상태 유지
+- 신규 8.0.46 전용 Binary 정상 기동
+- 신규 3309 Listen 확인
+- 전용 `my.cnf` 적용값 검증
+- SELinux Enforcing에서 systemd 기동 시 `mysqld_t` 확인
+- `/bin/sh` 문법 검사 통과
+- 외부 Package Manager/Downloader 호출 없음 확인
+- direct `mysqld --daemonize` 입력 흐름 및 SELinux 경고/명시 승인 Dry-run 검증
 
 ## 종료 코드
 
 | 코드 | 의미 |
 |---:|---|
-| `0` | 검증 또는 작업 성공 |
-| `1` | 실행 오류/사용자 취소/설치 실패 |
-| `2` | Precheck 또는 Dry-run Blocker 발견 |
+| `0` | 성공 |
+| `1` | 실행 오류 / 사용자 취소 / 설치 실패 |
+| `2` | Precheck 또는 Dry-run Blocker |
 
-## 현재 검증 범위
+## 운영 적용 시 주의
 
-v1.0.11 기준 다음 항목 실제 검증 완료.
-
-- `/bin/sh` 문법
-- Same-version Bundle Package 재사용
-- 다른 Version Bundle의 공용 RPM 교체 차단
-- Minimum Profile 실제 기동
-- Production Profile 실제 기동
-- Classic Protocol / MySQL X Protocol 분리
-- Custom `my.cnf`
-- Custom Data/Log/Socket/PID Directory
-- SELinux Enforcing
-- 신규 OS 계정 생성
-- 실행/중지 인스턴스 충돌 탐지
-- Port/Socket/Log/Lock File 충돌 탐지
-- 기동 실패 시 Rollback
-- 기존 빈 Directory Metadata 원복
-- Dry-run 무변경
-- 기존 3개 MySQL 인스턴스 무영향 확인
-
-검증 환경에서 이미 MySQL 9.7.2 공용 RPM과 다중 인스턴스가 존재하여 **MySQL Package가 전혀 없는 Fresh Host의 최초 RPM 설치 분기는 실제 Package 설치까지 수행하지 않고 Precheck/Dependency 경로까지만 검증**.
-
-## 운영 적용 기준
-
-- 대상 OS와 Bundle의 EL Major/Architecture 일치 확인
-- 실제 운영과 동일한 MySQL Version/Topology의 테스트 환경 선행 검증
-- 기존 Package/Config/Data Directory 백업 확인
-- Port/Socket/Service 충돌 여부 확인
-- SELinux 정책 적용 범위 확인
-- 최종 Plan 검토 후 실행 승인
-
-설치 후 출력되는 임시 `root` Password 위치 확인 후 별도 로그인으로 초기 Password 변경 수행.
+- Bundle과 대상 Host의 EL Major/Architecture가 맞아야 한다.
+- Bundle 자체와 Host에 이미 설치된 OS prerequisite는 사전에 준비한다.
+- 스크립트는 부족한 dependency를 인터넷에서 설치하지 않는다.
+- Production 적용 전 동일한 OS/MySQL Version/Topology에서 Dry-run과 테스트를 선행한다.
+- 사용자 지정 경로와 Port는 최종 Plan에서 반드시 확인한다.
+- SELinux 활성 환경에서는 systemd 기동이 가장 예측 가능한 MySQL process domain을 제공한다.
