@@ -1,11 +1,11 @@
 #!/bin/sh
-# mysql_innodb_cluster_preflight.sh v1.0.0
+# mysql_innodb_cluster_preflight.sh v1.0.1
 # POSIX /bin/sh. Read-only preflight companion for mysql_innodb_cluster_migrate.sh.
 # No package installation, no third-party runtime, no hard-coded host/port/path.
 set -eu
 umask 077
 
-VERSION=1.0.0
+VERSION=1.0.1
 ROOT=${MYSQL_IC_WORK_ROOT:-"$(pwd)/mysql_innodb_cluster_work"}
 MYSQL=${MYSQL_IC_MYSQL:-mysql}
 STEP=${1:-all}
@@ -25,11 +25,11 @@ need "$MYSQL"
 [ -f "$ROOT/meta/complete" ] || die "Discovery is incomplete. Run mysql_innodb_cluster_migrate.sh discover first."
 TMP=$(mktemp -d "$ROOT/.preflight.XXXXXX")
 chmod 700 "$TMP" 2>/dev/null || :
+TAB=$(printf '\t')
 
 get(){ cat "$ROOT/$1/$2"; }
 get_optional(){ [ -f "$ROOT/$1/$2" ] && cat "$ROOT/$1/$2" || :; }
 ids(){ n=1; c=$(get meta count); while [ "$n" -le "$c" ]; do printf '%s\n' "$n"; n=$((n+1)); done; }
-q(){ printf '%s' "$1" | sed "s/'/''/g"; }
 
 secret(){
     printf '%s: ' "$1" >&2
@@ -278,11 +278,12 @@ xcom_precheck(){
     tool=$(probe_cmd)
     if [ "$stack" = XCOM ] && [ "$active" -gt 0 ]; then
         if [ -n "$tool" ]; then
-            while IFS='\t' read -r i h p la; do
+            while IFS="$TAB" read -r i h p la; do
                 if probe_tcp "$tool" "$h" "$p"; then
                     log "EXECUTION_HOST_XCOM_REACHABILITY=PASS node=$i endpoint=$la probe=$tool"
                 else
-                    die "ERROR_CODE=XCOM_ENDPOINT_UNREACHABLE_FROM_EXECUTION_HOST NODE=$i ENDPOINT=$la"
+                    warn "Execution host cannot open XCOM endpoint $la for node $i. This does not prove peer-to-peer failure because firewall policy may restrict the execution host differently from GR members."
+                    manual "Validate XCOM endpoint $la from every other GR member."
                 fi
             done < "$eps"
         else
@@ -296,9 +297,9 @@ xcom_precheck(){
 
     if [ "$stack" = XCOM ]; then
         log 'Pairwise XCOM validation commands (run on each source node OS after the XCOM listeners are active):'
-        while IFS='\t' read -r src shost sport sla; do
+        while IFS="$TAB" read -r src shost sport sla; do
             log "  Source Node $src:"
-            while IFS='\t' read -r dst dhost dport dla; do
+            while IFS="$TAB" read -r dst dhost dport dla; do
                 [ "$src" = "$dst" ] && continue
                 log "    nc -z -w 3 '$dhost' '$dport'    # target Node $dst $dla"
             done < "$eps"
