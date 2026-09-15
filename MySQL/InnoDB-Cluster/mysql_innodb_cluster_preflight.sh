@@ -1,13 +1,14 @@
 #!/bin/sh
-# mysql_innodb_cluster_preflight.sh v1.0.1
+# mysql_innodb_cluster_preflight.sh v1.0.2
 # POSIX /bin/sh. Read-only preflight companion for mysql_innodb_cluster_migrate.sh.
-# No package installation, no third-party runtime, no hard-coded host/port/path.
+# No package installation, no third-party runtime, no hard-coded host/port/path/version policy.
 set -eu
 umask 077
 
-VERSION=1.0.1
+VERSION=1.0.2
 ROOT=${MYSQL_IC_WORK_ROOT:-"$(pwd)/mysql_innodb_cluster_work"}
 MYSQL=${MYSQL_IC_MYSQL:-mysql}
+MYSQLSH=${MYSQL_IC_MYSQLSH:-mysqlsh}
 STEP=${1:-all}
 TMP=''
 MANUAL_CHECKS=0
@@ -30,6 +31,7 @@ TAB=$(printf '\t')
 get(){ cat "$ROOT/$1/$2"; }
 get_optional(){ [ -f "$ROOT/$1/$2" ] && cat "$ROOT/$1/$2" || :; }
 ids(){ n=1; c=$(get meta count); while [ "$n" -le "$c" ]; do printf '%s\n' "$n"; n=$((n+1)); done; }
+manual(){ MANUAL_CHECKS=$((MANUAL_CHECKS+1)); log "MANUAL_CHECK_REQUIRED: $*"; }
 
 secret(){
     printf '%s: ' "$1" >&2
@@ -51,8 +53,7 @@ secret(){
 cred(){
     i=$1
     [ -f "$TMP/$i.pw" ] && return 0
-    mode=$(get "$i" auth_mode)
-    [ "$mode" = login-path ] && return 0
+    [ "$(get "$i" auth_mode)" = login-path ] && return 0
     user=$(get "$i" user)
     pw=$(secret "Node $i password for $user")
     printf '%s\n' "$pw" > "$TMP/$i.pw"
@@ -85,32 +86,20 @@ mysql_cmd(){
 }
 sql(){ i=$1; stmt=$2; printf '%s\n' "$stmt" | mysql_cmd "$i" --batch --raw --skip-column-names; }
 
-valid_port(){ case $1 in ''|*[!0-9]*) return 1;; esac; [ "$1" -ge 1 ] 2>/dev/null && [ "$1" -le 65535 ] 2>/dev/null; }
-version_triplet(){ printf '%s\n' "$1" | sed -n 's/^\([0-9][0-9]*\)\.\([0-9][0-9]*\)\.\([0-9][0-9]*\).*/\1 \2 \3/p'; }
-version_ge_8_0_17(){ set -- $(version_triplet "$1"); [ $# -eq 3 ] || return 1; [ "$1" -gt 8 ] || { [ "$1" -eq 8 ] && { [ "$2" -gt 0 ] || { [ "$2" -eq 0 ] && [ "$3" -ge 17 ]; }; }; }; }
-version_ge_8_0_37(){ set -- $(version_triplet "$1"); [ $# -eq 3 ] || return 1; [ "$1" -gt 8 ] || { [ "$1" -eq 8 ] && { [ "$2" -gt 0 ] || { [ "$2" -eq 0 ] && [ "$3" -ge 37 ]; }; }; }; }
-clone_version_compatible(){
-    d=$1; r=$2
-    version_ge_8_0_17 "$d" || return 1
-    version_ge_8_0_17 "$r" || return 1
-    set -- $(version_triplet "$d"); dmaj=$1; dmin=$2; dpatch=$3
-    set -- $(version_triplet "$r"); rmaj=$1; rmin=$2; rpatch=$3
-    if version_ge_8_0_37 "$d" && version_ge_8_0_37 "$r"; then
-        [ "$dmaj" -eq "$rmaj" ] && [ "$dmin" -eq "$rmin" ]
-    else
-        [ "$dmaj" -eq "$rmaj" ] && [ "$dmin" -eq "$rmin" ] && [ "$dpatch" -eq "$rpatch" ]
-    fi
-}
-
 placement(){ get_optional "$1" placement; }
-manual(){ MANUAL_CHECKS=$((MANUAL_CHECKS+1)); log "MANUAL_CHECK_REQUIRED: $*"; }
+valid_port(){ case $1 in ''|*[!0-9]*) return 1;; esac; [ "$1" -ge 1 ] 2>/dev/null && [ "$1" -le 65535 ] 2>/dev/null; }
 
 clone_precheck(){
+    need "$MYSQLSH"
     donor=${MYSQL_IC_CLONE_DONOR:-1}
     margin=${MYSQL_IC_CLONE_SPACE_MARGIN_PERCENT:-10}
     case $donor in ''|*[!0-9]*) die "MYSQL_IC_CLONE_DONOR must be a node number";; esac
     case $margin in ''|*[!0-9]*) die "MYSQL_IC_CLONE_SPACE_MARGIN_PERCENT must be a non-negative integer";; esac
     [ "$donor" -ge 1 ] && [ "$donor" -le "$(get meta count)" ] || die "Clone donor node is outside the registered range: $donor"
+
+    shell_ver=$($MYSQLSH --version 2>/dev/null | sed -n '1p' || :)
+    log "CLONE_COMPATIBILITY_AUTHORITY=AdminAPI_runtime mysqlsh=${shell_ver:-UNKNOWN}"
+    log 'CLONE_VERSION_POLICY=not_hard_coded; Cluster.addInstance(recoveryMethod=clone) performs the authoritative runtime version compatibility check.'
 
     dver=$(sql "$donor" 'SELECT VERSION();')
     dos=$(sql "$donor" 'SELECT @@version_compile_os;')
@@ -118,7 +107,7 @@ clone_precheck(){
     ddatadir=$(sql "$donor" 'SELECT @@datadir;')
     dplugin=$(sql "$donor" "SELECT COALESCE((SELECT PLUGIN_STATUS FROM information_schema.PLUGINS WHERE PLUGIN_NAME='clone' LIMIT 1),'NOT_INSTALLED');")
     log "CLONE_DONOR node=$donor version=$dver os=$dos arch=$darch plugin=$dplugin datadir=$ddatadir"
-    [ "$dplugin" = ACTIVE ] || warn "Clone plugin is not ACTIVE on donor node $donor ($dplugin). AdminAPI may install it when Clone recovery is selected; this script does not install plugins."
+    [ "$dplugin" = ACTIVE ] || warn "Clone plugin is not ACTIVE on donor node $donor ($dplugin). AdminAPI may install it when Clone recovery is selected; this preflight never installs plugins."
 
     donor_kb=''
     if [ "$(placement "$donor")" = local ] && [ -d "$ddatadir" ]; then
@@ -126,6 +115,13 @@ clone_precheck(){
         case $donor_kb in ''|*[!0-9]*) donor_kb='';; esac
     fi
     [ -n "$donor_kb" ] || manual "Clone donor data size could not be measured locally. On node $donor run: du -sk '$ddatadir'"
+
+    outside=$(sql "$donor" "SELECT COUNT(*) FROM information_schema.FILES WHERE FILE_NAME IS NOT NULL AND FILE_NAME LIKE '/%' AND FILE_NAME NOT LIKE CONCAT(@@datadir,'%');" 2>/dev/null || printf 'UNKNOWN')
+    case $outside in
+        ''|*[!0-9]*) manual 'Could not determine whether clone-relevant tablespace files exist outside @@datadir; include external tablespaces in the donor size estimate.';;
+        0) :;;
+        *) manual "Donor reports $outside absolute tablespace file record(s) outside @@datadir. Add their filesystem usage to the clone capacity estimate.";;
+    esac
 
     for i in $(ids); do
         [ "$i" -eq "$donor" ] && continue
@@ -136,9 +132,13 @@ clone_precheck(){
         rplugin=$(sql "$i" "SELECT COALESCE((SELECT PLUGIN_STATUS FROM information_schema.PLUGINS WHERE PLUGIN_NAME='clone' LIMIT 1),'NOT_INSTALLED');")
         log "CLONE_RECIPIENT node=$i version=$rver os=$ros arch=$rarch plugin=$rplugin datadir=$rdatadir"
 
-        clone_version_compatible "$dver" "$rver" || die "ERROR_CODE=CLONE_VERSION_INCOMPATIBLE DONOR=$dver RECIPIENT=$rver NODE=$i"
         [ "$dos" = "$ros" ] || die "ERROR_CODE=CLONE_OS_INCOMPATIBLE DONOR=$dos RECIPIENT=$ros NODE=$i"
-        [ "$darch" = "$rarch" ] || die "ERROR_CODE=CLONE_ARCH_INCOMPATIBLE DONOR=$darch RECIPIENT=$rarch NODE=$i"
+        [ "$darch" = "$rarch" ] || die "ERROR_CODE=CLONE_PLATFORM_INCOMPATIBLE DONOR=$darch RECIPIENT=$rarch NODE=$i"
+        if [ "$dver" = "$rver" ]; then
+            log "CLONE_VERSION_INVENTORY node=$i donor=$dver recipient=$rver exact_match=yes"
+        else
+            log "CLONE_VERSION_INVENTORY node=$i donor=$dver recipient=$rver exact_match=no authoritative_check=AdminAPI"
+        fi
         [ "$rplugin" = ACTIVE ] || warn "Clone plugin is not ACTIVE on recipient node $i ($rplugin). AdminAPI may install it when Clone recovery is selected."
 
         if [ -n "$donor_kb" ] && [ "$(placement "$i")" = local ] && [ -d "$rdatadir" ]; then
@@ -146,16 +146,16 @@ clone_precheck(){
             case $avail in ''|*[!0-9]*) avail='';; esac
             if [ -n "$avail" ]; then
                 required=$((donor_kb + (donor_kb * margin / 100)))
-                log "CLONE_SPACE node=$i donor_used_kb=$donor_kb available_kb=$avail required_with_margin_kb=$required margin_percent=$margin"
+                log "CLONE_SPACE_ESTIMATE node=$i donor_datadir_used_kb=$donor_kb available_kb=$avail required_with_margin_kb=$required margin_percent=$margin"
                 [ "$avail" -ge "$required" ] || die "ERROR_CODE=CLONE_RECIPIENT_DISK_INSUFFICIENT NODE=$i AVAILABLE_KB=$avail REQUIRED_KB=$required"
             else
                 manual "Recipient free space could not be measured. On node $i run: df -Pk '$rdatadir'"
             fi
         else
-            manual "Clone disk capacity requires node-local filesystem evidence for recipient node $i. Run donor: du -sk '$ddatadir' ; recipient: df -Pk '$rdatadir' ; require recipient available KB >= donor used KB plus ${margin}% margin."
+            manual "Clone disk capacity requires node-local filesystem evidence for recipient node $i. Run donor: du -sk '$ddatadir' ; recipient: df -Pk '$rdatadir' ; require recipient available KB >= donor used KB plus configured margin, plus external tablespace usage if present."
         fi
     done
-    log 'CLONE_PREFLIGHT=PASS'
+    log 'CLONE_PREFLIGHT=PASS_WITH_ADMINAPI_VERSION_CHECK_AT_ADDINSTANCE'
 }
 
 resolved_tls_mode(){
@@ -208,16 +208,12 @@ tls_precheck(){
                 if tls_connect_test "$i" "$mode" "$ca"; then
                     log "TLS_VERIFY=PASS node=$i mode=$mode host=$host"
                 else
-                    die "ERROR_CODE=TLS_VERIFY_FAILED NODE=$i MODE=$mode HOST=$host. VERIFY_IDENTITY failures include CA-chain or certificate SAN/CN hostname mismatch."
+                    die "ERROR_CODE=TLS_VERIFY_FAILED NODE=$i MODE=$mode HOST=$host. VERIFY_IDENTITY validates the connection host against the certificate identity as implemented by the installed MySQL client."
                 fi
             done
             ;;
-        REQUIRED)
-            log 'TLS_VERIFY=ENCRYPTION_REQUIRED. CA/identity verification is not requested by this mode.'
-            ;;
-        DISABLED)
-            warn 'TLS is explicitly disabled for this preflight mode.'
-            ;;
+        REQUIRED) log 'TLS_VERIFY=ENCRYPTION_REQUIRED. CA/identity verification is not requested by this mode.';;
+        DISABLED) warn 'TLS is explicitly disabled for this preflight mode.';;
     esac
     log 'TLS_PREFLIGHT=PASS'
 }
@@ -237,7 +233,8 @@ communication_stack(){
 build_gr_endpoints(){
     stack=$1
     out="$ROOT/preflight_gr_endpoints.tsv"
-    : > "$out"
+    only="$TMP/gr_endpoints.only"
+    : > "$out"; : > "$only"
     for i in $(ids); do
         la=$(sql "$i" "SELECT COALESCE(@@GLOBAL.group_replication_local_address,'');" 2>/dev/null || printf '')
         if [ -z "$la" ]; then
@@ -251,9 +248,10 @@ build_gr_endpoints(){
         [ -n "$h" ] || die "ERROR_CODE=GR_LOCAL_ADDRESS_HOST_INVALID NODE=$i VALUE=$la"
         valid_port "$p" || die "ERROR_CODE=GR_LOCAL_ADDRESS_PORT_INVALID NODE=$i VALUE=$la"
         printf '%s\t%s\t%s\t%s\n' "$i" "$h" "$p" "$la" >> "$out"
+        printf '%s\n' "$la" >> "$only"
     done
-    unique=$(awk -F '\t' '{print $4}' "$out" | sort | uniq | wc -l | tr -d ' ')
-    [ "$unique" -eq "$(get meta count)" ] || die 'ERROR_CODE=DUPLICATE_GR_LOCAL_ADDRESS'
+    dup=$(sort "$only" | uniq -d | sed -n '1p')
+    [ -z "$dup" ] || die "ERROR_CODE=DUPLICATE_GR_LOCAL_ADDRESS VALUE=$dup"
     cat "$out" >&2
 }
 
@@ -282,7 +280,7 @@ xcom_precheck(){
                 if probe_tcp "$tool" "$h" "$p"; then
                     log "EXECUTION_HOST_XCOM_REACHABILITY=PASS node=$i endpoint=$la probe=$tool"
                 else
-                    warn "Execution host cannot open XCOM endpoint $la for node $i. This does not prove peer-to-peer failure because firewall policy may restrict the execution host differently from GR members."
+                    warn "Execution host cannot open XCOM endpoint $la for node $i. This does not prove peer-to-peer failure because firewall policy may differ by source."
                     manual "Validate XCOM endpoint $la from every other GR member."
                 fi
             done < "$eps"
@@ -290,18 +288,19 @@ xcom_precheck(){
             manual 'No preinstalled nc/ncat is available, so execution-host TCP reachability was not tested. No package is installed automatically.'
         fi
     elif [ "$stack" = XCOM ]; then
-        log 'XCOM listeners are not active yet; pre-create TCP failure would be ambiguous, so only endpoint validity is checked now.'
+        log 'XCOM listeners are not active yet; pre-create TCP failure would be ambiguous, so endpoint syntax/range/uniqueness is checked now and pairwise live tests are deferred until listeners are active.'
     else
         log 'MYSQL communication stack selected; registered Classic TCP connectivity has already been exercised by SQL discovery/preflight queries.'
     fi
 
     if [ "$stack" = XCOM ]; then
-        log 'Pairwise XCOM validation commands (run on each source node OS after the XCOM listeners are active):'
+        hint=${tool:-nc}
+        log 'Pairwise XCOM validation commands (run on each source node OS after the XCOM listeners are active; use an already-approved TCP probe utility):'
         while IFS="$TAB" read -r src shost sport sla; do
             log "  Source Node $src:"
             while IFS="$TAB" read -r dst dhost dport dla; do
                 [ "$src" = "$dst" ] && continue
-                log "    nc -z -w 3 '$dhost' '$dport'    # target Node $dst $dla"
+                log "    $hint -z -w 3 '$dhost' '$dport'    # target Node $dst $dla"
             done < "$eps"
         done < "$eps"
         manual 'True node-to-node XCOM reachability cannot be proven from one execution host without remote command execution. Validate every source-to-target pair after listeners are active; firewall/SELinux policy must allow the selected localAddress ports.'
@@ -327,12 +326,14 @@ Reads discovery metadata from MYSQL_IC_WORK_ROOT created by mysql_innodb_cluster
 Environment:
   MYSQL_IC_WORK_ROOT
   MYSQL_IC_MYSQL
+  MYSQL_IC_MYSQLSH
   MYSQL_IC_CLONE_DONOR                  node number, default 1
   MYSQL_IC_CLONE_SPACE_MARGIN_PERCENT   default 10
   MYSQL_IC_TLS_MODE                     AUTO|DISABLED|REQUIRED|VERIFY_CA|VERIFY_IDENTITY
   MYSQL_IC_TLS_CA                       CA file on this execution host for VERIFY_CA/VERIFY_IDENTITY
   MYSQL_IC_COMMUNICATION_STACK          AUTO|XCOM|MYSQL
 
+Clone version compatibility is deliberately not hard-coded. The installed MySQL Shell/AdminAPI performs the authoritative check when Cluster.addInstance() runs.
 No packages, plugins, runtimes, firewall rules, SELinux rules, GTIDs, or MySQL configuration are modified.
 EOF
 }
