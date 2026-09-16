@@ -1,7 +1,7 @@
 #!/bin/sh
 # Oracle MySQL Community RPM Bundle installer
 # POSIX /bin/sh, no third-party runtime dependency
-SCRIPT_VERSION="1.0.23"
+SCRIPT_VERSION="1.0.24"
 set -u
 umask 027
 
@@ -29,6 +29,8 @@ DATADIR_INITIALIZED=no
 DATADIR_CREATED=no
 CONF_PARENT_CREATED=no
 CREATED_PATHS=""
+CREATED_FILES=""
+SERVICE_START_ATTEMPTED=no
 SELINUX_FCONTEXT_ADDED=""
 SELINUX_PORT_ADDED=""
 
@@ -40,21 +42,40 @@ rollback_changes() {
     [ "${ROLLBACK_ACTIVE:-no}" = yes ] || return 0
     ROLLBACK_ACTIVE=no
     printf '%s\n' "[ROLLBACK] Reverting instance-level changes created by this run" >&2
-    if [ "${SERVICE_STARTED:-no}" = yes ]; then
+    # Never remove an instance's files until its process has stopped.
+    if [ "${SERVICE_START_ATTEMPTED:-no}" = yes ]; then
         if [ "${START_METHOD:-}" = systemd ]; then
-            systemctl stop "${SERVICE_NAME}.service" >/dev/null 2>&1 || true
-        elif [ -r "${PIDFILE:-}" ]; then
-            _rb_pid=$(sed -n '1p' "$PIDFILE" 2>/dev/null || true)
-            [ -n "$_rb_pid" ] && kill -TERM "$_rb_pid" >/dev/null 2>&1 || true
+            if ! systemctl stop "${SERVICE_NAME}.service"; then
+                warn "Rollback retained instance resources: service stop failed"
+                return 1
+            fi
+            _rb_pid=$(systemctl show -p MainPID --value "${SERVICE_NAME}.service" 2>/dev/null) || {
+                warn "Rollback retained instance resources: service state is unknown"; return 1;
+            }
+            [ "$_rb_pid" = 0 ] || { warn "Rollback retained instance resources: MainPID=$_rb_pid"; return 1; }
+        else
+            # Match the executable and exact option-file argument before signalling.
+            for _rb_pid in $(mysqld_pids); do
+                [ -r "/proc/$_rb_pid/cmdline" ] || { warn "Cannot inspect mysqld; retaining instance resources"; return 1; }
+                if tr '\0' '\n' < "/proc/$_rb_pid/cmdline" | grep -Fxq -- "--defaults-file=$CONF"; then
+                    _rb_exe=$(readlink -f "/proc/$_rb_pid/exe") || return 1
+                    [ "$_rb_exe" = "$(readlink -f "$TARGET_MYSQLD_PATH")" ] || {
+                        warn "Unexpected executable; retaining instance resources"; return 1;
+                    }
+                    kill -TERM "$_rb_pid" || { warn "Could not stop mysqld; retaining instance resources"; return 1; }
+                    if kill -0 "$_rb_pid" 2>/dev/null; then
+                        warn "mysqld is still stopping; retaining instance resources for manual review"
+                        return 1
+                    fi
+                fi
+            done
         fi
     fi
     if [ "${SERVICE_ENABLED:-no}" = yes ]; then systemctl disable "${SERVICE_NAME}.service" >/dev/null 2>&1 || true; fi
     if [ "${CREATED_UNIT:-no}" = yes ] && [ -n "${UNIT_FILE:-}" ]; then rm -f "$UNIT_FILE"; systemctl daemon-reload >/dev/null 2>&1 || true; fi
     if [ "${CREATED_CONF:-no}" = yes ] && [ -n "${CONF:-}" ]; then rm -f "$CONF"; fi
-    # Known instance files are required to be absent by precheck; remove only files created by this run.
-    for _f in "${INIT_LOG:-}" "${LOGFILE:-}" "${SLOWLOG:-}" "${PIDFILE:-}" "${SOCKET:-}" "${SOCKET:-}.lock" "${MYSQLX_SOCKET:-}" "${MYSQLX_SOCKET:-}.lock"; do
-        [ -n "$_f" ] && [ "$_f" != ".lock" ] && rm -f "$_f" 2>/dev/null || true
-    done
+    # Explicitly reserved/created files only; never infer ownership from a filename.
+    for _f in ${CREATED_FILES:-}; do rm -f -- "$_f" 2>/dev/null || true; done
     for _p in ${SELINUX_PORT_ADDED:-}; do semanage port -d -p tcp "$_p" >/dev/null 2>&1 || true; done
     for _e in ${SELINUX_FCONTEXT_ADDED:-}; do semanage fcontext -d "$_e" >/dev/null 2>&1 || true; done
     if [ "${INITIALIZE_ATTEMPTED:-no}" = yes ] && [ "${DATADIR_CREATED:-no}" != yes ] && [ -d "${DATADIR:-}" ]; then
@@ -154,6 +175,68 @@ safe_path() {
     esac
 }
 
+
+canonical_path() (
+    safe_path "$1"
+    _canonical=$(readlink -m -- "$1") || die "Cannot resolve path: $1"
+    safe_path "$_canonical"
+    printf '%s\n' "$_canonical"
+)
+normalize_instance_paths() {
+    INSTANCE_ROOT=$(canonical_path "$INSTANCE_ROOT") || die "Invalid Instance Root"
+    CONF=$(canonical_path "$CONF") || die "Invalid configuration path"
+    DATADIR=$(canonical_path "$DATADIR") || die "Invalid Data Directory"
+    LOGDIR=$(canonical_path "$LOGDIR") || die "Invalid log directory"
+    RUNDIR=$(canonical_path "$RUNDIR") || die "Invalid runtime directory"
+    FILESDIR=$(canonical_path "$FILESDIR") || die "Invalid secure_file_priv directory"
+    if [ "$PACKAGE_ACTION" = coexist ]; then
+        PRIVATE_SOFTWARE_ROOT=$(canonical_path "$PRIVATE_SOFTWARE_ROOT") || die "Invalid private software root"
+        PRIVATE_PAYLOAD_ROOT="$PRIVATE_SOFTWARE_ROOT/payload"
+        TARGET_MYSQLD_PATH="$PRIVATE_PAYLOAD_ROOT$SYSTEM_MYSQLD_PATH"
+    fi
+}
+paths_overlap() (
+    case "$1/" in "$2/"*) exit 0;; esac
+    case "$2/" in "$1/"*) exit 0;; esac
+    exit 1
+)
+validate_instance_layout() {
+    for _layout_dir in "$INSTANCE_ROOT" "$DATADIR" "$LOGDIR" "$RUNDIR" "$FILESDIR"; do
+        [ "$_layout_dir" != / ] || block "Filesystem root cannot be an instance directory"
+        if [ -e "$_layout_dir" ] && [ ! -d "$_layout_dir" ]; then
+            block "Expected a directory: $_layout_dir"
+        fi
+    done
+    # Data/log/runtime/export directories have distinct ownership and SELinux roles.
+    set -- "$DATADIR" "$LOGDIR" "$RUNDIR" "$FILESDIR"
+    while [ "$#" -gt 1 ]; do
+        _layout_first=$1; shift
+        for _layout_other in "$@"; do
+            paths_overlap "$_layout_first" "$_layout_other" &&
+                block "Instance directories must not overlap: $_layout_first / $_layout_other"
+        done
+    done
+    for _layout_dir in "$DATADIR" "$LOGDIR" "$RUNDIR" "$FILESDIR"; do
+        paths_overlap "$CONF" "$_layout_dir" &&
+            block "Configuration file must be outside data/log/runtime/export directories: $CONF"
+        case "$INSTANCE_ROOT/" in "$_layout_dir/"*) block "Instance Root must not be inside $_layout_dir";; esac
+        if [ "$PACKAGE_ACTION" = coexist ]; then
+            paths_overlap "$PRIVATE_SOFTWARE_ROOT" "$_layout_dir" &&
+                block "Private software and instance directories must not overlap: $PRIVATE_SOFTWARE_ROOT / $_layout_dir"
+        fi
+    done
+    if [ "$PACKAGE_ACTION" = coexist ]; then
+        paths_overlap "$PRIVATE_SOFTWARE_ROOT" "$CONF" &&
+            block "Configuration file must be outside the private software tree"
+    fi
+    return 0
+}
+reserve_instance_file() {
+    # noclobber protects pre-existing files and symlinks between precheck and write.
+    (set -C; : > "$1") 2>/dev/null || die "Refusing to overwrite or create file: $1"
+    CREATED_FILES="${CREATED_FILES}${CREATED_FILES:+ }$1"
+}
+
 valid_port() {
     case "$1" in *[!0-9]*|'') return 1 ;; esac
     [ "$1" -ge 1 ] 2>/dev/null && [ "$1" -le 65535 ] 2>/dev/null
@@ -194,7 +277,7 @@ mysqld_pids() {
 config_candidates() {
     {
         find /etc -maxdepth 3 -type f \( -name 'my.cnf' -o -name 'my[0-9A-Za-z_.-]*.cnf' -o -name 'mysqld*.cnf' \) -print 2>/dev/null
-        for _pid in $(pgrep mysqld 2>/dev/null); do
+        for _pid in $(mysqld_pids); do
             [ -r "/proc/$_pid/cmdline" ] || continue
             tr '\0' '\n' < "/proc/$_pid/cmdline" 2>/dev/null | sed -n 's/^--defaults-file=//p'
         done
@@ -239,7 +322,16 @@ configured_option_owner() {
     _opt=$1; _want=$2
     config_candidates | while IFS= read -r _cf; do
         _got=$(config_option_value "$_cf" "$_opt")
-        [ -n "$_got" ] && [ "$_got" = "$_want" ] && { printf '%s\n' "$_cf"; exit 0; }
+        [ -n "$_got" ] || continue
+        case "$_opt" in
+            datadir|socket|pid-file|log-error|secure-file-priv|mysqlx-socket)
+                _got=$(canonical_path "$_got") || exit 1
+                _want=$(canonical_path "$_want") || exit 1;;
+        esac
+        [ "$_got" = "$_want" ] && { printf '%s\n' "$_cf"; exit 0; }
+        if [ "$_opt" = datadir ] && paths_overlap "$_got" "$_want"; then
+            printf '%s\n' "$_cf"; exit 0
+        fi
     done
 }
 configured_port_owner() {
@@ -515,7 +607,19 @@ ensure_signatures_before_install() {
 }
 
 check_installed_products() {
-    INSTALLED_MYSQL=$(rpm -q --qf '%{VERSION}-%{RELEASE}.%{ARCH}' mysql-community-server 2>/dev/null || true)
+    # Use the query status, not stdout (rpm prints missing-package text there).
+    if INSTALLED_MYSQL=$(rpm -q --qf '%{VERSION}-%{RELEASE}.%{ARCH}' mysql-community-server 2>"$WORKDIR/server-query.err"); then
+        [ -n "$INSTALLED_MYSQL" ] || die "Installed server RPM query returned an empty result"
+    else
+        # Confirm absence with a successful inventory; RPM database errors must not
+        # be interpreted as permission to install packages.
+        rpm -qa --qf '%{NAME}\n' > "$WORKDIR/installed-package-names" 2>"$WORKDIR/package-query.err" ||
+            die "Cannot read installed RPM inventory"
+        if grep -Fxq mysql-community-server "$WORKDIR/installed-package-names"; then
+            die "Installed server RPM metadata query failed"
+        fi
+        INSTALLED_MYSQL=""
+    fi
     TARGET_NEVRA="$TARGET_VERSION-$TARGET_RELEASE.$TARGET_ARCH"
     SYSTEM_MYSQLD_PATH=$TARGET_MYSQLD_PATH
     if [ -n "$INSTALLED_MYSQL" ]; then
@@ -828,6 +932,7 @@ collect_selinux_choice() {
     esac
 }
 check_instance_collisions() {
+    validate_instance_layout
     [ "$PORT" -ge 1024 ] || block "Port $PORT requires root privileges; mysqld runs as $OS_USER"
     port_busy "$PORT" && block "SQL port already in use: $PORT"
     _port_cf=$(configured_port_owner "$PORT")
@@ -867,7 +972,7 @@ check_instance_collisions() {
 
     for _pair in "datadir:$DATADIR" "socket:$SOCKET" "pid-file:$PIDFILE" "log-error:$LOGFILE" "secure-file-priv:$FILESDIR"; do
         _opt=${_pair%%:*}; _val=${_pair#*:}
-        _owner_cf=$(configured_option_owner "$_opt" "$_val")
+        _owner_cf=$(configured_option_owner "$_opt" "$_val") || { block "Could not resolve configured $_opt paths"; continue; }
         [ -z "$_owner_cf" ] || block "$_opt path already configured in $_owner_cf: $_val"
     done
 
@@ -1091,35 +1196,38 @@ snapshot_existing_dir() {
     stat -c '%u|%g|%a|%C|%n' "$_d" >> "$_meta" || die "Could not snapshot directory metadata: $_d"
 }
 
+create_instance_directory() {
+    if [ -d "$1" ]; then return 0; fi
+    mkdir -p -- "$1" || die "Directory creation failed: $1"
+    CREATED_PATHS="$1${CREATED_PATHS:+ }$CREATED_PATHS"
+}
 prepare_directories() {
     for _d in "$INSTANCE_ROOT" "$DATADIR" "$LOGDIR" "$RUNDIR" "$FILESDIR"; do snapshot_existing_dir "$_d"; done
     _root_was_new=no
     [ -d "$INSTANCE_ROOT" ] || _root_was_new=yes
     _data_new=no; [ -d "$DATADIR" ] || _data_new=yes
-    _log_new=no; [ -d "$LOGDIR" ] || _log_new=yes
-    _run_new=no; [ -d "$RUNDIR" ] || _run_new=yes
-    _files_new=no; [ -d "$FILESDIR" ] || _files_new=yes
-    _conf_parent=$(dirname "$CONF")
-    _conf_parent_new=no; [ -d "$_conf_parent" ] || _conf_parent_new=yes
-
-    mkdir -p "$DATADIR" "$LOGDIR" "$RUNDIR" "$FILESDIR" "$_conf_parent" || die "Directory creation failed"
-    chown "$OS_USER:$OS_GROUP" "$DATADIR" "$LOGDIR" "$RUNDIR" "$FILESDIR"
-    chmod 750 "$DATADIR" "$LOGDIR" "$RUNDIR" "$FILESDIR"
-    [ "$_root_was_new" = yes ] && { chown "$OS_USER:$OS_GROUP" "$INSTANCE_ROOT"; chmod 750 "$INSTANCE_ROOT"; }
-
-    [ "$_data_new" = yes ] && { DATADIR_CREATED=yes; CREATED_PATHS="$DATADIR${CREATED_PATHS:+ }$CREATED_PATHS"; }
-    [ "$_log_new" = yes ] && CREATED_PATHS="$LOGDIR${CREATED_PATHS:+ }$CREATED_PATHS"
-    [ "$_run_new" = yes ] && CREATED_PATHS="$RUNDIR${CREATED_PATHS:+ }$CREATED_PATHS"
-    [ "$_files_new" = yes ] && CREATED_PATHS="$FILESDIR${CREATED_PATHS:+ }$CREATED_PATHS"
-    [ "$_conf_parent_new" = yes ] && CREATED_PATHS="$_conf_parent${CREATED_PATHS:+ }$CREATED_PATHS"
-    [ "$_root_was_new" = yes ] && CREATED_PATHS="$CREATED_PATHS${CREATED_PATHS:+ }$INSTANCE_ROOT"
+    # Create Instance Root explicitly, including layouts with independent paths.
+    create_instance_directory "$INSTANCE_ROOT"
+    create_instance_directory "$DATADIR"
+    [ "$_data_new" != yes ] || DATADIR_CREATED=yes
+    create_instance_directory "$LOGDIR"
+    create_instance_directory "$RUNDIR"
+    create_instance_directory "$FILESDIR"
+    create_instance_directory "$(dirname "$CONF")"
+    chown "$OS_USER:$OS_GROUP" "$DATADIR" "$LOGDIR" "$RUNDIR" "$FILESDIR" || die "Directory ownership change failed"
+    chmod 750 "$DATADIR" "$LOGDIR" "$RUNDIR" "$FILESDIR" || die "Directory permission change failed"
+    if [ "$_root_was_new" = yes ]; then
+        chown "$OS_USER:$OS_GROUP" "$INSTANCE_ROOT" || die "Instance Root ownership change failed"
+        chmod 750 "$INSTANCE_ROOT" || die "Instance Root permission change failed"
+    fi
 }
 write_config() {
     [ ! -e "$CONF" ] || die "Refusing to overwrite existing config: $CONF"
-    render_config > "$CONF" || die "Config write failed"
+    reserve_instance_file "$CONF"
     CREATED_CONF=yes
-    chown root:"$OS_GROUP" "$CONF"
-    chmod 640 "$CONF"
+    render_config > "$CONF" || die "Config write failed"
+    chown root:"$OS_GROUP" "$CONF" || die "Config ownership change failed"
+    chmod 640 "$CONF" || die "Config permission change failed"
     log "Created config: $CONF"
 }
 
@@ -1296,6 +1404,7 @@ validate_config() {
 initialize_datadir() {
     path_nonempty "$DATADIR" && die "Data Directory became non-empty before initialization: $DATADIR"
     INIT_LOG="$LOGDIR/initialize.log"
+    reserve_instance_file "$INIT_LOG"
     INITIALIZE_ATTEMPTED=yes
     log "Initializing Data Directory with --initialize"
     if "$MYSQLD_BIN" --no-defaults --initialize --user="$OS_USER" --datadir="$DATADIR" >"$INIT_LOG" 2>&1; then
@@ -1313,19 +1422,43 @@ write_service() {
     [ "$START_METHOD" = systemd ] || return 0
     UNIT_FILE="/etc/systemd/system/$SERVICE_NAME.service"
     [ ! -e "$UNIT_FILE" ] || die "Refusing to overwrite systemd unit: $UNIT_FILE"
-    render_service > "$UNIT_FILE" || die "systemd unit write failed"
+    reserve_instance_file "$UNIT_FILE"
     CREATED_UNIT=yes
+    render_service > "$UNIT_FILE" || die "systemd unit write failed"
     chown root:root "$UNIT_FILE"; chmod 644 "$UNIT_FILE"
     systemctl daemon-reload || die "systemctl daemon-reload failed"
+}
+track_runtime_files() {
+    CREATED_FILES="${CREATED_FILES}${CREATED_FILES:+ }$PIDFILE $SOCKET $SOCKET.lock"
+    if [ "$MYSQLX_ENABLED" = yes ]; then
+        CREATED_FILES="$CREATED_FILES $MYSQLX_SOCKET $MYSQLX_SOCKET.lock"
+    fi
 }
 start_service() {
     port_busy "$PORT" && die "SQL port $PORT became busy before server start"
     socket_busy "$SOCKET" && die "Socket path became busy before server start"
+    reserve_instance_file "$LOGFILE"
+    chown "$OS_USER:$OS_GROUP" "$LOGFILE" || die "Error log ownership change failed"
+    if [ "$SLOW_QUERY" = yes ]; then
+        reserve_instance_file "$SLOWLOG"
+        chown "$OS_USER:$OS_GROUP" "$SLOWLOG" || die "Slow log ownership change failed"
+    fi
+    # These runtime names were checked absent; only startup can create them now.
+    for _runtime_file in "$PIDFILE" "$SOCKET" "$SOCKET.lock"; do
+        [ ! -e "$_runtime_file" ] && [ ! -L "$_runtime_file" ] || die "Runtime path already exists: $_runtime_file"
+    done
+    if [ "$MYSQLX_ENABLED" = yes ]; then
+        for _runtime_file in "$MYSQLX_SOCKET" "$MYSQLX_SOCKET.lock"; do
+            [ ! -e "$_runtime_file" ] && [ ! -L "$_runtime_file" ] || die "Runtime path already exists: $_runtime_file"
+        done
+    fi
     if [ "$START_METHOD" = systemd ]; then
         if [ "$ENABLE_AT_BOOT" = yes ]; then
             systemctl enable "$SERVICE_NAME.service" >/dev/null || die "systemctl enable failed"
             SERVICE_ENABLED=yes
         fi
+        track_runtime_files
+        SERVICE_START_ATTEMPTED=yes
         if ! systemctl start "$SERVICE_NAME.service"; then
             systemctl status "$SERVICE_NAME.service" --no-pager -l 2>/dev/null || true
             journalctl -u "$SERVICE_NAME.service" -n 100 --no-pager 2>/dev/null || true
@@ -1335,6 +1468,8 @@ start_service() {
     else
         "$MYSQLD_BIN" --verbose --help 2>/dev/null | grep -q -- '--daemonize' || die "Target mysqld does not advertise --daemonize support"
         command -v runuser >/dev/null 2>&1 || die "runuser is required for safe direct startup as $OS_USER"
+        track_runtime_files
+        SERVICE_START_ATTEMPTED=yes
         if ! runuser -u "$OS_USER" -- "$MYSQLD_BIN" --defaults-file="$CONF" --daemonize; then
             [ -f "$LOGFILE" ] && tail -100 "$LOGFILE" || true
             die "Direct mysqld --daemonize startup failed"
@@ -1416,6 +1551,7 @@ main() {
     [ "$(id -u)" -eq 0 ] || die "Run as root"
     command -v rpm >/dev/null 2>&1 || die "rpm command not found"
     command -v tar >/dev/null 2>&1 || die "tar command not found"
+    command -v readlink >/dev/null 2>&1 || die "readlink command not found"
     command -v systemctl >/dev/null 2>&1 || die "systemd/systemctl required"
 
     echo "MySQL Community RPM Bundle Installer v$SCRIPT_VERSION"
@@ -1441,6 +1577,7 @@ main() {
         die "Precheck blockers detected. No installation changes made."
     fi
     collect_instance_inputs
+    normalize_instance_paths
     collect_start_method
     collect_network_inputs
     collect_profile_inputs

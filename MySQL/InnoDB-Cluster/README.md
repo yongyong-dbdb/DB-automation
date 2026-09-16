@@ -2,7 +2,7 @@
 
 `mysql_innodb_cluster_migrate.sh`는 준비된 MySQL 인스턴스 또는 기존 Group Replication(GR) 구성을 **MySQL InnoDB Cluster**로 전환하기 위한 POSIX `/bin/sh` 자동화 스크립트다.
 
-현재 스크립트 버전: **v1.0.44**
+현재 스크립트 버전: **v1.0.45**
 
 ## 목적
 
@@ -97,6 +97,7 @@ strict-gtid
 gr-restart-precheck
 configure-admin
 precheck
+preflight [all|clone|tls|xcom]
 configure
 plan
 create
@@ -205,6 +206,50 @@ InnoDB Cluster 관리용 AdminAPI 계정을 준비한다.
 ### `precheck`
 
 `sql-precheck` 결과와 함께 각 노드에서 `dba.checkInstanceConfiguration()`을 clusterAdmin으로 수행한다.
+
+### `preflight [all|clone|tls|xcom]`
+
+Clone/TLS/통신 사전 점검을 메인 스크립트에 통합했다. **실행용 쉘은
+`mysql_innodb_cluster_migrate.sh` 하나만 필요하다.** 이전의 별도 preflight
+쉘은 제거했으며, 외부 쉘을 source하거나 실행하지 않는다.
+
+`discover` 완료 후 동일한 `MYSQL_IC_WORK_ROOT`를 사용한다.
+
+```sh
+sh mysql_innodb_cluster_migrate.sh preflight all
+sh mysql_innodb_cluster_migrate.sh preflight clone
+sh mysql_innodb_cluster_migrate.sh preflight tls
+sh mysql_innodb_cluster_migrate.sh preflight xcom
+sh mysql_innodb_cluster_migrate.sh preflight --help
+```
+
+- `clone`: OS/아키텍처, Clone 플러그인 상태, 확인 가능한 로컬 디스크 용량을 검사한다.
+- `tls`: SSL 지원과 선택한 모드의 CA/호스트명 검증 접속을 확인한다.
+- `xcom`: GR 통신 주소 형식/범위/중복과 가능한 TCP 연결을 검사한다. MYSQL 통신 스택도 처리한다.
+- `all` 또는 생략: 위 세 점검을 실행한다.
+- 실행 전에 discovery schema와 등록 노드 UUID를 재검증한다.
+- DB/패키지/정책은 변경하지 않는다. 작업 폴더에는 제한된 임시 인증 파일과
+  `preflight_gr_endpoints.tsv` 증적을 생성한다. 인증과 작업 잠금은 메인 스크립트를 사용한다.
+
+선택 환경변수:
+
+| 변수 | 의미 |
+|---|---|
+| `MYSQL_IC_CLONE_DONOR` | 등록된 donor 노드 번호, 기본 1 |
+| `MYSQL_IC_CLONE_SPACE_MARGIN_PERCENT` | 디스크 여유율, 기본 10 |
+| `MYSQL_IC_TLS_MODE` | AUTO / DISABLED / REQUIRED / VERIFY_CA / VERIFY_IDENTITY |
+| `MYSQL_IC_TLS_CA` | 검증 접속에 사용할 실행 호스트의 CA 파일 |
+| `MYSQL_IC_COMMUNICATION_STACK` | AUTO / XCOM / MYSQL |
+
+이 변수는 **사전 점검에만 적용**된다. 이후 `create`의 실제 옵션 선택을 자동 변경하지 않는다.
+실제 구성할 TLS/통신 옵션과 일치시켜 점검해야 한다.
+
+결과는 `PASS`, `PASS_WITH_WARNINGS`, `PASS_WITH_MANUAL_CHECKS`로 구분한다.
+오류는 비정상 종료하며, 경고/수동 확인이 남은 결과는 종료 코드 0이므로 출력도 확인한다.
+원격 디스크와 노드 간 양방향 통신은 수동 검증이 남을 수 있다.
+Clone 버전 호환성은 하드코딩하지 않고 실제 `addInstance()`의 AdminAPI 판정에 맡긴다.
+이 명령은 SQL/AdminAPI 구성 요구사항을 검사하는 기존 `precheck`를 대체하지 않는다.
+도움말은 MySQL 클라이언트나 discovery 정보 없이 조회할 수 있다.
 
 ### `configure`
 
@@ -328,6 +373,7 @@ final_validation.txt
 ```sh
 sh mysql_innodb_cluster_migrate.sh discover
 sh mysql_innodb_cluster_migrate.sh capabilities
+sh mysql_innodb_cluster_migrate.sh preflight all
 sh mysql_innodb_cluster_migrate.sh sql-precheck
 sh mysql_innodb_cluster_migrate.sh configure-admin
 sh mysql_innodb_cluster_migrate.sh precheck
@@ -348,6 +394,7 @@ sh mysql_innodb_cluster_migrate.sh status
 ```sh
 sh mysql_innodb_cluster_migrate.sh discover
 sh mysql_innodb_cluster_migrate.sh capabilities
+sh mysql_innodb_cluster_migrate.sh preflight all
 sh mysql_innodb_cluster_migrate.sh sql-precheck
 sh mysql_innodb_cluster_migrate.sh configure-admin
 sh mysql_innodb_cluster_migrate.sh precheck

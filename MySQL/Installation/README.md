@@ -2,7 +2,7 @@
 
 `mysql_install_auto.sh`는 사용자가 미리 준비한 Oracle MySQL Community RPM Bundle(`*.rpm-bundle.tar`)을 이용해 신규 MySQL 인스턴스를 구성하는 POSIX `/bin/sh` 스크립트다.
 
-현재 스크립트 버전: **v1.0.23**
+현재 스크립트 버전: **v1.0.24**
 
 ## 핵심 원칙
 
@@ -43,6 +43,7 @@ Ubuntu/Debian APT/DEB 설치는 현재 범위가 아니다.
 rpm
 tar
 systemctl
+readlink (GNU readlink -m 지원)
 ```
 
 다른 MySQL Version을 기존 RPM과 공존시키는 side-by-side 모드:
@@ -98,6 +99,8 @@ sh mysql_install_auto.sh \
 ### 1. Fresh install
 
 Host에 `mysql-community-server`가 없으면 Bundle RPM만 대상으로 `rpm --test` 후 설치한다.
+RPM 조회의 종료 상태를 기준으로 분기한다. 미설치 안내 문구를 설치 정보로 취급하지 않으며,
+조회 실패 시 RPM 목록을 확인하여 실제 미설치와 RPM DB/메타데이터 오류를 구분한다.
 
 OS 의존성이 부족하면 외부 Repository를 사용하지 않고 누락 dependency를 출력한 뒤 중단한다.
 
@@ -138,6 +141,16 @@ RPM DB와 `/usr/sbin/mysqld`는 변경하지 않는다.
 - Log Directory
 - Socket/PID Directory
 - `secure_file_priv` Directory
+
+입력 경로는 `readlink -m`으로 정규화하여 후행 슬래시, `..`, 기존 심볼릭 링크가
+가리키는 실제 경로를 기준으로 비교한다. 정규화된 경로는 최종 Plan에 표시한다.
+
+- Data/Log/Socket-PID/secure_file_priv 디렉터리는 서로 같거나 포함 관계일 수 없다.
+- `my.cnf`는 위 네 디렉터리와 private software tree 밖에 둔다.
+- Private software tree와 Data/Log/Socket-PID/secure_file_priv는 서로 겹칠 수 없다.
+- Instance Root는 네 디렉터리 안에 둘 수 없다. 상위 폴더이거나 독립 경로일 수 있다.
+- 별도로 입력한 Instance Root는 다른 경로의 부모가 아니어도 명시적으로 생성한다.
+- 기존 설정 파일의 경로도 정규화하여 비교하며, 기존 datadir과 포함 관계도 차단한다.
 
 입력 경로의 기존 parent, write/execute 가능성, read-only filesystem, 충돌 여부를 검사한다.
 
@@ -265,6 +278,12 @@ Temporary root password 자체는 화면에 노출하지 않고 `initialize.log`
 
 기존 공유 RPM을 자동 제거하는 Rollback은 수행하지 않는다.
 
+v1.0.24부터 로그 등 파일은 이번 실행에서 확보/생성한 목록만 정리한다.
+Slow Log를 사용하지 않는 경우 기존 `slow.log`는 정리 대상에 포함하지 않는다.
+설정/로그 파일 생성 시 기존 파일을 덮어쓰지 않는 방식으로 확보한다.
+서비스 기동을 시도한 뒤 실패하면 정리 전에 종료 상태를 확인하며, 종료 실패 또는
+실행 중인 프로세스가 남으면 파일/디렉터리를 보존하고 수동 확인을 안내한다.
+
 ## 실제 검증 완료 사례
 
 v1.0.23 기준 테스트 Host에서 기존 MySQL 9.7.2 인스턴스 3개가 실행 중인 상태에서 MySQL 8.0.46 RPM Bundle을 사용해 다른 Version 인스턴스를 추가했다.
@@ -305,3 +324,12 @@ v1.0.23 기준 테스트 Host에서 기존 MySQL 9.7.2 인스턴스 3개가 실�
 - Production 적용 전 동일한 OS/MySQL Version/Topology에서 Dry-run과 테스트를 선행한다.
 - 사용자 지정 경로와 Port는 최종 Plan에서 반드시 확인한다.
 - SELinux 활성 환경에서는 systemd 기동이 가장 예측 가능한 MySQL process domain을 제공한다.
+
+## v1.0.24 검증 범위
+
+미설치/동일 버전/다른 버전/RPM 조회 실패 분기, 기존 로그 보존과 생성 파일 정리,
+종료 실패 시 자원 보존, 독립 Instance Root 생성, 정규화/포함 관계 충돌을
+POSIX dash의 격리 회귀 검사로 확인했다. RPM/systemd/계정 변경 명령은 모의 처리했다.
+
+이 버전에 대한 실제 RHEL/MySQL 설치·기동 및 SELinux 통합 시험은 수행하지 않았다.
+위의 실제 검증 완료 사례는 v1.0.23에 대한 기존 기록이다.
