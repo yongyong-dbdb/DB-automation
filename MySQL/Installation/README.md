@@ -2,7 +2,7 @@
 
 `mysql_install_auto.sh`는 사용자가 미리 준비한 Oracle MySQL Community RPM Bundle(`*.rpm-bundle.tar`)을 이용해 신규 MySQL 인스턴스를 구성하는 POSIX `/bin/sh` 스크립트다.
 
-현재 스크립트 버전: **v1.0.23**
+현재 스크립트 버전: **v1.0.24**
 
 ## 핵심 원칙
 
@@ -122,7 +122,7 @@ Bundle        : MySQL 8.0.46
 
 ```text
 /usr/sbin/mysqld                                  -> MySQL 9.7.2 (기존 RPM)
-/opt/mysql-8.0.46-mysql4/payload/usr/sbin/mysqld -> MySQL 8.0.46 (신규 private tree)
+/opt/mysql-8.0.46-mysql4/usr/sbin/mysqld         -> MySQL 8.0.46 (신규 private tree)
 ```
 
 RPM DB와 `/usr/sbin/mysqld`는 변경하지 않는다.
@@ -132,7 +132,7 @@ RPM DB와 `/usr/sbin/mysqld`는 변경하지 않는다.
 다음 경로는 스크립트가 패턴화하지 않고 사용자가 직접 지정한다.
 
 - Instance Root
-- Different-version coexistence 시 Private MySQL Software Root
+- Different-version coexistence 시 Private MySQL Installation Root (입력한 경로 바로 아래에 `usr/sbin/mysqld`를 배치)
 - `my.cnf`
 - Data Directory
 - Log Directory
