@@ -1,7 +1,7 @@
 #!/bin/sh
 # Oracle MySQL Community RPM Bundle installer
 # POSIX /bin/sh, no third-party runtime dependency
-SCRIPT_VERSION="1.0.23"
+SCRIPT_VERSION="1.0.24"
 set -u
 umask 027
 
@@ -613,13 +613,14 @@ collect_instance_inputs() {
     safe_path "$INSTANCE_ROOT"
     if [ "$PACKAGE_ACTION" = coexist ]; then
         while :; do
-            ask "Private MySQL software root for $TARGET_VERSION (absolute path; explicit input required)" ""; PRIVATE_SOFTWARE_ROOT=$ASK_RESULT
+            ask "Private MySQL installation root for $TARGET_VERSION (will contain usr/sbin/mysqld; absolute path; explicit input required)" ""; PRIVATE_SOFTWARE_ROOT=$ASK_RESULT
             [ -n "$PRIVATE_SOFTWARE_ROOT" ] && break
             echo "Private MySQL software root must be entered explicitly for side-by-side versions." >&2
         done
         safe_path "$PRIVATE_SOFTWARE_ROOT"
-        PRIVATE_PAYLOAD_ROOT="$PRIVATE_SOFTWARE_ROOT/payload"
+        PRIVATE_PAYLOAD_ROOT="$PRIVATE_SOFTWARE_ROOT"
         TARGET_MYSQLD_PATH="$PRIVATE_PAYLOAD_ROOT$SYSTEM_MYSQLD_PATH"
+        log "Private mysqld path selected from the entered installation root: $TARGET_MYSQLD_PATH"
     fi
     ask "systemd service name" "mysqld-$OS_USER"; SERVICE_NAME=$ASK_RESULT
     case "$SERVICE_NAME" in *[!A-Za-z0-9_.@-]*|'') die "Invalid systemd service name" ;; esac
@@ -1007,17 +1008,17 @@ prepare_private_software() {
     [ ! -e "$PRIVATE_SOFTWARE_ROOT" ] || die "Refusing to overwrite private software root: $PRIVATE_SOFTWARE_ROOT"
     _parent=$(dirname "$PRIVATE_SOFTWARE_ROOT")
     mkdir -p "$_parent" || die "Cannot create parent directory for private software root: $_parent"
-    mkdir -p "$PRIVATE_PAYLOAD_ROOT" || die "Cannot create private software payload root: $PRIVATE_PAYLOAD_ROOT"
+    mkdir -p "$PRIVATE_PAYLOAD_ROOT" || die "Cannot create private MySQL installation root: $PRIVATE_PAYLOAD_ROOT"
     chmod 755 "$PRIVATE_SOFTWARE_ROOT" "$PRIVATE_PAYLOAD_ROOT" || die "Cannot set traversal permissions on private software root"
     PRIVATE_SOFTWARE_CREATED=yes
 
-    log "Extracting MySQL $TARGET_VERSION RPM payloads into private software root; RPM database will not be modified"
+    log "Extracting MySQL $TARGET_VERSION RPM contents directly into the user-entered private installation root; RPM database will not be modified"
     for _rpm in $CORE_RPMS; do
         (cd "$PRIVATE_PAYLOAD_ROOT" && rpm2cpio "$_rpm" | cpio -idm --quiet) || die "Failed to extract RPM payload: $(basename "$_rpm")"
     done
     # umask 027 must not make root-owned software directories inaccessible to the mysqld OS account.
     # Grant read/traverse only; no write permission is granted to non-root users.
-    chmod -R a+rX "$PRIVATE_PAYLOAD_ROOT" || die "Cannot set read/traverse permissions on private MySQL payload"
+    chmod -R a+rX "$PRIVATE_PAYLOAD_ROOT" || die "Cannot set read/traverse permissions on private MySQL installation tree"
     [ -x "$TARGET_MYSQLD_PATH" ] || die "Private mysqld was not extracted as expected: $TARGET_MYSQLD_PATH"
 
     _ver=$($TARGET_MYSQLD_PATH --no-defaults --version 2>&1 || true)
