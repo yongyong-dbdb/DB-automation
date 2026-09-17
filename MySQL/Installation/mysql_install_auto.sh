@@ -1,7 +1,7 @@
 #!/bin/sh
 # Oracle MySQL Community RPM Bundle installer
 # POSIX /bin/sh, no third-party runtime dependency
-SCRIPT_VERSION="1.0.28"
+SCRIPT_VERSION="1.0.29"
 set -u
 umask 027
 
@@ -650,6 +650,25 @@ select_private_directory() {
     TARGET_MYSQLD_PATH="$PRIVATE_PAYLOAD_ROOT$SYSTEM_MYSQLD_PATH"
 }
 
+show_software_file_examples() {
+    _example_root=$1
+    printf '  Installation directory: %s\n' "$_example_root" >&2
+    printf '  Server executable:      %s%s\n' "$_example_root" "$SYSTEM_MYSQLD_PATH" >&2
+    for _example_name in mysql mysqldump; do
+        _example_relative=$(rpm -qpl "$CLIENT_RPM" 2>/dev/null | awk -F/ -v name="$_example_name" '$NF==name {print; exit}')
+        [ -z "$_example_relative" ] || printf '  %s executable: %s%s\n' "$_example_name" "$_example_root" "$_example_relative" >&2
+    done
+    echo "  Socket/PID files are runtime files, not server executables." >&2
+}
+
+show_runtime_file_example() {
+    printf '  Example full file path: %s\n' "$1" >&2
+    echo "  Example only; enter your chosen absolute path including filename." >&2
+    if [ "$2" = socket ]; then
+        printf '  Automatic lock file:    %s.lock (no input required)\n' "$1" >&2
+    fi
+}
+
 collect_instance_inputs() {
     _owner=$(stat -c '%U' "$SCRIPT_DIR" 2>/dev/null || echo mysql)
     case "$_owner" in root|UNKNOWN|'') _owner=mysql ;; esac
@@ -685,11 +704,13 @@ collect_instance_inputs() {
         echo "Enter a NEW directory for this version's executable, libraries and plugins." >&2
         echo "Enter only a directory; do not append the RPM binary path $SYSTEM_MYSQLD_PATH." >&2
         echo "Socket and PID files are configured separately below and must use a different directory." >&2
+        echo "Example only (directory need not use this name):" >&2
+        show_software_file_examples "${INSTANCE_ROOT%/}/software"
         while :; do
             ask "MySQL $TARGET_VERSION installation directory (absolute directory path)" ""
             if select_private_directory "$ASK_RESULT"; then
                 log "Installation directory: $PRIVATE_SOFTWARE_ROOT"
-                log "Detected RPM layout -> executable: $TARGET_MYSQLD_PATH"
+                show_software_file_examples "$PRIVATE_SOFTWARE_ROOT"
                 break
             fi
         done
@@ -713,9 +734,11 @@ collect_instance_inputs() {
         [ -n "$LOGDIR" ] && break
         echo "Log directory must be entered explicitly." >&2
     done
+    show_runtime_file_example "${INSTANCE_ROOT%/}/mysqld/$OS_USER.sock" socket
     ask_runtime_path "SQL socket file (absolute path including filename)"
     SOCKET=$ASK_RESULT
     RUNDIR=$(dirname "$SOCKET")
+    show_runtime_file_example "$RUNDIR/$OS_USER.pid" pid
     ask_runtime_path "PID file (absolute path including filename)"
     PIDFILE=$ASK_RESULT
     while :; do
@@ -802,6 +825,7 @@ collect_network_inputs() {
         _xbind_default=${BIND_ADDRESS:-127.0.0.1}
         [ -n "$_xbind_default" ] || _xbind_default=127.0.0.1
         ask "MySQL X Protocol bind-address" "$_xbind_default"; MYSQLX_BIND_ADDRESS=$ASK_RESULT
+        show_runtime_file_example "$RUNDIR/$OS_USER-x.sock" socket
         ask_runtime_path "MySQL X socket file (absolute path including filename)"
         MYSQLX_SOCKET=$ASK_RESULT
     else
