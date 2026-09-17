@@ -1,7 +1,7 @@
 #!/bin/sh
 # Oracle MySQL Community RPM Bundle installer
 # POSIX /bin/sh, no third-party runtime dependency
-SCRIPT_VERSION="1.0.26"
+SCRIPT_VERSION="1.0.27"
 set -u
 umask 027
 
@@ -627,6 +627,25 @@ validate_runtime_paths() {
     done
 }
 
+derive_private_root() {
+    # Preserve the RPM layout; never guess a version, filename or suffix.
+    case "$1" in
+        *"$SYSTEM_MYSQLD_PATH") _install_root=${1%"$SYSTEM_MYSQLD_PATH"} ;;
+        *) echo "The executable path must end with $SYSTEM_MYSQLD_PATH; arbitrary relocation is not supported." >&2; return 1 ;;
+    esac
+    case "$_install_root" in
+        ""|/|/home|/usr|/etc|/var|/tmp|/opt|/run|"$INSTANCE_ROOT")
+            echo "Choose a dedicated, new software directory; a shared root or instance root is not allowed." >&2
+            return 1 ;;
+    esac
+    if [ -e "$_install_root" ] || [ -L "$_install_root" ]; then
+        echo "Installation root already exists; it will not be overwritten: $_install_root" >&2
+        return 1
+    fi
+    PRIVATE_SOFTWARE_ROOT=$_install_root
+    return 0
+}
+
 collect_instance_inputs() {
     _owner=$(stat -c '%U' "$SCRIPT_DIR" 2>/dev/null || echo mysql)
     case "$_owner" in root|UNKNOWN|'') _owner=mysql ;; esac
@@ -658,15 +677,19 @@ collect_instance_inputs() {
     done
     safe_path "$INSTANCE_ROOT"
     if [ "$PACKAGE_ACTION" = coexist ]; then
+        echo "Enter the full destination path of the mysqld executable, including its filename." >&2
+        echo "The path must end with $SYSTEM_MYSQLD_PATH (detected from this RPM bundle)." >&2
+        echo "Related libraries and plugins will be extracted under the derived installation root." >&2
         while :; do
-            ask "MySQL program installation directory for $TARGET_VERSION (binary: <input>$SYSTEM_MYSQLD_PATH; NOT socket/PID directory)" ""; PRIVATE_SOFTWARE_ROOT=$ASK_RESULT
-            [ -n "$PRIVATE_SOFTWARE_ROOT" ] && break
-            echo "Private MySQL software root must be entered explicitly for side-by-side versions." >&2
+            ask_runtime_path "mysqld executable destination (absolute file path)"
+            if derive_private_root "$ASK_RESULT"; then
+                TARGET_MYSQLD_PATH=$ASK_RESULT
+                PRIVATE_PAYLOAD_ROOT=$PRIVATE_SOFTWARE_ROOT
+                log "mysqld executable: $TARGET_MYSQLD_PATH"
+                log "Related MySQL files will be installed under: $PRIVATE_SOFTWARE_ROOT"
+                break
+            fi
         done
-        safe_path "$PRIVATE_SOFTWARE_ROOT"
-        PRIVATE_PAYLOAD_ROOT="$PRIVATE_SOFTWARE_ROOT"
-        TARGET_MYSQLD_PATH="$PRIVATE_PAYLOAD_ROOT$SYSTEM_MYSQLD_PATH"
-        log "Private mysqld path selected from the entered installation root: $TARGET_MYSQLD_PATH"
     fi
     ask "systemd service name" "mysqld-$OS_USER"; SERVICE_NAME=$ASK_RESULT
     case "$SERVICE_NAME" in *[!A-Za-z0-9_.@-]*|'') die "Invalid systemd service name" ;; esac
