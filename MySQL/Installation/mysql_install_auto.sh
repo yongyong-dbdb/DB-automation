@@ -1,7 +1,7 @@
 #!/bin/sh
 # Oracle MySQL Community RPM Bundle installer
 # POSIX /bin/sh, no third-party runtime dependency
-SCRIPT_VERSION="1.0.30"
+SCRIPT_VERSION="1.0.31"
 set -u
 umask 027
 
@@ -1485,6 +1485,34 @@ start_service() {
     SERVICE_STARTED=yes
 }
 
+print_initial_root_password() {
+    # Read only this run's initialization log; never execute or transform the secret.
+    if [ ! -r "$1" ]; then
+        echo "Initialization log is not readable: $1" >&2
+        return 0
+    fi
+    LC_ALL=C awk '
+        {
+            marker="A temporary password is generated for root@localhost: "
+            pos=index($0,marker)
+            if(pos) {
+                password=substr($0,pos+length(marker))
+                sub(/\r$/, "", password)
+                if(length(password)) found=1
+            }
+        }
+        END {
+            if(found) {
+                print "Account: root@localhost"
+                printf "Temporary root password: %s\n",password
+                print "Change this password after the first login."
+            } else {
+                print "No root@localhost temporary password found; inspect the initialization log."
+            }
+        }
+    ' "$1"
+}
+
 postcheck() {
     echo ""
     echo "===== POST-INSTALL VALIDATION ====="
@@ -1538,13 +1566,9 @@ postcheck() {
         ls -Zd "$CONF" "$DATADIR" "$LOGDIR" $(runtime_dirs) "$FILESDIR" 2>/dev/null || true
         ps -eZ 2>/dev/null | grep "[m]ysqld" || true
     fi
-    echo "-- Initial root password location --"
-    if grep -i 'temporary password' "$INIT_LOG" >/dev/null 2>&1; then
-        echo "$INIT_LOG"
-        grep -i 'temporary password' "$INIT_LOG" | sed 's/: .*/: <hidden>/' || true
-    else
-        echo "No temporary-password line detected; inspect $INIT_LOG"
-    fi
+    echo "-- Initial root credentials (this instance) --"
+    echo "Initialization log: $INIT_LOG"
+    print_initial_root_password "$INIT_LOG"
     echo "Manual login / password change command:"
     if [ -n "${PRIVATE_MYSQL_BIN:-}" ] && [ -x "$PRIVATE_MYSQL_BIN" ]; then
         echo "  $PRIVATE_MYSQL_BIN --defaults-file=$CONF --protocol=socket -uroot -p"
