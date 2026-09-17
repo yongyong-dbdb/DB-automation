@@ -1,7 +1,7 @@
 #!/bin/sh
 # Oracle MySQL Community RPM Bundle installer
 # POSIX /bin/sh, no third-party runtime dependency
-SCRIPT_VERSION="1.0.27"
+SCRIPT_VERSION="1.0.28"
 set -u
 umask 027
 
@@ -627,23 +627,27 @@ validate_runtime_paths() {
     done
 }
 
-derive_private_root() {
-    # Preserve the RPM layout; never guess a version, filename or suffix.
-    case "$1" in
-        *"$SYSTEM_MYSQLD_PATH") _install_root=${1%"$SYSTEM_MYSQLD_PATH"} ;;
-        *) echo "The executable path must end with $SYSTEM_MYSQLD_PATH; arbitrary relocation is not supported." >&2; return 1 ;;
-    esac
+select_private_directory() {
+    _install_root=$1
+    while [ "${_install_root%/}" != "$_install_root" ]; do
+        _install_root=${_install_root%/}
+    done
     case "$_install_root" in
-        ""|/|/home|/usr|/etc|/var|/tmp|/opt|/run|"$INSTANCE_ROOT")
-            echo "Choose a dedicated, new software directory; a shared root or instance root is not allowed." >&2
+        ""|/home|/usr|/etc|/var|/tmp|/opt|/run|"$INSTANCE_ROOT")
+            echo "Choose a dedicated new directory for this MySQL version." >&2
+            return 1 ;;
+        */./*|*/../*|*/.|*/..|*//*)
+            echo "Use a normalized absolute directory path." >&2
             return 1 ;;
     esac
+    safe_path "$_install_root"
     if [ -e "$_install_root" ] || [ -L "$_install_root" ]; then
-        echo "Installation root already exists; it will not be overwritten: $_install_root" >&2
+        echo "Directory already exists; it will not be overwritten: $_install_root" >&2
         return 1
     fi
     PRIVATE_SOFTWARE_ROOT=$_install_root
-    return 0
+    PRIVATE_PAYLOAD_ROOT=$_install_root
+    TARGET_MYSQLD_PATH="$PRIVATE_PAYLOAD_ROOT$SYSTEM_MYSQLD_PATH"
 }
 
 collect_instance_inputs() {
@@ -677,19 +681,20 @@ collect_instance_inputs() {
     done
     safe_path "$INSTANCE_ROOT"
     if [ "$PACKAGE_ACTION" = coexist ]; then
-        echo "Enter the full destination path of the mysqld executable, including its filename." >&2
-        echo "The path must end with $SYSTEM_MYSQLD_PATH (detected from this RPM bundle)." >&2
-        echo "Related libraries and plugins will be extracted under the derived installation root." >&2
+        echo "The installed MySQL version differs from $TARGET_VERSION; separate server files are required." >&2
+        echo "Enter a NEW directory for this version's executable, libraries and plugins." >&2
+        echo "Enter only a directory; do not append the RPM binary path $SYSTEM_MYSQLD_PATH." >&2
+        echo "Socket and PID files are configured separately below and must use a different directory." >&2
         while :; do
-            ask_runtime_path "mysqld executable destination (absolute file path)"
-            if derive_private_root "$ASK_RESULT"; then
-                TARGET_MYSQLD_PATH=$ASK_RESULT
-                PRIVATE_PAYLOAD_ROOT=$PRIVATE_SOFTWARE_ROOT
-                log "mysqld executable: $TARGET_MYSQLD_PATH"
-                log "Related MySQL files will be installed under: $PRIVATE_SOFTWARE_ROOT"
+            ask "MySQL $TARGET_VERSION installation directory (absolute directory path)" ""
+            if select_private_directory "$ASK_RESULT"; then
+                log "Installation directory: $PRIVATE_SOFTWARE_ROOT"
+                log "Detected RPM layout -> executable: $TARGET_MYSQLD_PATH"
                 break
             fi
         done
+    else
+        log "MySQL executable from the system RPM: $TARGET_MYSQLD_PATH"
     fi
     ask "systemd service name" "mysqld-$OS_USER"; SERVICE_NAME=$ASK_RESULT
     case "$SERVICE_NAME" in *[!A-Za-z0-9_.@-]*|'') die "Invalid systemd service name" ;; esac
