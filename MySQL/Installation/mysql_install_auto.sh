@@ -1,7 +1,7 @@
 #!/bin/sh
 # Oracle MySQL Community RPM Bundle installer
 # POSIX /bin/sh, no third-party runtime dependency
-SCRIPT_VERSION="1.0.29"
+SCRIPT_VERSION="1.0.30"
 set -u
 umask 027
 
@@ -652,13 +652,37 @@ select_private_directory() {
 
 show_software_file_examples() {
     _example_root=$1
-    printf '  Installation directory: %s\n' "$_example_root" >&2
-    printf '  Server executable:      %s%s\n' "$_example_root" "$SYSTEM_MYSQLD_PATH" >&2
-    for _example_name in mysql mysqldump; do
-        _example_relative=$(rpm -qpl "$CLIENT_RPM" 2>/dev/null | awk -F/ -v name="$_example_name" '$NF==name {print; exit}')
-        [ -z "$_example_relative" ] || printf '  %s executable: %s%s\n' "$_example_name" "$_example_root" "$_example_relative" >&2
+    printf '\n이 디렉터리에 설치되는 파일 (전체 경로): %s\n' "$_example_root" >&2
+    for _example_rpm in $CORE_RPMS; do
+        rpm -qpl "$_example_rpm" > "$WORKDIR/install-preview.paths" 2>/dev/null ||
+            die "Cannot read RPM file list: $_example_rpm"
+        awk -v root="$_example_root" '
+            /\/$/ {next}
+            {
+                n=split($0,a,"/"); name=a[n]; label=""
+                if(name=="mysqld") label="MySQL 서버 실행 파일"
+                else if(name=="mysql") label="SQL 접속 클라이언트"
+                else if(name=="mysqldump") label="논리 백업 프로그램"
+                else if(name=="mysqladmin") label="서버 관리 프로그램"
+                else if(name=="my_print_defaults") label="설정 옵션 확인 프로그램"
+                else if(name ~ /[.]so([.]|$)/ && libs++ < 3) label="라이브러리 또는 플러그인 (일부)"
+                else if(name=="errmsg.sys" && messages++ < 1) label="서버 오류 메시지 파일 (일부)"
+                if(label!="") printf "  %s%s — %s\n",root,$0,label
+            }
+        ' "$WORKDIR/install-preview.paths" >&2
     done
-    echo "  Socket/PID files are runtime files, not server executables." >&2
+    echo "위 목록은 주요 파일입니다. RPM에 포함된 나머지 지원 파일도 함께 설치됩니다." >&2
+    echo "DB 데이터, 로그, 소켓 및 PID는 이후 별도로 입력한 경로에 생성됩니다." >&2
+}
+
+show_all_software_paths() {
+    echo "===== 선택한 RPM의 전체 설치 경로 (디렉터리 포함) =====" >&2
+    for _preview_rpm in $CORE_RPMS; do
+        printf 'RPM: %s\n' "${_preview_rpm##*/}" >&2
+        rpm -qpl "$_preview_rpm" > "$WORKDIR/install-preview.paths" 2>/dev/null ||
+            die "Cannot read RPM file list: $_preview_rpm"
+        awk -v root="$PRIVATE_SOFTWARE_ROOT" '{print root $0}' "$WORKDIR/install-preview.paths" >&2
+    done
 }
 
 show_runtime_file_example() {
@@ -707,10 +731,13 @@ collect_instance_inputs() {
         echo "Example only (directory need not use this name):" >&2
         show_software_file_examples "${INSTANCE_ROOT%/}/software"
         while :; do
-            ask "MySQL $TARGET_VERSION installation directory (absolute directory path)" ""
+            ask "MySQL $TARGET_VERSION 실행 파일·라이브러리를 설치할 새 디렉터리 (위 파일들이 들어갈 위치)" ""
             if select_private_directory "$ASK_RESULT"; then
                 log "Installation directory: $PRIVATE_SOFTWARE_ROOT"
                 show_software_file_examples "$PRIVATE_SOFTWARE_ROOT"
+                if ask_yn "전체 설치 파일 경로 목록도 확인하시겠습니까" no; then
+                    show_all_software_paths
+                fi
                 break
             fi
         done
