@@ -1,7 +1,7 @@
 #!/bin/sh
 # Oracle MySQL Community RPM Bundle installer
 # POSIX /bin/sh, no third-party runtime dependency
-SCRIPT_VERSION="1.0.24"
+SCRIPT_VERSION="1.0.25"
 set -u
 umask 027
 
@@ -807,10 +807,6 @@ detect_mysql_conf_selinux_type() {
 collect_selinux_choice() {
     SELINUX_STATE=$(getenforce 2>/dev/null || echo Disabled)
     SELINUX_APPLY=no
-    if [ "$START_METHOD" = daemonize ] && [ "$SELINUX_STATE" != Disabled ]; then
-        warn "Direct mysqld --daemonize was selected while SELinux is $SELINUX_STATE. Direct startup may run outside mysqld_t even when file/port contexts are applied; systemd is the recommended Oracle RPM startup path."
-        ask_yn "Continue with direct --daemonize startup under active SELinux" no || die "Choose systemd startup or manage SELinux policy separately"
-    fi
     case "$SELINUX_STATE" in
         Enforcing|Permissive)
             if ask_yn "Apply MySQL SELinux file/port contexts for selected custom paths and ports" yes; then
@@ -828,6 +824,13 @@ collect_selinux_choice() {
             ;;
     esac
 }
+confirm_direct_start_selinux() {
+    [ "$START_METHOD" = daemonize ] || return 0
+    [ "$SELINUX_STATE" != Disabled ] || return 0
+    warn "Direct mysqld --daemonize was selected while SELinux is $SELINUX_STATE. Direct startup may run outside mysqld_t even when file/port contexts are applied; systemd is the recommended Oracle RPM startup path."
+    ask_yn "Continue with direct --daemonize startup under active SELinux" no || die "Choose systemd startup or manage SELinux policy separately"
+}
+
 check_instance_collisions() {
     [ "$PORT" -ge 1024 ] || block "Port $PORT requires root privileges; mysqld runs as $OS_USER"
     port_busy "$PORT" && block "SQL port already in use: $PORT"
@@ -1441,11 +1444,12 @@ main() {
     if [ "$MODE" = install ] && [ "$BLOCKERS" -gt 0 ]; then
         die "Precheck blockers detected. No installation changes made."
     fi
+    collect_selinux_choice
     collect_instance_inputs
     collect_start_method
+    confirm_direct_start_selinux
     collect_network_inputs
     collect_profile_inputs
-    collect_selinux_choice
     choose_dependency_mode
     refresh_collision_cache
     check_instance_collisions
