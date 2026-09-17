@@ -1,7 +1,7 @@
 #!/bin/sh
 # Oracle MySQL Community RPM Bundle installer
 # POSIX /bin/sh, no third-party runtime dependency
-SCRIPT_VERSION="1.0.31"
+SCRIPT_VERSION="1.0.32"
 set -u
 umask 027
 
@@ -593,6 +593,34 @@ ask_runtime_path() {
         break
     done
 }
+validate_log_paths() {
+    case "$LOGDIR" in /|/home|/usr|/etc|/var|/tmp|/opt|/run|"$INSTANCE_ROOT")
+        block "Use a dedicated log directory: $LOGDIR" ;;
+    esac
+    for _log_other in "$DATADIR" "$FILESDIR" "${PRIVATE_SOFTWARE_ROOT:-}"; do
+        [ -n "$_log_other" ] || continue
+        case "$LOGDIR/" in "${_log_other%/}/"*) block "Log directory overlaps $_log_other" ;; esac
+        case "${_log_other%/}/" in "$LOGDIR/"*) block "Log directory contains $_log_other" ;; esac
+    done
+    _log_seen=""
+    for _log_file in "$LOGFILE" "$LOGDIR/initialize.log" "$SLOWLOG"; do
+        case " $_log_seen " in *" $_log_file "*) block "Log file paths collide: $_log_file" ;; esac
+        _log_seen="$_log_seen $_log_file"
+        [ ! -e "$_log_file" ] && [ ! -L "$_log_file" ] || block "Log path already exists: $_log_file"
+        for _log_reserved in "$CONF" "$SOCKET" "$SOCKET.lock" "$PIDFILE" ${MYSQLX_SOCKET:+"$MYSQLX_SOCKET"} ${MYSQLX_SOCKET:+"$MYSQLX_SOCKET.lock"}; do
+            [ "$_log_file" != "$_log_reserved" ] || block "Log path conflicts with file $_log_reserved"
+        done
+        for _log_dir in "$INSTANCE_ROOT" "$DATADIR" "$LOGDIR" "$FILESDIR" "$(dirname "$CONF")" $(runtime_dirs); do
+            case "${_log_dir%/}/" in "$_log_file/"*) block "Log file conflicts with directory $_log_dir" ;; esac
+        done
+    done
+    _log_parent=$LOGDIR
+    while [ "$_log_parent" != / ]; do
+        [ ! -L "$_log_parent" ] || block "Log directory has a symbolic-link component: $_log_parent"
+        [ ! -e "$_log_parent" ] || [ -d "$_log_parent" ] || block "Log parent is not a directory: $_log_parent"
+        _log_parent=$(dirname "$_log_parent")
+    done
+}
 runtime_dirs() {
     {
         dirname "$SOCKET"
@@ -756,11 +784,13 @@ collect_instance_inputs() {
         [ -n "$DATADIR" ] && break
         echo "Data directory must be entered explicitly." >&2
     done
-    while :; do
-        ask "Log directory (absolute path; explicit input required)" ""; LOGDIR=$ASK_RESULT
-        [ -n "$LOGDIR" ] && break
-        echo "Log directory must be entered explicitly." >&2
-    done
+    show_runtime_file_example "${INSTANCE_ROOT%/}/log/$OS_USER.log" log
+    ask_runtime_path "Error log file (absolute path including filename)"
+    LOGFILE=$ASK_RESULT
+    LOGDIR=$(dirname "$LOGFILE")
+    echo "Log directory derived from error log: $LOGDIR" >&2
+    echo "Initialization log: $LOGDIR/initialize.log" >&2
+    echo "Slow query log (when enabled): $LOGDIR/slow.log" >&2
     show_runtime_file_example "${INSTANCE_ROOT%/}/mysqld/$OS_USER.sock" socket
     ask_runtime_path "SQL socket file (absolute path including filename)"
     SOCKET=$ASK_RESULT
@@ -860,6 +890,11 @@ collect_network_inputs() {
     fi
 }
 collect_profile_inputs() {
+    if ask_yn "Enable Performance Schema (performance_schema)" yes; then
+        PERFORMANCE_SCHEMA=ON
+    else
+        PERFORMANCE_SCHEMA=OFF
+    fi
     while :; do
         ask "my.cnf profile: 1=minimum, 2=production" "1"; PROFILE=$ASK_RESULT
         case "$PROFILE" in 1) PROFILE_NAME=minimum; break ;; 2) PROFILE_NAME=production; break ;; esac
@@ -965,8 +1000,8 @@ check_instance_collisions() {
     _sel_t=$(selinux_conflicting_port_type "$PORT" || true)
     [ -z "$_sel_t" ] || block "SQL port $PORT reserved by SELinux type $_sel_t"
     validate_runtime_paths
-    LOGFILE="$LOGDIR/mysqld.log"
     SLOWLOG="$LOGDIR/slow.log"
+    validate_log_paths
 
     socket_busy "$SOCKET" && block "Unix socket already in use: $SOCKET"
     [ -e "$SOCKET" ] && block "Unix socket path already exists: $SOCKET"
@@ -1044,6 +1079,7 @@ datadir=$DATADIR
 socket=$SOCKET
 pid-file=$PIDFILE
 log-error=$LOGFILE
+performance_schema=$PERFORMANCE_SCHEMA
 secure-file-priv=$FILESDIR
 EOF
     if [ "$TCP_ENABLED" = yes ]; then
@@ -1119,6 +1155,7 @@ show_plan() {
     echo "Config        : $CONF"
     echo "Data          : $DATADIR"
     echo "Log           : $LOGFILE"
+    echo "Performance Schema: $PERFORMANCE_SCHEMA"
     echo "Socket        : $SOCKET"
     echo "PID           : $PIDFILE"
     echo "SQL port      : $PORT"
@@ -1417,9 +1454,13 @@ validate_config() {
     fi
     _effective="$WORKDIR/effective-options.txt"
     "$MYSQLD_BIN" --defaults-file="$CONF" --print-defaults >"$_effective" 2>&1 || die "Could not inspect option-file values with mysqld --print-defaults"
-    for _check in "datadir:$DATADIR" "socket:$SOCKET" "pid-file:$PIDFILE" "port:$PORT"; do
+    for _check in "datadir:$DATADIR" "socket:$SOCKET" "pid-file:$PIDFILE" "port:$PORT" "log-error:$LOGFILE" "performance-schema:$PERFORMANCE_SCHEMA"; do
         _key=${_check%%:*}; _want=${_check#*:}
-        _got=$(tr ' ' '\n' < "$_effective" | sed -n "s/^--${_key}=//p" | tail -n 1)
+        _got=$(tr ' ' '\n' < "$_effective" | awk -v key="--$_key" '
+            { pos=index($0,"="); if(!pos) next
+              name=substr($0,1,pos-1); gsub(/_/,"-",name)
+              if(name==key) value=substr($0,pos+1) }
+            END {print value}')
         if [ "$_key" = port ]; then
             [ "$_got" = "$_want" ] || die "Configured option mismatch for $_key: ${_got:-<empty>} != $_want"
         else
