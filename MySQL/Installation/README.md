@@ -2,7 +2,7 @@
 
 `mysql_install_auto.sh`는 사용자가 미리 준비한 Oracle MySQL Community RPM Bundle(`*.rpm-bundle.tar`)을 이용해 신규 MySQL 인스턴스를 구성하는 POSIX `/bin/sh` 스크립트다.
 
-현재 스크립트 버전: **v1.0.25**
+현재 스크립트 버전: **v1.0.27**
 
 ## 핵심 원칙
 
@@ -307,3 +307,15 @@ v1.0.23 기준 테스트 Host에서 기존 MySQL 9.7.2 인스턴스 3개가 실�
 - Production 적용 전 동일한 OS/MySQL Version/Topology에서 Dry-run과 테스트를 선행한다.
 - 사용자 지정 경로와 Port는 최종 Plan에서 반드시 확인한다.
 - SELinux 활성 환경에서는 systemd 기동이 가장 예측 가능한 MySQL process domain을 제공한다.
+
+## v1.0.27 입력 변경
+
+버전 공존 모드에서는 설치 root 대신 mysqld 실행 파일의 전체 목적지 경로를 입력한다.
+예: `/opt/mysql-8.0.46-mysql4/usr/sbin/mysqld`.
+RPM에서 확인한 실행 파일 경로를 접미사로 유지해야 하며, 나머지를 설치 root로 계산한다.
+임의 파일명 변경이나 RPM 구조와 다른 재배치는 지원하지 않는다. 기존 설치 디렉터리는 덮어쓰지 않는다.
+이 경로는 socket/PID 경로와 별개다. SQL socket 및 PID 파일은 파일명을 포함해 각각 입력하고,
+MySQL X socket은 X Protocol을 활성화한 경우에만 입력한다.
+
+검증: POSIX sh 문법, 설치 root 계산, 잘못된 접미사 및 공유 경로 거부 테스트 통과.
+실서버 RPM 설치 검증은 별도로 필요하다.
