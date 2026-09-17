@@ -1,7 +1,7 @@
 #!/bin/sh
 # Oracle MySQL Community RPM Bundle installer
 # POSIX /bin/sh, no third-party runtime dependency
-SCRIPT_VERSION="1.0.25"
+SCRIPT_VERSION="1.0.26"
 set -u
 umask 027
 
@@ -581,6 +581,52 @@ print_precheck_summary() {
     echo "Warnings      : $WARNINGS"
     echo "============================"
 }
+ask_runtime_path() {
+    while :; do
+        ask "$1" ""
+        [ -n "$ASK_RESULT" ] || { echo "Explicit file path required." >&2; continue; }
+        safe_path "$ASK_RESULT"
+        case "$ASK_RESULT" in
+            /|*/|*/./*|*/../*|*/.|*/..|*//*)
+                echo "Use a normalized absolute file path." >&2; continue ;;
+        esac
+        break
+    done
+}
+runtime_dirs() {
+    {
+        dirname "$SOCKET"
+        dirname "$PIDFILE"
+        [ -z "${MYSQLX_SOCKET:-}" ] || dirname "$MYSQLX_SOCKET"
+    } | awk '!seen[$0]++'
+}
+validate_runtime_paths() {
+    _runtime_seen=""
+    for _runtime_file in "$SOCKET" "$SOCKET.lock" "$PIDFILE" ${MYSQLX_SOCKET:+"$MYSQLX_SOCKET"} ${MYSQLX_SOCKET:+"$MYSQLX_SOCKET.lock"}; do
+        case " $_runtime_seen " in *" $_runtime_file "*) block "Runtime file paths collide: $_runtime_file" ;; esac
+        _runtime_seen="$_runtime_seen $_runtime_file"
+        [ ! -e "$_runtime_file" ] && [ ! -L "$_runtime_file" ] || block "Runtime path already exists: $_runtime_file"
+        [ "$_runtime_file" != "$CONF" ] || block "Runtime path conflicts with config: $_runtime_file"
+    done
+    for _runtime_socket in "$SOCKET" ${MYSQLX_SOCKET:+"$MYSQLX_SOCKET"}; do
+        [ ${#_runtime_socket} -lt 100 ] || block "Unix socket path too long: $_runtime_socket"
+    done
+    for _runtime_dir in $(runtime_dirs); do
+        case "$_runtime_dir" in /|/home|/usr|/etc|/var|/tmp|/opt|/run|"$INSTANCE_ROOT")
+            block "Use a dedicated runtime directory: $_runtime_dir" ;;
+        esac
+        for _other in "$DATADIR" "$LOGDIR" "$FILESDIR" "${PRIVATE_SOFTWARE_ROOT:-}"; do
+            [ -n "$_other" ] || continue
+            case "$_runtime_dir/" in "$_other/"*) block "Runtime directory overlaps $_other" ;; esac
+            case "$_other/" in "$_runtime_dir/"*) block "Runtime directory contains $_other" ;; esac
+        done
+        for _runtime_file in $_runtime_seen "$CONF"; do
+            case "$_runtime_dir/" in "$_runtime_file/"*) block "Runtime directory conflicts with file $_runtime_file" ;; esac
+        done
+        warn_if_path_not_creatable "Runtime directory" "$_runtime_dir"
+    done
+}
+
 collect_instance_inputs() {
     _owner=$(stat -c '%U' "$SCRIPT_DIR" 2>/dev/null || echo mysql)
     case "$_owner" in root|UNKNOWN|'') _owner=mysql ;; esac
@@ -613,7 +659,7 @@ collect_instance_inputs() {
     safe_path "$INSTANCE_ROOT"
     if [ "$PACKAGE_ACTION" = coexist ]; then
         while :; do
-            ask "Private MySQL installation root for $TARGET_VERSION (will contain usr/sbin/mysqld; absolute path; explicit input required)" ""; PRIVATE_SOFTWARE_ROOT=$ASK_RESULT
+            ask "MySQL program installation directory for $TARGET_VERSION (binary: <input>$SYSTEM_MYSQLD_PATH; NOT socket/PID directory)" ""; PRIVATE_SOFTWARE_ROOT=$ASK_RESULT
             [ -n "$PRIVATE_SOFTWARE_ROOT" ] && break
             echo "Private MySQL software root must be entered explicitly for side-by-side versions." >&2
         done
@@ -639,17 +685,17 @@ collect_instance_inputs() {
         [ -n "$LOGDIR" ] && break
         echo "Log directory must be entered explicitly." >&2
     done
-    while :; do
-        ask "Socket/PID directory (absolute path; explicit input required)" ""; RUNDIR=$ASK_RESULT
-        [ -n "$RUNDIR" ] && break
-        echo "Socket/PID directory must be entered explicitly." >&2
-    done
+    ask_runtime_path "SQL socket file (absolute path including filename)"
+    SOCKET=$ASK_RESULT
+    RUNDIR=$(dirname "$SOCKET")
+    ask_runtime_path "PID file (absolute path including filename)"
+    PIDFILE=$ASK_RESULT
     while :; do
         ask "secure_file_priv directory (absolute path; explicit input required)" ""; FILESDIR=$ASK_RESULT
         [ -n "$FILESDIR" ] && break
         echo "secure_file_priv directory must be entered explicitly." >&2
     done
-    for _p in "$CONF" "$DATADIR" "$LOGDIR" "$RUNDIR" "$FILESDIR"; do safe_path "$_p"; done
+    for _p in "$CONF" "$DATADIR" "$LOGDIR" $(runtime_dirs) "$FILESDIR"; do safe_path "$_p"; done
 }
 collect_start_method() {
     echo ""
@@ -728,7 +774,8 @@ collect_network_inputs() {
         _xbind_default=${BIND_ADDRESS:-127.0.0.1}
         [ -n "$_xbind_default" ] || _xbind_default=127.0.0.1
         ask "MySQL X Protocol bind-address" "$_xbind_default"; MYSQLX_BIND_ADDRESS=$ASK_RESULT
-        MYSQLX_SOCKET="$RUNDIR/mysqlx.sock"
+        ask_runtime_path "MySQL X socket file (absolute path including filename)"
+        MYSQLX_SOCKET=$ASK_RESULT
     else
         MYSQLX_ENABLED=no; MYSQLX_PORT=""; MYSQLX_BIND_ADDRESS=""; MYSQLX_SOCKET=""
     fi
@@ -838,8 +885,7 @@ check_instance_collisions() {
     [ -z "$_port_cf" ] || block "SQL port $PORT already configured in $_port_cf"
     _sel_t=$(selinux_conflicting_port_type "$PORT" || true)
     [ -z "$_sel_t" ] || block "SQL port $PORT reserved by SELinux type $_sel_t"
-    SOCKET="$RUNDIR/mysql.sock"
-    PIDFILE="$RUNDIR/mysqld.pid"
+    validate_runtime_paths
     LOGFILE="$LOGDIR/mysqld.log"
     SLOWLOG="$LOGDIR/slow.log"
 
@@ -1096,24 +1142,29 @@ snapshot_existing_dir() {
 }
 
 prepare_directories() {
-    for _d in "$INSTANCE_ROOT" "$DATADIR" "$LOGDIR" "$RUNDIR" "$FILESDIR"; do snapshot_existing_dir "$_d"; done
+    for _d in "$INSTANCE_ROOT" "$DATADIR" "$LOGDIR" $(runtime_dirs) "$FILESDIR"; do snapshot_existing_dir "$_d"; done
     _root_was_new=no
     [ -d "$INSTANCE_ROOT" ] || _root_was_new=yes
     _data_new=no; [ -d "$DATADIR" ] || _data_new=yes
     _log_new=no; [ -d "$LOGDIR" ] || _log_new=yes
-    _run_new=no; [ -d "$RUNDIR" ] || _run_new=yes
+    for _rd in $(runtime_dirs); do
+        snapshot_existing_dir "$_rd"
+        if [ ! -d "$_rd" ]; then
+            mkdir -p "$_rd" || die "Cannot create runtime directory: $_rd"
+            CREATED_PATHS="$_rd${CREATED_PATHS:+ }$CREATED_PATHS"
+        fi
+    done
     _files_new=no; [ -d "$FILESDIR" ] || _files_new=yes
     _conf_parent=$(dirname "$CONF")
     _conf_parent_new=no; [ -d "$_conf_parent" ] || _conf_parent_new=yes
 
-    mkdir -p "$DATADIR" "$LOGDIR" "$RUNDIR" "$FILESDIR" "$_conf_parent" || die "Directory creation failed"
-    chown "$OS_USER:$OS_GROUP" "$DATADIR" "$LOGDIR" "$RUNDIR" "$FILESDIR"
-    chmod 750 "$DATADIR" "$LOGDIR" "$RUNDIR" "$FILESDIR"
+    mkdir -p "$DATADIR" "$LOGDIR" $(runtime_dirs) "$FILESDIR" "$_conf_parent" || die "Directory creation failed"
+    chown "$OS_USER:$OS_GROUP" "$DATADIR" "$LOGDIR" $(runtime_dirs) "$FILESDIR"
+    chmod 750 "$DATADIR" "$LOGDIR" $(runtime_dirs) "$FILESDIR"
     [ "$_root_was_new" = yes ] && { chown "$OS_USER:$OS_GROUP" "$INSTANCE_ROOT"; chmod 750 "$INSTANCE_ROOT"; }
 
     [ "$_data_new" = yes ] && { DATADIR_CREATED=yes; CREATED_PATHS="$DATADIR${CREATED_PATHS:+ }$CREATED_PATHS"; }
     [ "$_log_new" = yes ] && CREATED_PATHS="$LOGDIR${CREATED_PATHS:+ }$CREATED_PATHS"
-    [ "$_run_new" = yes ] && CREATED_PATHS="$RUNDIR${CREATED_PATHS:+ }$CREATED_PATHS"
     [ "$_files_new" = yes ] && CREATED_PATHS="$FILESDIR${CREATED_PATHS:+ }$CREATED_PATHS"
     [ "$_conf_parent_new" = yes ] && CREATED_PATHS="$_conf_parent${CREATED_PATHS:+ }$CREATED_PATHS"
     [ "$_root_was_new" = yes ] && CREATED_PATHS="$CREATED_PATHS${CREATED_PATHS:+ }$INSTANCE_ROOT"
@@ -1206,7 +1257,10 @@ apply_selinux() {
 
     selinux_fcontext_set mysqld_db_t "$DATADIR(/.*)?"
     selinux_fcontext_set mysqld_log_t "$LOGDIR(/.*)?"
-    selinux_fcontext_set mysqld_var_run_t "$RUNDIR(/.*)?"
+    for _rd in $(runtime_dirs); do
+        _rd_expr=$(printf '%s' "$_rd" | sed 's/[.]/\\./g')
+        selinux_fcontext_set mysqld_var_run_t "$_rd_expr(/.*)?"
+    done
     selinux_fcontext_set mysqld_db_t "$FILESDIR(/.*)?"
     if [ "$PACKAGE_ACTION" = coexist ]; then
         [ -n "${MYSQL_USR_SELINUX_TYPE:-}" ] && selinux_fcontext_set "$MYSQL_USR_SELINUX_TYPE" "$PRIVATE_PAYLOAD_ROOT(/.*)?"
@@ -1218,7 +1272,7 @@ apply_selinux() {
         CONF_SELINUX_EXPR=$(printf '%s' "$CONF" | sed 's/[.]/\\./g')
         selinux_fcontext_set "$MYSQL_CONF_SELINUX_TYPE" "$CONF_SELINUX_EXPR"
     fi
-    restorecon -R "$DATADIR" "$LOGDIR" "$RUNDIR" "$FILESDIR" || die "restorecon failed"
+    restorecon -R "$DATADIR" "$LOGDIR" $(runtime_dirs) "$FILESDIR" || die "restorecon failed"
     [ "$PACKAGE_ACTION" = coexist ] && restorecon -R "$PRIVATE_PAYLOAD_ROOT" || [ "$PACKAGE_ACTION" != coexist ] || die "restorecon failed for private MySQL software tree"
     restorecon -v "$CONF" || die "restorecon failed for MySQL option file: $CONF"
 
@@ -1235,7 +1289,10 @@ verify_selinux_runtime() {
     [ "$SELINUX_APPLY" = yes ] || return 0
     _t=$(selinux_path_type "$DATADIR"); [ "$_t" = mysqld_db_t ] || die "SELinux type mismatch for Data Directory: ${_t:-unknown}"
     _t=$(selinux_path_type "$LOGDIR"); [ "$_t" = mysqld_log_t ] || die "SELinux type mismatch for log directory: ${_t:-unknown}"
-    _t=$(selinux_path_type "$RUNDIR"); [ "$_t" = mysqld_var_run_t ] || die "SELinux type mismatch for socket/PID directory: ${_t:-unknown}"
+    for _rd in $(runtime_dirs); do
+        _t=$(selinux_path_type "$_rd")
+        [ "$_t" = mysqld_var_run_t ] || die "SELinux type mismatch for $_rd: ${_t:-unknown}"
+    done
     _t=$(selinux_path_type "$FILESDIR"); [ "$_t" = mysqld_db_t ] || die "SELinux type mismatch for secure_file_priv directory: ${_t:-unknown}"
     if [ -n "${MYSQL_CONF_SELINUX_TYPE:-}" ]; then
         _t=$(selinux_path_type "$CONF"); [ "$_t" = "$MYSQL_CONF_SELINUX_TYPE" ] || die "SELinux type mismatch for MySQL option file: ${_t:-unknown} != $MYSQL_CONF_SELINUX_TYPE"
@@ -1249,13 +1306,15 @@ verify_selinux_runtime() {
 
 validate_account_access() {
     if command -v runuser >/dev/null 2>&1; then
-        for _d in "$INSTANCE_ROOT" "$(dirname "$CONF")" "$DATADIR" "$LOGDIR" "$RUNDIR" "$FILESDIR"; do
+        for _d in "$INSTANCE_ROOT" "$(dirname "$CONF")" "$DATADIR" "$LOGDIR" $(runtime_dirs) "$FILESDIR"; do
             runuser -u "$OS_USER" -- test -x "$_d" || die "$OS_USER cannot traverse $_d; verify execute permission on this directory and every parent directory"
         done
         runuser -u "$OS_USER" -- test -r "$CONF" || die "$OS_USER cannot read $CONF; verify file mode/group and parent-directory traversal"
         runuser -u "$OS_USER" -- test -w "$DATADIR" || die "$OS_USER cannot write $DATADIR"
         runuser -u "$OS_USER" -- test -w "$LOGDIR" || die "$OS_USER cannot write $LOGDIR"
-        runuser -u "$OS_USER" -- test -w "$RUNDIR" || die "$OS_USER cannot write $RUNDIR"
+        for _rd in $(runtime_dirs); do
+            runuser -u "$OS_USER" -- test -w "$_rd" || die "$OS_USER cannot write $_rd"
+        done
         runuser -u "$OS_USER" -- test -w "$FILESDIR" || die "$OS_USER cannot write $FILESDIR"
         if [ "$PACKAGE_ACTION" = coexist ]; then
             runuser -u "$OS_USER" -- test -x "$TARGET_MYSQLD_PATH" || die "$OS_USER cannot execute private mysqld: $TARGET_MYSQLD_PATH"
@@ -1397,7 +1456,7 @@ postcheck() {
     fi
     if [ "$SELINUX_STATE" != Disabled ]; then
         echo "-- SELinux contexts --"
-        ls -Zd "$CONF" "$DATADIR" "$LOGDIR" "$RUNDIR" "$FILESDIR" 2>/dev/null || true
+        ls -Zd "$CONF" "$DATADIR" "$LOGDIR" $(runtime_dirs) "$FILESDIR" 2>/dev/null || true
         ps -eZ 2>/dev/null | grep "[m]ysqld" || true
     fi
     echo "-- Initial root password location --"
