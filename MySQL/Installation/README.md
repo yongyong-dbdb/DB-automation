@@ -131,38 +131,62 @@ RPM DB와 `/usr/sbin/mysqld`는 변경하지 않는다.
 
 SELinux 상태를 먼저 확인하고, Enforcing/Permissive이면 사용자에게 정책 적용 여부를 묻는다. 그 선택을 확정한 뒤 instance별 경로를 입력받아 최종 정책 적용 계획을 구성한다.
 
-다음 경로는 스크립트가 패턴화하지 않고 사용자가 직접 지정한다.
+다음 경로는 고정값으로 하드코딩하지 않고 사용자가 직접 지정한다.
 
 - Instance Root
-- Different-version coexistence 시 Private MySQL Installation Root (입력한 경로 바로 아래에 `usr/sbin/mysqld`를 배치)
+- Different-version coexistence 시 Private MySQL Installation Root
 - `my.cnf`
 - Data Directory
 - Log Directory
-- Socket/PID Directory
+- Error Log file path — Error Log 활성화 시
+- Binary Log basename — Binary Log 활성화 시
+- SQL Socket file
+- PID file
+- MySQL X Socket file — X Protocol 활성화 시
 - `secure_file_priv` Directory
 
-입력 경로의 기존 parent, write/execute 가능성, read-only filesystem, 충돌 여부를 검사한다.
+입력 경로의 기존 parent, write/execute 가능성, read-only filesystem, 다른 인스턴스와의 충돌 여부를 검사한다.
+Binary Log를 활성화한 경우 해당 디렉터리도 소유권/권한, SELinux Context, Rollback 추적 대상에 포함한다.
 
 ## 자동 생성되는 my.cnf
 
 Minimum Profile은 독립 기동에 필요한 기본 항목을 생성한다.
 
 ```text
-basedir        # side-by-side 모드일 때
+basedir                 # side-by-side 모드일 때
 user
 port
 datadir
 socket
 pid-file
-log-error
+performance_schema
 secure-file-priv
+log-error               # Error Log 활성화 시
+log-bin                 # Binary Log 활성화 시
+skip-log-bin            # Binary Log 비활성화 시
 bind-address 또는 skip-networking
 mysqlx 관련 항목
 ```
 
+각 기능은 설치 중 개별 선택한다.
+
+```text
+Enable Error Log file (log-error) (yes/no) [yes]:
+Enable Binary Log (log-bin) (yes/no) [yes]:
+Enable Performance Schema (performance_schema) (yes/no) [yes]:
+```
+
+- Error Log = `yes`: 사용자가 지정한 전체 파일 경로를 `log-error`에 기록한다.
+- Error Log = `no`: `log-error`를 명시하지 않는다.
+- Binary Log = `yes`: 사용자가 지정한 절대경로 basename을 `log-bin`에 기록한다.
+- Binary Log = `no`: `skip-log-bin`을 명시하여 Binary Log를 비활성화한다.
+- Performance Schema = `yes`: `performance_schema=ON`
+- Performance Schema = `no`: `performance_schema=OFF`
+
 `[client]`에도 신규 인스턴스의 Port/Socket을 기록한다.
 
-생성 후 대상 Version의 실제 `mysqld`로 `--validate-config`와 `--print-defaults` 검증을 수행한다.
+생성 후 대상 Version의 실제 `mysqld`로 `--validate-config`와 `--print-defaults` 검증을 수행하고,
+선택한 Error Log / Binary Log / Performance Schema 설정이 effective option에 반영됐는지 확인한다.
 
 ## 기동 방식
 
@@ -204,6 +228,7 @@ Apply MySQL SELinux file/port contexts ...? yes/no
 |---|---|
 | Data Directory | `mysqld_db_t` |
 | Log Directory | `mysqld_log_t` |
+| Binary Log Directory | `mysqld_db_t` |
 | Socket/PID Directory | `mysqld_var_run_t` |
 | `secure_file_priv` | `mysqld_db_t` |
 | 별도 option file | Host `/etc/my.cnf` 정책에서 판별 |
@@ -225,6 +250,7 @@ Apply MySQL SELinux file/port contexts ...? yes/no
 - PID File
 - Data Directory
 - Error/Slow/Initialization Log
+- Binary Log basename / index / existing numbered files
 - `secure_file_priv`
 - Service Name
 - Private Software Root
@@ -249,7 +275,8 @@ Apply MySQL SELinux file/port contexts ...? yes/no
 - systemd + SELinux 정책 적용 환경의 `mysqld_t` process domain
 - 실제 MySQL Version
 
-Temporary root password 자체는 화면에 노출하지 않고 `initialize.log` 위치만 안내한다.
+초기화가 성공하면 이번 실행에서 생성한 `initialize.log`만 읽어 `root@localhost`의 Temporary Password를 화면에 표시한다.
+사용자는 첫 로그인 후 즉시 비밀번호를 변경해야 한다.
 
 ## Rollback
 
@@ -321,14 +348,60 @@ MySQL X socket은 X Protocol을 활성화한 경우에만 입력한다.
 실서버 RPM 설치 검증은 별도로 필요하다.
 
 
-## v1.0.35 logging option changes
+## v1.0.35 변경사항
 
-The installer now asks explicitly whether to configure the following server features.
+Error Log, Binary Log, Performance Schema를 각각 독립적으로 활성화/비활성화할 수 있도록 입력 흐름을 추가했다.
 
-- Error Log file (`log-error`): yes/no. When enabled, the full error-log file path is entered explicitly and must be inside the selected log directory. When disabled, no explicit `log-error` option is written and mysqld's startup method/default error destination applies.
-- Binary Log (`log-bin`): yes/no. When enabled, the absolute binary-log basename is entered explicitly (example: `/home/mysql4/binlog/mysql-bin`). When disabled, the installer writes `skip-log-bin` explicitly because MySQL 8.x enables binary logging by default.
-- Performance Schema (`performance_schema`): yes/no. The selected ON/OFF value is written to the generated option file.
+### Error Log
 
-Binary-log directories are included in path collision checks, directory ownership/permission checks, SELinux context handling, rollback tracking for directories created by the run, install-plan output, and effective option validation. No fixed instance paths or ports are introduced by these changes.
+```text
+Enable Error Log file (log-error) (yes/no) [yes]:
+```
 
-Static configuration validation still uses the target mysqld binary (`--validate-config` where supported and `--print-defaults`). A final installation/startup test on the target RHEL/SELinux host remains a separate real-server validation step.
+`yes`이면 전체 Error Log 파일 경로를 입력받고 `log-error=<path>`를 생성한다.
+`no`이면 별도의 `log-error` 항목을 생성하지 않는다.
+
+### Binary Log
+
+```text
+Enable Binary Log (log-bin) (yes/no) [yes]:
+Binary log basename (absolute path including basename, e.g. /path/mysql-bin):
+```
+
+`yes`이면 사용자가 입력한 절대경로 basename을 `log-bin`에 사용한다.
+`no`이면 `skip-log-bin`을 명시적으로 생성한다.
+
+Binary Log 활성화 시 다음 검증을 수행한다.
+
+- 절대경로 및 정규화 경로 검사
+- Data/Log/Runtime/`secure_file_priv`/Private Software Root와의 경로 중첩 검사
+- 기존 `log-bin` 설정 충돌 검사
+- 기존 `.index` 및 numbered Binary Log 파일 충돌 검사
+- Directory 생성 및 OS User 소유권/쓰기 권한 검사
+- SELinux `mysqld_db_t` 적용 및 사후 검증
+- 이번 실행에서 생성한 Directory Rollback 추적
+
+### Performance Schema
+
+```text
+Enable Performance Schema (performance_schema) (yes/no) [yes]:
+```
+
+선택에 따라 `performance_schema=ON` 또는 `performance_schema=OFF`를 생성한다.
+
+### 설정 검증
+
+생성된 `my.cnf`는 대상 MySQL Version의 실제 `mysqld`로 검증한다.
+
+- 지원 Version: `mysqld --validate-config`
+- Effective option 확인: `mysqld --print-defaults`
+- Error Log 활성화 시 `log-error` 값 검증
+- Error Log 비활성화 시 의도하지 않은 `log-error` 존재 여부 검사
+- Binary Log 활성화 시 `log-bin` basename 검증
+- Binary Log 비활성화 시 `skip-log-bin` 존재 여부 검사
+- Performance Schema ON/OFF 값 검증
+
+경로, Port, Service Name 등은 특정 인스턴스 값으로 하드코딩하지 않는다.
+외부 Package 설치나 별도 Runtime 추가도 하지 않는다.
+
+실제 RHEL 8.6 + SELinux Enforcing Host에서의 v1.0.35 전체 설치/기동 검증은 별도 실서버 검증 항목으로 남아 있다.
