@@ -319,3 +319,16 @@ MySQL X socket은 X Protocol을 활성화한 경우에만 입력한다.
 
 검증: POSIX sh 문법, 설치 root 계산, 잘못된 접미사 및 공유 경로 거부 테스트 통과.
 실서버 RPM 설치 검증은 별도로 필요하다.
+
+
+## v1.0.35 logging option changes
+
+The installer now asks explicitly whether to configure the following server features.
+
+- Error Log file (`log-error`): yes/no. When enabled, the full error-log file path is entered explicitly and must be inside the selected log directory. When disabled, no explicit `log-error` option is written and mysqld's startup method/default error destination applies.
+- Binary Log (`log-bin`): yes/no. When enabled, the absolute binary-log basename is entered explicitly (example: `/home/mysql4/binlog/mysql-bin`). When disabled, the installer writes `skip-log-bin` explicitly because MySQL 8.x enables binary logging by default.
+- Performance Schema (`performance_schema`): yes/no. The selected ON/OFF value is written to the generated option file.
+
+Binary-log directories are included in path collision checks, directory ownership/permission checks, SELinux context handling, rollback tracking for directories created by the run, install-plan output, and effective option validation. No fixed instance paths or ports are introduced by these changes.
+
+Static configuration validation still uses the target mysqld binary (`--validate-config` where supported and `--print-defaults`). A final installation/startup test on the target RHEL/SELinux host remains a separate real-server validation step.
