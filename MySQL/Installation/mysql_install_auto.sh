@@ -1,7 +1,7 @@
 #!/bin/sh
 # Oracle MySQL Community RPM Bundle installer
 # POSIX /bin/sh, no third-party runtime dependency
-SCRIPT_VERSION="1.0.33"
+SCRIPT_VERSION="1.0.34"
 set -u
 umask 027
 
@@ -773,9 +773,6 @@ collect_instance_inputs() {
         echo "Instance root directory must be entered explicitly." >&2
     done
     safe_path "$INSTANCE_ROOT"
-    if [ "$ERROR_LOG" = no ] && grep -Eq -- '(^|[[:space:]])--log-error=' "$_effective"; then
-        die "log-error was not requested but is present in effective option-file settings"
-    fi
     if [ "$PACKAGE_ACTION" = coexist ]; then
         echo "The installed MySQL version differs from $TARGET_VERSION; separate server files are required." >&2
         echo "Enter a NEW directory for this version's executable, libraries and plugins." >&2
@@ -819,6 +816,7 @@ collect_instance_inputs() {
         show_runtime_file_example "${LOGDIR%/}/$OS_USER.log" log
         ask_runtime_path "Error log file (absolute path including filename)"
         LOGFILE=$ASK_RESULT
+        [ "$(dirname "$LOGFILE")" = "$LOGDIR" ] || die "Error log file must be inside the selected Log directory: $LOGDIR"
     else
         ERROR_LOG=no
         LOGFILE=""
@@ -1550,6 +1548,9 @@ validate_config() {
             [ "$_got_norm" = "$_want_norm" ] || die "Configured option mismatch for $_key: ${_got:-<empty>} != $_want"
         fi
     done
+    if [ "$ERROR_LOG" = no ] && grep -Eq -- '(^|[[:space:]])--log-error=' "$_effective"; then
+        die "log-error was not requested but is present in effective option-file settings"
+    fi
     if [ "$PACKAGE_ACTION" = coexist ]; then
         _want="$PRIVATE_PAYLOAD_ROOT/usr"
         _got=$(tr ' ' '\n' < "$_effective" | sed -n 's/^--basedir=//p' | tail -n 1)
