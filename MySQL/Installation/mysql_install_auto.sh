@@ -1,7 +1,7 @@
 #!/bin/sh
 # Oracle MySQL Community RPM Bundle installer
 # POSIX /bin/sh, no third-party runtime dependency
-SCRIPT_VERSION="1.0.32"
+SCRIPT_VERSION="1.0.33"
 set -u
 umask 027
 
@@ -603,14 +603,14 @@ validate_log_paths() {
         case "${_log_other%/}/" in "$LOGDIR/"*) block "Log directory contains $_log_other" ;; esac
     done
     _log_seen=""
-    for _log_file in "$LOGFILE" "$LOGDIR/initialize.log" "$SLOWLOG"; do
+    for _log_file in ${LOGFILE:+"$LOGFILE"} "$LOGDIR/initialize.log" "$SLOWLOG"; do
         case " $_log_seen " in *" $_log_file "*) block "Log file paths collide: $_log_file" ;; esac
         _log_seen="$_log_seen $_log_file"
         [ ! -e "$_log_file" ] && [ ! -L "$_log_file" ] || block "Log path already exists: $_log_file"
         for _log_reserved in "$CONF" "$SOCKET" "$SOCKET.lock" "$PIDFILE" ${MYSQLX_SOCKET:+"$MYSQLX_SOCKET"} ${MYSQLX_SOCKET:+"$MYSQLX_SOCKET.lock"}; do
             [ "$_log_file" != "$_log_reserved" ] || block "Log path conflicts with file $_log_reserved"
         done
-        for _log_dir in "$INSTANCE_ROOT" "$DATADIR" "$LOGDIR" "$FILESDIR" "$(dirname "$CONF")" $(runtime_dirs); do
+        for _log_dir in "$INSTANCE_ROOT" "$DATADIR" "$LOGDIR" "$FILESDIR" "$(dirname "$CONF")" $(runtime_dirs) $(binary_dirs); do
             case "${_log_dir%/}/" in "$_log_file/"*) block "Log file conflicts with directory $_log_dir" ;; esac
         done
     done
@@ -619,6 +619,28 @@ validate_log_paths() {
         [ ! -L "$_log_parent" ] || block "Log directory has a symbolic-link component: $_log_parent"
         [ ! -e "$_log_parent" ] || [ -d "$_log_parent" ] || block "Log parent is not a directory: $_log_parent"
         _log_parent=$(dirname "$_log_parent")
+    done
+}
+binary_dirs() {
+    [ "${BINARY_LOG:-no}" = yes ] && dirname "$BINLOG_BASE"
+}
+validate_binary_log_path() {
+    [ "${BINARY_LOG:-no}" = yes ] || return 0
+    safe_path "$BINLOG_BASE"
+    case "$BINDIR" in /|/home|/usr|/etc|/var|/tmp|/opt|/run|"$INSTANCE_ROOT")
+        block "Use a dedicated Binary Log directory: $BINDIR" ;;
+    esac
+    for _other in "$DATADIR" "$LOGDIR" "$FILESDIR" "${PRIVATE_SOFTWARE_ROOT:-}" $(runtime_dirs); do
+        [ -n "$_other" ] || continue
+        case "$BINDIR/" in "${_other%/}/"*) block "Binary Log directory overlaps $_other" ;; esac
+        case "${_other%/}/" in "$BINDIR/"*) block "Binary Log directory contains $_other" ;; esac
+    done
+    [ ! -e "$BINLOG_BASE" ] && [ ! -L "$BINLOG_BASE" ] || block "Binary Log basename already exists as a file: $BINLOG_BASE"
+    [ ! -e "$BINLOG_BASE.index" ] && [ ! -L "$BINLOG_BASE.index" ] || block "Binary Log index already exists: $BINLOG_BASE.index"
+    for _existing in "$BINLOG_BASE".[0-9]*; do
+        [ -e "$_existing" ] || continue
+        block "Binary Log file already exists for selected basename: $_existing"
+        break
     done
 }
 runtime_dirs() {
@@ -751,6 +773,9 @@ collect_instance_inputs() {
         echo "Instance root directory must be entered explicitly." >&2
     done
     safe_path "$INSTANCE_ROOT"
+    if [ "$ERROR_LOG" = no ] && grep -Eq -- '(^|[[:space:]])--log-error=' "$_effective"; then
+        die "log-error was not requested but is present in effective option-file settings"
+    fi
     if [ "$PACKAGE_ACTION" = coexist ]; then
         echo "The installed MySQL version differs from $TARGET_VERSION; separate server files are required." >&2
         echo "Enter a NEW directory for this version's executable, libraries and plugins." >&2
@@ -784,13 +809,22 @@ collect_instance_inputs() {
         [ -n "$DATADIR" ] && break
         echo "Data directory must be entered explicitly." >&2
     done
-    show_runtime_file_example "${INSTANCE_ROOT%/}/log/$OS_USER.log" log
-    ask_runtime_path "Error log file (absolute path including filename)"
-    LOGFILE=$ASK_RESULT
-    LOGDIR=$(dirname "$LOGFILE")
-    echo "Log directory derived from error log: $LOGDIR" >&2
+    while :; do
+        ask "Log directory for initialization and optional log files (absolute path; explicit input required)" ""; LOGDIR=$ASK_RESULT
+        [ -n "$LOGDIR" ] && break
+        echo "Log directory must be entered explicitly." >&2
+    done
+    if ask_yn "Enable Error Log file (log-error)" yes; then
+        ERROR_LOG=yes
+        show_runtime_file_example "${LOGDIR%/}/$OS_USER.log" log
+        ask_runtime_path "Error log file (absolute path including filename)"
+        LOGFILE=$ASK_RESULT
+    else
+        ERROR_LOG=no
+        LOGFILE=""
+        echo "No explicit log-error file will be configured; mysqld's default error logging destination will apply." >&2
+    fi
     echo "Initialization log: $LOGDIR/initialize.log" >&2
-    echo "Slow query log (when enabled): $LOGDIR/slow.log" >&2
     show_runtime_file_example "${INSTANCE_ROOT%/}/mysqld/$OS_USER.sock" socket
     ask_runtime_path "SQL socket file (absolute path including filename)"
     SOCKET=$ASK_RESULT
@@ -890,6 +924,17 @@ collect_network_inputs() {
     fi
 }
 collect_profile_inputs() {
+    if ask_yn "Enable Binary Log (log-bin)" yes; then
+        BINARY_LOG=yes
+        show_runtime_file_example "${INSTANCE_ROOT%/}/binlog/mysql-bin" log
+        ask_runtime_path "Binary log basename (absolute path including basename, e.g. /path/mysql-bin)"
+        BINLOG_BASE=$ASK_RESULT
+        BINDIR=$(dirname "$BINLOG_BASE")
+    else
+        BINARY_LOG=no
+        BINLOG_BASE=""
+        BINDIR=""
+    fi
     if ask_yn "Enable Performance Schema (performance_schema)" yes; then
         PERFORMANCE_SCHEMA=ON
     else
@@ -1002,13 +1047,19 @@ check_instance_collisions() {
     validate_runtime_paths
     SLOWLOG="$LOGDIR/slow.log"
     validate_log_paths
+    validate_binary_log_path
 
     socket_busy "$SOCKET" && block "Unix socket already in use: $SOCKET"
     [ -e "$SOCKET" ] && block "Unix socket path already exists: $SOCKET"
     [ -e "$SOCKET.lock" ] && block "Unix socket lock path already exists: $SOCKET.lock"
     [ -e "$PIDFILE" ] && block "PID file path already exists: $PIDFILE"
-    [ -e "$LOGFILE" ] && block "Error log path already exists: $LOGFILE"
+    [ "$ERROR_LOG" = yes ] && [ -e "$LOGFILE" ] && block "Error log path already exists: $LOGFILE"
     [ -e "$LOGDIR/initialize.log" ] && block "Initialization log path already exists: $LOGDIR/initialize.log"
+    if [ "$BINARY_LOG" = yes ]; then
+        warn_if_path_not_creatable "Binary Log directory" "$BINDIR"
+        _bin_owner=$(configured_option_owner log-bin "$BINLOG_BASE")
+        [ -z "$_bin_owner" ] || block "Binary Log basename already configured in $_bin_owner: $BINLOG_BASE"
+    fi
     [ "$PROFILE" = "2" ] && [ "$SLOW_QUERY" = yes ] && [ -e "$SLOWLOG" ] && block "Slow query log path already exists: $SLOWLOG"
     path_nonempty "$DATADIR" && block "Data directory is not empty: $DATADIR"
     [ -e "$CONF" ] && block "Configuration file already exists: $CONF"
@@ -1029,11 +1080,15 @@ check_instance_collisions() {
     warn_if_path_not_creatable "Socket/PID directory" "$RUNDIR"
     warn_if_path_not_creatable "secure_file_priv directory" "$FILESDIR"
 
-    for _pair in "datadir:$DATADIR" "socket:$SOCKET" "pid-file:$PIDFILE" "log-error:$LOGFILE" "secure-file-priv:$FILESDIR"; do
+    for _pair in "datadir:$DATADIR" "socket:$SOCKET" "pid-file:$PIDFILE" "secure-file-priv:$FILESDIR"; do
         _opt=${_pair%%:*}; _val=${_pair#*:}
         _owner_cf=$(configured_option_owner "$_opt" "$_val")
         [ -z "$_owner_cf" ] || block "$_opt path already configured in $_owner_cf: $_val"
     done
+    if [ "$ERROR_LOG" = yes ]; then
+        _owner_cf=$(configured_option_owner log-error "$LOGFILE")
+        [ -z "$_owner_cf" ] || block "log-error path already configured in $_owner_cf: $LOGFILE"
+    fi
 
     case "$FILESDIR/" in "$DATADIR"/*) block "secure_file_priv directory must not be inside Data Directory" ;; esac
     [ "$DATADIR" != "$LOGDIR" ] || block "Data and log directories must differ"
@@ -1078,10 +1133,17 @@ port=$PORT
 datadir=$DATADIR
 socket=$SOCKET
 pid-file=$PIDFILE
-log-error=$LOGFILE
 performance_schema=$PERFORMANCE_SCHEMA
 secure-file-priv=$FILESDIR
 EOF
+    if [ "$ERROR_LOG" = yes ]; then
+        echo "log-error=$LOGFILE"
+    fi
+    if [ "$BINARY_LOG" = yes ]; then
+        echo "log-bin=$BINLOG_BASE"
+    else
+        echo "skip-log-bin=ON"
+    fi
     if [ "$TCP_ENABLED" = yes ]; then
         echo "bind-address=$BIND_ADDRESS"
     else
@@ -1096,7 +1158,7 @@ EOF
     fi
     if [ "$PROFILE" = "2" ]; then
         echo "innodb-flush-log-at-trx-commit=1"
-        echo "sync-binlog=1"
+        [ "$BINARY_LOG" = yes ] && echo "sync-binlog=1"
         echo "max-connections=$MAX_CONNECTIONS"
         echo "local-infile=OFF"
         [ "$DEDICATED" = yes ] && echo "innodb-dedicated-server=ON"
@@ -1154,7 +1216,9 @@ show_plan() {
     echo "Profile       : $PROFILE_NAME"
     echo "Config        : $CONF"
     echo "Data          : $DATADIR"
-    echo "Log           : $LOGFILE"
+    echo "Log directory : $LOGDIR"
+    echo "Error Log     : $ERROR_LOG${LOGFILE:+ ($LOGFILE)}"
+    echo "Binary Log    : $BINARY_LOG${BINLOG_BASE:+ ($BINLOG_BASE)}"
     echo "Performance Schema: $PERFORMANCE_SCHEMA"
     echo "Socket        : $SOCKET"
     echo "PID           : $PIDFILE"
@@ -1258,11 +1322,13 @@ snapshot_existing_dir() {
 }
 
 prepare_directories() {
-    for _d in "$INSTANCE_ROOT" "$DATADIR" "$LOGDIR" $(runtime_dirs) "$FILESDIR"; do snapshot_existing_dir "$_d"; done
+    for _d in "$INSTANCE_ROOT" "$DATADIR" "$LOGDIR" $(runtime_dirs) $(binary_dirs) "$FILESDIR"; do snapshot_existing_dir "$_d"; done
     _root_was_new=no
     [ -d "$INSTANCE_ROOT" ] || _root_was_new=yes
     _data_new=no; [ -d "$DATADIR" ] || _data_new=yes
     _log_new=no; [ -d "$LOGDIR" ] || _log_new=yes
+    _bin_new=no
+    if [ "$BINARY_LOG" = yes ] && [ ! -d "$BINDIR" ]; then _bin_new=yes; fi
     for _rd in $(runtime_dirs); do
         snapshot_existing_dir "$_rd"
         if [ ! -d "$_rd" ]; then
@@ -1274,13 +1340,14 @@ prepare_directories() {
     _conf_parent=$(dirname "$CONF")
     _conf_parent_new=no; [ -d "$_conf_parent" ] || _conf_parent_new=yes
 
-    mkdir -p "$DATADIR" "$LOGDIR" $(runtime_dirs) "$FILESDIR" "$_conf_parent" || die "Directory creation failed"
-    chown "$OS_USER:$OS_GROUP" "$DATADIR" "$LOGDIR" $(runtime_dirs) "$FILESDIR"
-    chmod 750 "$DATADIR" "$LOGDIR" $(runtime_dirs) "$FILESDIR"
+    mkdir -p "$DATADIR" "$LOGDIR" $(runtime_dirs) $(binary_dirs) "$FILESDIR" "$_conf_parent" || die "Directory creation failed"
+    chown "$OS_USER:$OS_GROUP" "$DATADIR" "$LOGDIR" $(runtime_dirs) $(binary_dirs) "$FILESDIR"
+    chmod 750 "$DATADIR" "$LOGDIR" $(runtime_dirs) $(binary_dirs) "$FILESDIR"
     [ "$_root_was_new" = yes ] && { chown "$OS_USER:$OS_GROUP" "$INSTANCE_ROOT"; chmod 750 "$INSTANCE_ROOT"; }
 
     [ "$_data_new" = yes ] && { DATADIR_CREATED=yes; CREATED_PATHS="$DATADIR${CREATED_PATHS:+ }$CREATED_PATHS"; }
     [ "$_log_new" = yes ] && CREATED_PATHS="$LOGDIR${CREATED_PATHS:+ }$CREATED_PATHS"
+    [ "$_bin_new" = yes ] && CREATED_PATHS="$BINDIR${CREATED_PATHS:+ }$CREATED_PATHS"
     [ "$_files_new" = yes ] && CREATED_PATHS="$FILESDIR${CREATED_PATHS:+ }$CREATED_PATHS"
     [ "$_conf_parent_new" = yes ] && CREATED_PATHS="$_conf_parent${CREATED_PATHS:+ }$CREATED_PATHS"
     [ "$_root_was_new" = yes ] && CREATED_PATHS="$CREATED_PATHS${CREATED_PATHS:+ }$INSTANCE_ROOT"
@@ -1373,6 +1440,10 @@ apply_selinux() {
 
     selinux_fcontext_set mysqld_db_t "$DATADIR(/.*)?"
     selinux_fcontext_set mysqld_log_t "$LOGDIR(/.*)?"
+    if [ "$BINARY_LOG" = yes ]; then
+        _bin_expr=$(printf '%s' "$BINDIR" | sed 's/[.]/\\./g')
+        selinux_fcontext_set mysqld_db_t "$_bin_expr(/.*)?"
+    fi
     for _rd in $(runtime_dirs); do
         _rd_expr=$(printf '%s' "$_rd" | sed 's/[.]/\\./g')
         selinux_fcontext_set mysqld_var_run_t "$_rd_expr(/.*)?"
@@ -1388,7 +1459,7 @@ apply_selinux() {
         CONF_SELINUX_EXPR=$(printf '%s' "$CONF" | sed 's/[.]/\\./g')
         selinux_fcontext_set "$MYSQL_CONF_SELINUX_TYPE" "$CONF_SELINUX_EXPR"
     fi
-    restorecon -R "$DATADIR" "$LOGDIR" $(runtime_dirs) "$FILESDIR" || die "restorecon failed"
+    restorecon -R "$DATADIR" "$LOGDIR" $(runtime_dirs) $(binary_dirs) "$FILESDIR" || die "restorecon failed"
     [ "$PACKAGE_ACTION" = coexist ] && restorecon -R "$PRIVATE_PAYLOAD_ROOT" || [ "$PACKAGE_ACTION" != coexist ] || die "restorecon failed for private MySQL software tree"
     restorecon -v "$CONF" || die "restorecon failed for MySQL option file: $CONF"
 
@@ -1405,6 +1476,9 @@ verify_selinux_runtime() {
     [ "$SELINUX_APPLY" = yes ] || return 0
     _t=$(selinux_path_type "$DATADIR"); [ "$_t" = mysqld_db_t ] || die "SELinux type mismatch for Data Directory: ${_t:-unknown}"
     _t=$(selinux_path_type "$LOGDIR"); [ "$_t" = mysqld_log_t ] || die "SELinux type mismatch for log directory: ${_t:-unknown}"
+    if [ "$BINARY_LOG" = yes ]; then
+        _t=$(selinux_path_type "$BINDIR"); [ "$_t" = mysqld_db_t ] || die "SELinux type mismatch for Binary Log directory: ${_t:-unknown}"
+    fi
     for _rd in $(runtime_dirs); do
         _t=$(selinux_path_type "$_rd")
         [ "$_t" = mysqld_var_run_t ] || die "SELinux type mismatch for $_rd: ${_t:-unknown}"
@@ -1422,12 +1496,13 @@ verify_selinux_runtime() {
 
 validate_account_access() {
     if command -v runuser >/dev/null 2>&1; then
-        for _d in "$INSTANCE_ROOT" "$(dirname "$CONF")" "$DATADIR" "$LOGDIR" $(runtime_dirs) "$FILESDIR"; do
+        for _d in "$INSTANCE_ROOT" "$(dirname "$CONF")" "$DATADIR" "$LOGDIR" $(runtime_dirs) $(binary_dirs) "$FILESDIR"; do
             runuser -u "$OS_USER" -- test -x "$_d" || die "$OS_USER cannot traverse $_d; verify execute permission on this directory and every parent directory"
         done
         runuser -u "$OS_USER" -- test -r "$CONF" || die "$OS_USER cannot read $CONF; verify file mode/group and parent-directory traversal"
         runuser -u "$OS_USER" -- test -w "$DATADIR" || die "$OS_USER cannot write $DATADIR"
         runuser -u "$OS_USER" -- test -w "$LOGDIR" || die "$OS_USER cannot write $LOGDIR"
+        if [ "$BINARY_LOG" = yes ]; then runuser -u "$OS_USER" -- test -w "$BINDIR" || die "$OS_USER cannot write $BINDIR"; fi
         for _rd in $(runtime_dirs); do
             runuser -u "$OS_USER" -- test -w "$_rd" || die "$OS_USER cannot write $_rd"
         done
@@ -1454,7 +1529,14 @@ validate_config() {
     fi
     _effective="$WORKDIR/effective-options.txt"
     "$MYSQLD_BIN" --defaults-file="$CONF" --print-defaults >"$_effective" 2>&1 || die "Could not inspect option-file values with mysqld --print-defaults"
-    for _check in "datadir:$DATADIR" "socket:$SOCKET" "pid-file:$PIDFILE" "port:$PORT" "log-error:$LOGFILE" "performance-schema:$PERFORMANCE_SCHEMA"; do
+    _checks="datadir:$DATADIR socket:$SOCKET pid-file:$PIDFILE port:$PORT performance-schema:$PERFORMANCE_SCHEMA"
+    [ "$ERROR_LOG" = yes ] && _checks="$_checks log-error:$LOGFILE"
+    if [ "$BINARY_LOG" = yes ]; then
+        _checks="$_checks log-bin:$BINLOG_BASE"
+    else
+        _checks="$_checks skip-log-bin:ON"
+    fi
+    for _check in $_checks; do
         _key=${_check%%:*}; _want=${_check#*:}
         _got=$(tr ' ' '\n' < "$_effective" | awk -v key="--$_key" '
             { pos=index($0,"="); if(!pos) next
@@ -1604,7 +1686,7 @@ postcheck() {
     fi
     if [ "$SELINUX_STATE" != Disabled ]; then
         echo "-- SELinux contexts --"
-        ls -Zd "$CONF" "$DATADIR" "$LOGDIR" $(runtime_dirs) "$FILESDIR" 2>/dev/null || true
+        ls -Zd "$CONF" "$DATADIR" "$LOGDIR" $(runtime_dirs) $(binary_dirs) "$FILESDIR" 2>/dev/null || true
         ps -eZ 2>/dev/null | grep "[m]ysqld" || true
     fi
     echo "-- Initial root credentials (this instance) --"
