@@ -1,7 +1,7 @@
 #!/bin/sh
 # Oracle MySQL Community RPM Bundle installer
 # POSIX /bin/sh, no third-party runtime dependency
-SCRIPT_VERSION="1.0.34"
+SCRIPT_VERSION="1.0.35"
 set -u
 umask 027
 
@@ -1140,7 +1140,7 @@ EOF
     if [ "$BINARY_LOG" = yes ]; then
         echo "log-bin=$BINLOG_BASE"
     else
-        echo "skip-log-bin=ON"
+        echo "skip-log-bin"
     fi
     if [ "$TCP_ENABLED" = yes ]; then
         echo "bind-address=$BIND_ADDRESS"
@@ -1531,8 +1531,6 @@ validate_config() {
     [ "$ERROR_LOG" = yes ] && _checks="$_checks log-error:$LOGFILE"
     if [ "$BINARY_LOG" = yes ]; then
         _checks="$_checks log-bin:$BINLOG_BASE"
-    else
-        _checks="$_checks skip-log-bin:ON"
     fi
     for _check in $_checks; do
         _key=${_check%%:*}; _want=${_check#*:}
@@ -1550,6 +1548,9 @@ validate_config() {
     done
     if [ "$ERROR_LOG" = no ] && grep -Eq -- '(^|[[:space:]])--log-error=' "$_effective"; then
         die "log-error was not requested but is present in effective option-file settings"
+    fi
+    if [ "$BINARY_LOG" = no ]; then
+        tr ' ' '\n' < "$_effective" | grep -qx -- '--skip-log-bin' || die "Binary Log was disabled but skip-log-bin is missing from effective option-file settings"
     fi
     if [ "$PACKAGE_ACTION" = coexist ]; then
         _want="$PRIVATE_PAYLOAD_ROOT/usr"
