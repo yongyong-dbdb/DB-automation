@@ -1,7 +1,7 @@
 #!/bin/sh
 # Oracle MySQL Community RPM Bundle installer
 # POSIX /bin/sh, no third-party runtime dependency
-SCRIPT_VERSION="1.0.41"
+SCRIPT_VERSION="1.0.42"
 set -u
 umask 027
 
@@ -832,20 +832,6 @@ collect_instance_inputs() {
         [ -n "$LOGDIR" ] && break
         echo "Log directory is required." >&2
     done
-    if ask_yn "Enable Error Log file (log-error)" yes; then
-        ERROR_LOG=yes
-        echo "  Recommended filename: mysqld.err (Error Log)" >&2
-        _error_log_default="${LOGDIR%/}/mysqld.err"
-        show_file_example "$_error_log_default"
-        ask_runtime_path "Error log file (absolute path including filename)" "$_error_log_default"
-        LOGFILE=$ASK_RESULT
-        [ "$(dirname "$LOGFILE")" = "$LOGDIR" ] || die "Error log file must be inside the selected Log directory: $LOGDIR"
-    else
-        ERROR_LOG=no
-        LOGFILE=""
-        echo "No explicit log-error file will be configured; mysqld's default error logging destination will apply." >&2
-    fi
-    echo "Initialization log: $LOGDIR/initialize.log" >&2
     _socket_default="${INSTANCE_ROOT%/}/mysqld/$OS_USER.sock"
     show_runtime_file_example "$_socket_default" socket
     ask_runtime_path "SQL socket file (absolute path including filename)" "$_socket_default"
@@ -888,6 +874,72 @@ collect_start_method() {
         ENABLE_AT_BOOT=no
     fi
 }
+detect_ipv4_addresses() {
+    _ipv4_file="$WORKDIR/ipv4-addresses"
+    : > "$_ipv4_file"
+
+    if command -v ip >/dev/null 2>&1; then
+        ip -o -4 addr show 2>/dev/null | awk '
+            {
+                iface=$2
+                split($4,a,"/")
+                addr=a[1]
+                if (addr != "" && addr != "127.0.0.1" && !seen[addr]++)
+                    print addr "|" iface
+            }' >> "$_ipv4_file"
+    elif command -v hostname >/dev/null 2>&1; then
+        hostname -I 2>/dev/null | tr ' ' '\n' | awk '
+            /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && $0 != "127.0.0.1" && !seen[$0]++ {
+                print $0 "|detected"
+            }' >> "$_ipv4_file"
+    fi
+}
+
+select_bind_address() {
+    detect_ipv4_addresses
+    echo "" >&2
+    echo "Detected IPv4 addresses:" >&2
+    echo "  1) 127.0.0.1       - localhost" >&2
+
+    _bind_index=2
+    _bind_default=1
+    if [ -s "$_ipv4_file" ]; then
+        while IFS='|' read -r _addr _iface; do
+            printf '  %s) %-15s - %s\n' "$_bind_index" "$_addr" "$_iface" >&2
+            [ "$_bind_default" -ne 1 ] || _bind_default=$_bind_index
+            _bind_index=$((_bind_index + 1))
+        done < "$_ipv4_file"
+    fi
+
+    _all_index=$_bind_index
+    printf '  %s) %-15s - all IPv4 interfaces\n' "$_all_index" "0.0.0.0" >&2
+    echo "" >&2
+
+    while :; do
+        ask "Select bind-address" "$_bind_default"
+        _choice=$ASK_RESULT
+        case "$_choice" in *[!0-9]*|'') echo "Enter a listed number." >&2; continue ;; esac
+
+        if [ "$_choice" -eq 1 ]; then
+            BIND_ADDRESS=127.0.0.1
+            break
+        fi
+        if [ "$_choice" -eq "$_all_index" ]; then
+            BIND_ADDRESS=0.0.0.0
+            break
+        fi
+
+        _wanted=$((_choice - 1))
+        _selected=$(sed -n "${_wanted}p" "$_ipv4_file" 2>/dev/null | cut -d'|' -f1)
+        if [ -n "$_selected" ]; then
+            BIND_ADDRESS=$_selected
+            break
+        fi
+        echo "Select one of the listed numbers." >&2
+    done
+    echo "Selected bind-address: $BIND_ADDRESS" >&2
+}
+
 collect_network_inputs() {
     DEFAULT_PORT=$(find_free_port)
     while :; do
@@ -911,7 +963,7 @@ collect_network_inputs() {
 
     if ask_yn "Enable TCP/IP connections" yes; then
         TCP_ENABLED=yes
-        ask "bind-address" "127.0.0.1"; BIND_ADDRESS=$ASK_RESULT
+        select_bind_address
     else
         TCP_ENABLED=no
         BIND_ADDRESS=""
@@ -950,12 +1002,56 @@ collect_network_inputs() {
     fi
 }
 collect_profile_inputs() {
-    if ask_yn "Enable Binary Log (log-bin)" yes; then
+    echo "" >&2
+    echo "===== Logging =====" >&2
+
+    if ask_yn "Error Log" yes; then
+        ERROR_LOG=yes
+        _error_log_default="${LOGDIR%/}/mysqld.err"
+        echo "  Records server startup, shutdown, warnings, and errors." >&2
+        ask_runtime_path "  File" "$_error_log_default"
+        LOGFILE=$ASK_RESULT
+        [ "$(dirname "$LOGFILE")" = "$LOGDIR" ] || die "Error log file must be inside the selected Log directory: $LOGDIR"
+    else
+        ERROR_LOG=no
+        LOGFILE=""
+    fi
+
+    GENERAL_LOG=no
+    GENERALLOG=""
+    if ask_yn "General Log" no; then
+        GENERAL_LOG=yes
+        _general_log_default="${LOGDIR%/}/general.log"
+        echo "  Records client connections and statements; can grow rapidly." >&2
+        ask_runtime_path "  File" "$_general_log_default"
+        GENERALLOG=$ASK_RESULT
+        [ "$(dirname "$GENERALLOG")" = "$LOGDIR" ] || die "General log file must be inside the selected Log directory: $LOGDIR"
+    else
+        echo "  Records almost every statement; normally keep it OFF unless needed." >&2
+    fi
+
+    SLOW_QUERY=no
+    SLOWLOG=""
+    LONG_QUERY_TIME=2
+    if ask_yn "Slow Query Log" yes; then
+        SLOW_QUERY=yes
+        _slow_log_default="${LOGDIR%/}/slow.log"
+        echo "  Records statements slower than long_query_time." >&2
+        ask_runtime_path "  File" "$_slow_log_default"
+        SLOWLOG=$ASK_RESULT
+        [ "$(dirname "$SLOWLOG")" = "$LOGDIR" ] || die "Slow query log file must be inside the selected Log directory: $LOGDIR"
+        while :; do
+            ask "  long_query_time seconds" "2"; LONG_QUERY_TIME=$ASK_RESULT
+            valid_nonnegative_number "$LONG_QUERY_TIME" && break
+            echo "long_query_time must be a non-negative number." >&2
+        done
+    fi
+
+    if ask_yn "Binary Log" yes; then
         BINARY_LOG=yes
-        echo "  Recommended basename: mysql-bin (Binary Log creates numbered files such as mysql-bin.000001)" >&2
-        _binlog_default="${INSTANCE_ROOT%/}/binlog/mysql-bin"
-        show_file_example "$_binlog_default"
-        ask_runtime_path "Binary log basename (absolute path including basename, e.g. /path/mysql-bin)" "$_binlog_default"
+        _binlog_default="${LOGDIR%/}/mysql-bin"
+        echo "  Used for replication and point-in-time recovery." >&2
+        ask_runtime_path "  Base" "$_binlog_default"
         BINLOG_BASE=$ASK_RESULT
         BINDIR=$(dirname "$BINLOG_BASE")
     else
@@ -963,32 +1059,29 @@ collect_profile_inputs() {
         BINLOG_BASE=""
         BINDIR=""
     fi
+
+    echo "  Initialization Log: $LOGDIR/initialize.log (automatic)" >&2
+    echo "===================" >&2
+
     if ask_yn "Enable Performance Schema (performance_schema)" yes; then
         PERFORMANCE_SCHEMA=ON
     else
         PERFORMANCE_SCHEMA=OFF
     fi
 
-    GENERAL_LOG=no
-    GENERALLOG=""
-    if ask_yn "Enable General Log (general_log)" no; then
-        GENERAL_LOG=yes
-        echo "  Recommended filename: general.log (General Query Log)" >&2
-        _general_log_default="${LOGDIR%/}/general.log"
-        show_file_example "$_general_log_default"
-        ask_runtime_path "General log file (absolute path including filename)" "$_general_log_default"
-        GENERALLOG=$ASK_RESULT
-        [ "$(dirname "$GENERALLOG")" = "$LOGDIR" ] || die "General log file must be inside the selected Log directory: $LOGDIR"
-        echo "  Note: General Log records client connections and statements and can grow quickly; normally keep it OFF unless needed." >&2
-    fi
-
-    SLOW_QUERY=no
-    SLOWLOG=""
-    LONG_QUERY_TIME=2
     while :; do
-        ask "my.cnf profile: 1=minimum, 2=production" "1"; PROFILE=$ASK_RESULT
-        case "$PROFILE" in 1) PROFILE_NAME=minimum; break ;; 2) PROFILE_NAME=production; break ;; esac
+        echo "" >&2
+        echo "Configuration profile:" >&2
+        echo "  1) Basic - selected paths/features with MySQL defaults" >&2
+        echo "  2) Tuned - additionally configure memory/connections" >&2
+        ask "Select profile" "1"; PROFILE=$ASK_RESULT
+        case "$PROFILE" in
+            1) PROFILE_NAME=basic; break ;;
+            2) PROFILE_NAME=tuned; break ;;
+        esac
+        echo "Select 1 or 2." >&2
     done
+
     DEDICATED=no; BUFFER_POOL_MB=0; MAX_CONNECTIONS=151
     [ "$PROFILE" = "2" ] || return 0
 
@@ -1014,20 +1107,6 @@ collect_profile_inputs() {
     ask "max_connections" "151"; MAX_CONNECTIONS=$ASK_RESULT
     case "$MAX_CONNECTIONS" in *[!0-9]*|'') die "Invalid max_connections" ;; esac
     [ "$MAX_CONNECTIONS" -ge 1 ] || die "max_connections must be >= 1"
-    if ask_yn "Enable Slow Query Log (slow_query_log)" yes; then
-        SLOW_QUERY=yes
-        echo "  Recommended filename: slow.log (Slow Query Log)" >&2
-        _slow_log_default="${LOGDIR%/}/slow.log"
-        show_file_example "$_slow_log_default"
-        ask_runtime_path "Slow query log file (absolute path including filename)" "$_slow_log_default"
-        SLOWLOG=$ASK_RESULT
-        [ "$(dirname "$SLOWLOG")" = "$LOGDIR" ] || die "Slow query log file must be inside the selected Log directory: $LOGDIR"
-        while :; do
-            ask "long_query_time seconds" "2"; LONG_QUERY_TIME=$ASK_RESULT
-            valid_nonnegative_number "$LONG_QUERY_TIME" && break
-            echo "long_query_time must be a non-negative number." >&2
-        done
-    fi
 }
 
 selinux_type_of_path() {
@@ -1111,7 +1190,7 @@ check_instance_collisions() {
         [ -z "$_bin_owner" ] || block "Binary Log basename already configured in $_bin_owner: $BINLOG_BASE"
     fi
     [ "$GENERAL_LOG" = yes ] && [ -e "$GENERALLOG" ] && block "General log path already exists: $GENERALLOG"
-    [ "$PROFILE" = "2" ] && [ "$SLOW_QUERY" = yes ] && [ -e "$SLOWLOG" ] && block "Slow query log path already exists: $SLOWLOG"
+    [ "$SLOW_QUERY" = yes ] && [ -e "$SLOWLOG" ] && block "Slow query log path already exists: $SLOWLOG"
     path_nonempty "$DATADIR" && block "Data directory is not empty: $DATADIR"
     [ -e "$CONF" ] && block "Configuration file already exists: $CONF"
     if [ "$START_METHOD" = systemd ]; then
@@ -1228,11 +1307,11 @@ EOF
         echo "local-infile=OFF"
         [ "$DEDICATED" = yes ] && echo "innodb-dedicated-server=ON"
         [ "$DEDICATED" = no ] && [ "$BUFFER_POOL_MB" -gt 0 ] && echo "innodb-buffer-pool-size=${BUFFER_POOL_MB}M"
-        if [ "$SLOW_QUERY" = yes ]; then
-            echo "slow-query-log=ON"
-            echo "slow-query-log-file=$SLOWLOG"
-            echo "long-query-time=$LONG_QUERY_TIME"
-        fi
+    fi
+    if [ "$SLOW_QUERY" = yes ]; then
+        echo "slow-query-log=ON"
+        echo "slow-query-log-file=$SLOWLOG"
+        echo "long-query-time=$LONG_QUERY_TIME"
     fi
     cat <<EOF
 
@@ -1820,17 +1899,19 @@ main() {
     check_instance_collisions
     show_plan
 
-    echo ""
-    echo "----- Planned my.cnf -----"
-    render_config
-    if [ "$START_METHOD" = systemd ]; then
-        echo "----- Planned systemd unit -----"
-        render_service
-    else
-        echo "----- Planned direct start command -----"
-        echo "runuser -u $OS_USER -- $TARGET_MYSQLD_PATH --defaults-file=$CONF --daemonize"
+    if ask_yn "Show detailed configuration" no; then
+        echo ""
+        echo "----- Planned my.cnf -----"
+        render_config
+        if [ "$START_METHOD" = systemd ]; then
+            echo "----- Planned systemd unit -----"
+            render_service
+        else
+            echo "----- Planned direct start command -----"
+            echo "runuser -u $OS_USER -- $TARGET_MYSQLD_PATH --defaults-file=$CONF --daemonize"
+        fi
+        echo "-------------------------------"
     fi
-    echo "-------------------------------"
 
     if [ "$MODE" = dryrun ]; then
         echo "DRY-RUN: no package/config/directory/SELinux/systemd changes applied."
