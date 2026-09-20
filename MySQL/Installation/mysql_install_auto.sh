@@ -1,7 +1,7 @@
 #!/bin/sh
 # Oracle MySQL Community RPM Bundle installer
 # POSIX /bin/sh, no third-party runtime dependency
-SCRIPT_VERSION="1.0.36"
+SCRIPT_VERSION="1.0.37"
 set -u
 umask 027
 
@@ -710,11 +710,11 @@ show_software_file_examples() {
             /\/$/ {next}
             {
                 n=split($0,a,"/"); name=a[n]; label=""
-                if(name=="mysqld") label="MySQL 서버 실행 파일"
-                else if(name=="mysql") label="SQL 접속 클라이언트"
-                else if(name=="mysqldump") label="논리 백업 프로그램"
-                else if(name=="mysqladmin") label="서버 관리 프로그램"
-                else if(name=="my_print_defaults") label="설정 옵션 확인 프로그램"
+                if($0 ~ /\/usr\/sbin\/mysqld$/) label="MySQL 서버 실행 파일"
+                else if($0 ~ /\/usr\/bin\/mysql$/) label="SQL 접속 클라이언트"
+                else if($0 ~ /\/usr\/bin\/mysqldump$/) label="논리 백업 프로그램"
+                else if($0 ~ /\/usr\/bin\/mysqladmin$/) label="서버 관리 프로그램"
+                else if($0 ~ /\/usr\/bin\/my_print_defaults$/) label="설정 옵션 확인 프로그램"
                 else if(name ~ /[.]so([.]|$)/ && libs++ < 3) label="라이브러리 또는 플러그인 (일부)"
                 else if(name=="errmsg.sys" && messages++ < 1) label="서버 오류 메시지 파일 (일부)"
                 if(label!="") printf "  %s%s — %s\n",root,$0,label
@@ -778,10 +778,9 @@ collect_instance_inputs() {
         echo "Enter a NEW directory for this version's executable, libraries and plugins." >&2
         echo "Enter only a directory; do not append the RPM binary path $SYSTEM_MYSQLD_PATH." >&2
         echo "Socket and PID files are configured separately below and must use a different directory." >&2
-        echo "Example only (directory need not use this name):" >&2
-        show_software_file_examples "${INSTANCE_ROOT%/}/software"
+        echo "Example installation directory: ${INSTANCE_ROOT%/}/software" >&2
         while :; do
-            ask "MySQL $TARGET_VERSION 실행 파일·라이브러리를 설치할 새 디렉터리 (위 파일들이 들어갈 위치)" ""
+            ask "MySQL $TARGET_VERSION 실행 파일·라이브러리를 설치할 새 디렉터리" ""
             if select_private_directory "$ASK_RESULT"; then
                 log "Installation directory: $PRIVATE_SOFTWARE_ROOT"
                 show_software_file_examples "$PRIVATE_SOFTWARE_ROOT"
