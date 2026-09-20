@@ -1,7 +1,7 @@
 #!/bin/sh
 # Oracle MySQL Community RPM Bundle installer
 # POSIX /bin/sh, no third-party runtime dependency
-SCRIPT_VERSION="1.0.38"
+SCRIPT_VERSION="1.0.39"
 set -u
 umask 027
 
@@ -405,9 +405,11 @@ $_f
         _count=$(printf '%s\n' "$_list" | sed '/^$/d' | wc -l | awk '{print $1}')
         if [ "$_count" -eq 1 ]; then
             _candidate=$(printf '%s\n' "$_list" | sed -n '1p')
+            echo "  Detected bundle example/default: $_candidate" >&2
             ask "RPM bundle path" "$_candidate"; BUNDLE=$ASK_RESULT
         else
             [ "$_count" -gt 1 ] && { echo "Detected MySQL RPM bundle candidates:" >&2; printf '%s\n' "$_list" >&2; }
+            echo "  Example file path: /absolute/path/mysql-<version>-<release>.<arch>.rpm-bundle.tar" >&2
             ask "RPM bundle path" ""; BUNDLE=$ASK_RESULT
         fi
     fi
