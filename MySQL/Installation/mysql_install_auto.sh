@@ -1,7 +1,7 @@
 #!/bin/sh
 # Oracle MySQL Community RPM Bundle installer
 # POSIX /bin/sh, no third-party runtime dependency
-SCRIPT_VERSION="1.0.40"
+SCRIPT_VERSION="1.0.41"
 set -u
 umask 027
 
@@ -636,6 +636,9 @@ validate_binary_log_path() {
     esac
     for _other in "$DATADIR" "$LOGDIR" "$FILESDIR" "${PRIVATE_SOFTWARE_ROOT:-}" $(runtime_dirs); do
         [ -n "$_other" ] || continue
+        if [ "$_other" = "$LOGDIR" ] && [ "$BINDIR" = "$LOGDIR" ]; then
+            continue
+        fi
         case "$BINDIR/" in "${_other%/}/"*) block "Binary Log directory overlaps $_other" ;; esac
         case "${_other%/}/" in "$BINDIR/"*) block "Binary Log directory contains $_other" ;; esac
     done
@@ -1505,8 +1508,12 @@ apply_selinux() {
     selinux_fcontext_set mysqld_db_t "$DATADIR(/.*)?"
     selinux_fcontext_set mysqld_log_t "$LOGDIR(/.*)?"
     if [ "$BINARY_LOG" = yes ]; then
-        _bin_expr=$(printf '%s' "$BINDIR" | sed 's/[.]/\\./g')
-        selinux_fcontext_set mysqld_db_t "$_bin_expr(/.*)?"
+        if [ "$BINDIR" = "$LOGDIR" ]; then
+            log "Binary Log shares Log directory; SELinux type remains mysqld_log_t: $LOGDIR"
+        else
+            _bin_expr=$(printf '%s' "$BINDIR" | sed 's/[.]/\\./g')
+            selinux_fcontext_set mysqld_db_t "$_bin_expr(/.*)?"
+        fi
     fi
     for _rd in $(runtime_dirs); do
         _rd_expr=$(printf '%s' "$_rd" | sed 's/[.]/\\./g')
@@ -1541,7 +1548,12 @@ verify_selinux_runtime() {
     _t=$(selinux_path_type "$DATADIR"); [ "$_t" = mysqld_db_t ] || die "SELinux type mismatch for Data Directory: ${_t:-unknown}"
     _t=$(selinux_path_type "$LOGDIR"); [ "$_t" = mysqld_log_t ] || die "SELinux type mismatch for log directory: ${_t:-unknown}"
     if [ "$BINARY_LOG" = yes ]; then
-        _t=$(selinux_path_type "$BINDIR"); [ "$_t" = mysqld_db_t ] || die "SELinux type mismatch for Binary Log directory: ${_t:-unknown}"
+        _t=$(selinux_path_type "$BINDIR")
+        if [ "$BINDIR" = "$LOGDIR" ]; then
+            [ "$_t" = mysqld_log_t ] || die "SELinux type mismatch for shared Log/Binary Log directory: ${_t:-unknown}"
+        else
+            [ "$_t" = mysqld_db_t ] || die "SELinux type mismatch for Binary Log directory: ${_t:-unknown}"
+        fi
     fi
     for _rd in $(runtime_dirs); do
         _t=$(selinux_path_type "$_rd")
