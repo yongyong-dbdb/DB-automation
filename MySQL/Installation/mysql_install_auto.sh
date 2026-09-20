@@ -1,7 +1,7 @@
 #!/bin/sh
 # Oracle MySQL Community RPM Bundle installer
 # POSIX /bin/sh, no third-party runtime dependency
-SCRIPT_VERSION="1.0.39"
+SCRIPT_VERSION="1.0.40"
 set -u
 umask 027
 
@@ -584,9 +584,11 @@ print_precheck_summary() {
     echo "============================"
 }
 ask_runtime_path() {
+    _arp_prompt=$1
+    _arp_default=${2-}
     while :; do
-        ask "$1" ""
-        [ -n "$ASK_RESULT" ] || { echo "Explicit file path required." >&2; continue; }
+        ask "$_arp_prompt" "$_arp_default"
+        [ -n "$ASK_RESULT" ] || { echo "File path is required." >&2; continue; }
         safe_path "$ASK_RESULT"
         case "$ASK_RESULT" in
             /|*/|*/./*|*/../*|*/.|*/..|*//*)
@@ -738,12 +740,12 @@ show_all_software_paths() {
 }
 
 show_directory_example() {
-    printf '  Example directory: %s\n' "$1" >&2
-    echo "  Example only; enter your chosen absolute directory path." >&2
+    printf '  Default directory: %s\n' "$1" >&2
+    echo "  Press Enter to use this value, or enter another absolute directory path." >&2
 }
 show_file_example() {
-    printf '  Example file path: %s\n' "$1" >&2
-    echo "  Example only; enter your chosen absolute path including filename." >&2
+    printf '  Default file path: %s\n' "$1" >&2
+    echo "  Press Enter to use this value, or enter another absolute path including filename." >&2
 }
 show_runtime_file_example() {
     show_file_example "$1"
@@ -778,9 +780,9 @@ collect_instance_inputs() {
 
     while :; do
         show_directory_example "$OS_HOME"
-        ask "Instance root directory (absolute path; explicit input required)" ""; INSTANCE_ROOT=$ASK_RESULT
+        ask "Instance root directory (absolute path)" "$OS_HOME"; INSTANCE_ROOT=$ASK_RESULT
         [ -n "$INSTANCE_ROOT" ] && break
-        echo "Instance root directory must be entered explicitly." >&2
+        echo "Instance root directory is required." >&2
     done
     safe_path "$INSTANCE_ROOT"
     if [ "$PACKAGE_ACTION" = coexist ]; then
@@ -788,9 +790,10 @@ collect_instance_inputs() {
         echo "Enter a NEW directory for this version's executable, libraries and plugins." >&2
         echo "Enter only a directory; do not append the RPM binary path $SYSTEM_MYSQLD_PATH." >&2
         echo "Socket and PID files are configured separately below and must use a different directory." >&2
-        show_directory_example "${INSTANCE_ROOT%/}/software"
+        _software_default="${INSTANCE_ROOT%/}/software"
+        show_directory_example "$_software_default"
         while :; do
-            ask "MySQL $TARGET_VERSION 실행 파일·라이브러리를 설치할 새 디렉터리" ""
+            ask "MySQL $TARGET_VERSION 실행 파일·라이브러리를 설치할 새 디렉터리" "$_software_default"
             if select_private_directory "$ASK_RESULT"; then
                 log "Installation directory: $PRIVATE_SOFTWARE_ROOT"
                 show_software_file_examples "$PRIVATE_SOFTWARE_ROOT"
@@ -806,28 +809,32 @@ collect_instance_inputs() {
     ask "systemd service name" "mysqld-$OS_USER"; SERVICE_NAME=$ASK_RESULT
     case "$SERVICE_NAME" in *[!A-Za-z0-9_.@-]*|'') die "Invalid systemd service name" ;; esac
     while :; do
-        show_file_example "/etc/my-${OS_USER}.cnf"
-        ask "Separate my.cnf path (absolute path; explicit input required)" ""; CONF=$ASK_RESULT
+        _conf_default="/etc/my-${OS_USER}.cnf"
+        show_file_example "$_conf_default"
+        ask "Separate my.cnf path (absolute path)" "$_conf_default"; CONF=$ASK_RESULT
         [ -n "$CONF" ] && break
-        echo "my.cnf path must be entered explicitly." >&2
+        echo "my.cnf path is required." >&2
     done
     while :; do
-        show_directory_example "${INSTANCE_ROOT%/}/data"
-        ask "Data directory (absolute path; explicit input required)" ""; DATADIR=$ASK_RESULT
+        _data_default="${INSTANCE_ROOT%/}/data"
+        show_directory_example "$_data_default"
+        ask "Data directory (absolute path)" "$_data_default"; DATADIR=$ASK_RESULT
         [ -n "$DATADIR" ] && break
-        echo "Data directory must be entered explicitly." >&2
+        echo "Data directory is required." >&2
     done
     while :; do
-        show_directory_example "${INSTANCE_ROOT%/}/log"
-        ask "Log directory for initialization and optional log files (absolute path; explicit input required)" ""; LOGDIR=$ASK_RESULT
+        _log_default="${INSTANCE_ROOT%/}/log"
+        show_directory_example "$_log_default"
+        ask "Log directory for initialization and optional log files (absolute path)" "$_log_default"; LOGDIR=$ASK_RESULT
         [ -n "$LOGDIR" ] && break
-        echo "Log directory must be entered explicitly." >&2
+        echo "Log directory is required." >&2
     done
     if ask_yn "Enable Error Log file (log-error)" yes; then
         ERROR_LOG=yes
         echo "  Recommended filename: mysqld.err (Error Log)" >&2
-        show_file_example "${LOGDIR%/}/mysqld.err"
-        ask_runtime_path "Error log file (absolute path including filename)"
+        _error_log_default="${LOGDIR%/}/mysqld.err"
+        show_file_example "$_error_log_default"
+        ask_runtime_path "Error log file (absolute path including filename)" "$_error_log_default"
         LOGFILE=$ASK_RESULT
         [ "$(dirname "$LOGFILE")" = "$LOGDIR" ] || die "Error log file must be inside the selected Log directory: $LOGDIR"
     else
@@ -836,18 +843,21 @@ collect_instance_inputs() {
         echo "No explicit log-error file will be configured; mysqld's default error logging destination will apply." >&2
     fi
     echo "Initialization log: $LOGDIR/initialize.log" >&2
-    show_runtime_file_example "${INSTANCE_ROOT%/}/mysqld/$OS_USER.sock" socket
-    ask_runtime_path "SQL socket file (absolute path including filename)"
+    _socket_default="${INSTANCE_ROOT%/}/mysqld/$OS_USER.sock"
+    show_runtime_file_example "$_socket_default" socket
+    ask_runtime_path "SQL socket file (absolute path including filename)" "$_socket_default"
     SOCKET=$ASK_RESULT
     RUNDIR=$(dirname "$SOCKET")
-    show_runtime_file_example "$RUNDIR/$OS_USER.pid" pid
-    ask_runtime_path "PID file (absolute path including filename)"
+    _pid_default="$RUNDIR/$OS_USER.pid"
+    show_runtime_file_example "$_pid_default" pid
+    ask_runtime_path "PID file (absolute path including filename)" "$_pid_default"
     PIDFILE=$ASK_RESULT
     while :; do
-        show_directory_example "${INSTANCE_ROOT%/}/secure"
-        ask "secure_file_priv directory (absolute path; explicit input required)" ""; FILESDIR=$ASK_RESULT
+        _secure_default="${INSTANCE_ROOT%/}/secure"
+        show_directory_example "$_secure_default"
+        ask "secure_file_priv directory (absolute path)" "$_secure_default"; FILESDIR=$ASK_RESULT
         [ -n "$FILESDIR" ] && break
-        echo "secure_file_priv directory must be entered explicitly." >&2
+        echo "secure_file_priv directory is required." >&2
     done
     for _p in "$CONF" "$DATADIR" "$LOGDIR" $(runtime_dirs) "$FILESDIR"; do safe_path "$_p"; done
 }
@@ -928,8 +938,9 @@ collect_network_inputs() {
         _xbind_default=${BIND_ADDRESS:-127.0.0.1}
         [ -n "$_xbind_default" ] || _xbind_default=127.0.0.1
         ask "MySQL X Protocol bind-address" "$_xbind_default"; MYSQLX_BIND_ADDRESS=$ASK_RESULT
-        show_runtime_file_example "$RUNDIR/$OS_USER-x.sock" socket
-        ask_runtime_path "MySQL X socket file (absolute path including filename)"
+        _mysqlx_socket_default="$RUNDIR/$OS_USER-x.sock"
+        show_runtime_file_example "$_mysqlx_socket_default" socket
+        ask_runtime_path "MySQL X socket file (absolute path including filename)" "$_mysqlx_socket_default"
         MYSQLX_SOCKET=$ASK_RESULT
     else
         MYSQLX_ENABLED=no; MYSQLX_PORT=""; MYSQLX_BIND_ADDRESS=""; MYSQLX_SOCKET=""
@@ -939,8 +950,9 @@ collect_profile_inputs() {
     if ask_yn "Enable Binary Log (log-bin)" yes; then
         BINARY_LOG=yes
         echo "  Recommended basename: mysql-bin (Binary Log creates numbered files such as mysql-bin.000001)" >&2
-        show_file_example "${INSTANCE_ROOT%/}/binlog/mysql-bin"
-        ask_runtime_path "Binary log basename (absolute path including basename, e.g. /path/mysql-bin)"
+        _binlog_default="${INSTANCE_ROOT%/}/binlog/mysql-bin"
+        show_file_example "$_binlog_default"
+        ask_runtime_path "Binary log basename (absolute path including basename, e.g. /path/mysql-bin)" "$_binlog_default"
         BINLOG_BASE=$ASK_RESULT
         BINDIR=$(dirname "$BINLOG_BASE")
     else
@@ -959,8 +971,9 @@ collect_profile_inputs() {
     if ask_yn "Enable General Log (general_log)" no; then
         GENERAL_LOG=yes
         echo "  Recommended filename: general.log (General Query Log)" >&2
-        show_file_example "${LOGDIR%/}/general.log"
-        ask_runtime_path "General log file (absolute path including filename)"
+        _general_log_default="${LOGDIR%/}/general.log"
+        show_file_example "$_general_log_default"
+        ask_runtime_path "General log file (absolute path including filename)" "$_general_log_default"
         GENERALLOG=$ASK_RESULT
         [ "$(dirname "$GENERALLOG")" = "$LOGDIR" ] || die "General log file must be inside the selected Log directory: $LOGDIR"
         echo "  Note: General Log records client connections and statements and can grow quickly; normally keep it OFF unless needed." >&2
@@ -1001,8 +1014,9 @@ collect_profile_inputs() {
     if ask_yn "Enable Slow Query Log (slow_query_log)" yes; then
         SLOW_QUERY=yes
         echo "  Recommended filename: slow.log (Slow Query Log)" >&2
-        show_file_example "${LOGDIR%/}/slow.log"
-        ask_runtime_path "Slow query log file (absolute path including filename)"
+        _slow_log_default="${LOGDIR%/}/slow.log"
+        show_file_example "$_slow_log_default"
+        ask_runtime_path "Slow query log file (absolute path including filename)" "$_slow_log_default"
         SLOWLOG=$ASK_RESULT
         [ "$(dirname "$SLOWLOG")" = "$LOGDIR" ] || die "Slow query log file must be inside the selected Log directory: $LOGDIR"
         while :; do
