@@ -1,7 +1,7 @@
 #!/bin/sh
 # Oracle MySQL Community RPM Bundle installer
 # POSIX /bin/sh, no third-party runtime dependency
-SCRIPT_VERSION="1.0.42"
+SCRIPT_VERSION="1.0.43"
 set -u
 umask 027
 
@@ -1072,24 +1072,43 @@ collect_profile_inputs() {
     while :; do
         echo "" >&2
         echo "Configuration profile:" >&2
-        echo "  1) Basic - selected paths/features with MySQL defaults" >&2
-        echo "  2) Tuned - additionally configure memory/connections" >&2
+        echo "  1) Basic    - selected paths/features with MySQL defaults" >&2
+        echo "  2) Advanced - optionally configure memory, connections, caches, redo, and I/O" >&2
         ask "Select profile" "1"; PROFILE=$ASK_RESULT
         case "$PROFILE" in
             1) PROFILE_NAME=basic; break ;;
-            2) PROFILE_NAME=tuned; break ;;
+            2) PROFILE_NAME=advanced; break ;;
         esac
         echo "Select 1 or 2." >&2
     done
 
-    DEDICATED=no; BUFFER_POOL_MB=0; MAX_CONNECTIONS=151
+    DEDICATED=no
+    BUFFER_POOL_MB=0
+    MAX_CONNECTIONS=0
+    REDO_LOG_CAPACITY_MB=0
+    LOG_BUFFER_MB=0
+    TMP_TABLE_MB=0
+    MAX_HEAP_TABLE_MB=0
+    TABLE_OPEN_CACHE=0
+    THREAD_CACHE_SIZE=0
+    INNODB_IO_CAPACITY=0
+    INNODB_IO_CAPACITY_MAX=0
     [ "$PROFILE" = "2" ] || return 0
+
+    echo "" >&2
+    echo "===== Advanced resource/performance settings =====" >&2
+    echo "Enter 0 to keep the MySQL server default unless another value is shown." >&2
 
     _running=$(mysqld_pids | wc -l | awk '{print $1}')
     _configured=$(config_candidates | wc -l | awk '{print $1}')
     _ded_default=yes
     if [ "$_running" -gt 0 ] 2>/dev/null || [ "$_configured" -gt 0 ] 2>/dev/null; then _ded_default=no; fi
     _want_dedicated=no
+    echo "" >&2
+    echo "innodb_dedicated_server:" >&2
+    echo "  Lets MySQL automatically size selected InnoDB memory/redo/flush settings." >&2
+    echo "  Use only when this MySQL instance can use the server/VM resources by itself." >&2
+    echo "  Select no when multiple MySQL instances or other major services share this host." >&2
     if version_ge "$TARGET_VERSION" "8.0.3" && ask_yn "Dedicated server/VM for this MySQL instance" "$_ded_default"; then
         _want_dedicated=yes
     fi
@@ -1097,16 +1116,84 @@ collect_profile_inputs() {
         warn "Existing MySQL process/configuration detected; innodb_dedicated_server is intended for a host dedicated to one MySQL instance"
         ask_yn "Confirm innodb_dedicated_server despite detected coexistence" no || _want_dedicated=no
     fi
+
     if [ "$_want_dedicated" = yes ]; then
         DEDICATED=yes
+        echo "  MySQL will automatically size innodb_buffer_pool_size and supported redo settings." >&2
     else
         DEDICATED=no
-        ask "innodb_buffer_pool_size in MB (0=leave MySQL default)" "0"; BUFFER_POOL_MB=$ASK_RESULT
-        case "$BUFFER_POOL_MB" in *[!0-9]*|'') die "Invalid buffer pool size" ;; esac
+        echo "" >&2
+        echo "innodb_buffer_pool_size:" >&2
+        echo "  Main InnoDB cache for table and index pages; usually the most important MySQL memory setting." >&2
+        echo "  On a multi-instance host, size it from memory available to THIS instance, not total host RAM." >&2
+        ask "innodb_buffer_pool_size in MB (0=MySQL default; example 1024)" "0"; BUFFER_POOL_MB=$ASK_RESULT
+        case "$BUFFER_POOL_MB" in *[!0-9]*|'') die "Invalid innodb_buffer_pool_size" ;; esac
+
+        if version_ge "$TARGET_VERSION" "8.0.30"; then
+            echo "" >&2
+            echo "innodb_redo_log_capacity:" >&2
+            echo "  Total redo log capacity. Larger capacity can reduce checkpoint pressure during write-heavy workloads" >&2
+            echo "  but uses more disk and may increase crash-recovery work." >&2
+            ask "innodb_redo_log_capacity in MB (0=MySQL default; example 1024)" "0"; REDO_LOG_CAPACITY_MB=$ASK_RESULT
+            case "$REDO_LOG_CAPACITY_MB" in *[!0-9]*|'') die "Invalid innodb_redo_log_capacity" ;; esac
+            [ "$REDO_LOG_CAPACITY_MB" -eq 0 ] || [ "$REDO_LOG_CAPACITY_MB" -ge 8 ] || die "innodb_redo_log_capacity must be 0 or at least 8 MB"
+        else
+            echo "  innodb_redo_log_capacity is not offered because target MySQL is older than 8.0.30." >&2
+        fi
     fi
-    ask "max_connections" "151"; MAX_CONNECTIONS=$ASK_RESULT
+
+    echo "" >&2
+    echo "innodb_log_buffer_size:" >&2
+    echo "  Memory buffer for redo before it is written to disk. Larger values can help very large transactions." >&2
+    ask "innodb_log_buffer_size in MB (0=MySQL default; example 64)" "0"; LOG_BUFFER_MB=$ASK_RESULT
+    case "$LOG_BUFFER_MB" in *[!0-9]*|'') die "Invalid innodb_log_buffer_size" ;; esac
+    [ "$LOG_BUFFER_MB" -eq 0 ] || [ "$LOG_BUFFER_MB" -ge 1 ] || die "innodb_log_buffer_size must be 0 or at least 1 MB"
+
+    echo "" >&2
+    echo "max_connections:" >&2
+    echo "  Maximum simultaneous client connections. Higher values can increase total memory and file-descriptor use." >&2
+    ask "max_connections (0=MySQL default; example 300)" "0"; MAX_CONNECTIONS=$ASK_RESULT
     case "$MAX_CONNECTIONS" in *[!0-9]*|'') die "Invalid max_connections" ;; esac
-    [ "$MAX_CONNECTIONS" -ge 1 ] || die "max_connections must be >= 1"
+    [ "$MAX_CONNECTIONS" -eq 0 ] || [ "$MAX_CONNECTIONS" -ge 1 ] || die "max_connections must be 0 or >= 1"
+
+    echo "" >&2
+    echo "Temporary table memory limits:" >&2
+    echo "  tmp_table_size limits individual internal in-memory temporary tables." >&2
+    echo "  max_heap_table_size also limits MEMORY-engine tables and can constrain MEMORY temporary tables." >&2
+    echo "  Increasing them may reduce disk temporary tables but raises memory risk under concurrency." >&2
+    ask "tmp_table_size in MB (0=MySQL default; example 64)" "0"; TMP_TABLE_MB=$ASK_RESULT
+    case "$TMP_TABLE_MB" in *[!0-9]*|'') die "Invalid tmp_table_size" ;; esac
+    ask "max_heap_table_size in MB (0=MySQL default; example 64)" "0"; MAX_HEAP_TABLE_MB=$ASK_RESULT
+    case "$MAX_HEAP_TABLE_MB" in *[!0-9]*|'') die "Invalid max_heap_table_size" ;; esac
+
+    echo "" >&2
+    echo "table_open_cache:" >&2
+    echo "  Number of open table handles cached by MySQL. Increase only when Opened_tables grows rapidly." >&2
+    echo "  Higher values also require more file descriptors." >&2
+    ask "table_open_cache (0=MySQL default; example 4000)" "0"; TABLE_OPEN_CACHE=$ASK_RESULT
+    case "$TABLE_OPEN_CACHE" in *[!0-9]*|'') die "Invalid table_open_cache" ;; esac
+
+    echo "" >&2
+    echo "thread_cache_size:" >&2
+    echo "  Reuses connection threads. MySQL already autosizes this by default." >&2
+    echo "  Set a value only when connection churn is high and Threads_created grows quickly." >&2
+    ask "thread_cache_size (0=keep MySQL automatic sizing; example 100)" "0"; THREAD_CACHE_SIZE=$ASK_RESULT
+    case "$THREAD_CACHE_SIZE" in *[!0-9]*|'') die "Invalid thread_cache_size" ;; esac
+
+    echo "" >&2
+    echo "InnoDB I/O capacity:" >&2
+    echo "  Controls the background flushing rate. Values should roughly reflect storage IOPS." >&2
+    echo "  Leave at 0 unless storage performance is known or measured." >&2
+    ask "innodb_io_capacity (0=MySQL default; example 1000)" "0"; INNODB_IO_CAPACITY=$ASK_RESULT
+    case "$INNODB_IO_CAPACITY" in *[!0-9]*|'') die "Invalid innodb_io_capacity" ;; esac
+    [ "$INNODB_IO_CAPACITY" -eq 0 ] || [ "$INNODB_IO_CAPACITY" -ge 100 ] || die "innodb_io_capacity must be 0 or at least 100"
+
+    ask "innodb_io_capacity_max (0=MySQL default/derived; example 2000)" "0"; INNODB_IO_CAPACITY_MAX=$ASK_RESULT
+    case "$INNODB_IO_CAPACITY_MAX" in *[!0-9]*|'') die "Invalid innodb_io_capacity_max" ;; esac
+    if [ "$INNODB_IO_CAPACITY" -gt 0 ] && [ "$INNODB_IO_CAPACITY_MAX" -gt 0 ] && [ "$INNODB_IO_CAPACITY_MAX" -lt "$INNODB_IO_CAPACITY" ]; then
+        die "innodb_io_capacity_max must be >= innodb_io_capacity"
+    fi
+    echo "==================================================" >&2
 }
 
 selinux_type_of_path() {
@@ -1303,10 +1390,18 @@ EOF
     if [ "$PROFILE" = "2" ]; then
         echo "innodb-flush-log-at-trx-commit=1"
         [ "$BINARY_LOG" = yes ] && echo "sync-binlog=1"
-        echo "max-connections=$MAX_CONNECTIONS"
         echo "local-infile=OFF"
         [ "$DEDICATED" = yes ] && echo "innodb-dedicated-server=ON"
         [ "$DEDICATED" = no ] && [ "$BUFFER_POOL_MB" -gt 0 ] && echo "innodb-buffer-pool-size=${BUFFER_POOL_MB}M"
+        [ "$DEDICATED" = no ] && [ "$REDO_LOG_CAPACITY_MB" -gt 0 ] && echo "innodb-redo-log-capacity=${REDO_LOG_CAPACITY_MB}M"
+        [ "$LOG_BUFFER_MB" -gt 0 ] && echo "innodb-log-buffer-size=${LOG_BUFFER_MB}M"
+        [ "$MAX_CONNECTIONS" -gt 0 ] && echo "max-connections=$MAX_CONNECTIONS"
+        [ "$TMP_TABLE_MB" -gt 0 ] && echo "tmp-table-size=${TMP_TABLE_MB}M"
+        [ "$MAX_HEAP_TABLE_MB" -gt 0 ] && echo "max-heap-table-size=${MAX_HEAP_TABLE_MB}M"
+        [ "$TABLE_OPEN_CACHE" -gt 0 ] && echo "table-open-cache=$TABLE_OPEN_CACHE"
+        [ "$THREAD_CACHE_SIZE" -gt 0 ] && echo "thread-cache-size=$THREAD_CACHE_SIZE"
+        [ "$INNODB_IO_CAPACITY" -gt 0 ] && echo "innodb-io-capacity=$INNODB_IO_CAPACITY"
+        [ "$INNODB_IO_CAPACITY_MAX" -gt 0 ] && echo "innodb-io-capacity-max=$INNODB_IO_CAPACITY_MAX"
     fi
     if [ "$SLOW_QUERY" = yes ]; then
         echo "slow-query-log=ON"
