@@ -1,7 +1,7 @@
 #!/bin/sh
 # Oracle MySQL Community RPM Bundle installer
 # POSIX /bin/sh, no third-party runtime dependency
-SCRIPT_VERSION="1.0.35"
+SCRIPT_VERSION="1.0.36"
 set -u
 umask 027
 
@@ -52,7 +52,7 @@ rollback_changes() {
     if [ "${CREATED_UNIT:-no}" = yes ] && [ -n "${UNIT_FILE:-}" ]; then rm -f "$UNIT_FILE"; systemctl daemon-reload >/dev/null 2>&1 || true; fi
     if [ "${CREATED_CONF:-no}" = yes ] && [ -n "${CONF:-}" ]; then rm -f "$CONF"; fi
     # Known instance files are required to be absent by precheck; remove only files created by this run.
-    for _f in "${INIT_LOG:-}" "${LOGFILE:-}" "${SLOWLOG:-}" "${PIDFILE:-}" "${SOCKET:-}" "${SOCKET:-}.lock" "${MYSQLX_SOCKET:-}" "${MYSQLX_SOCKET:-}.lock"; do
+    for _f in "${INIT_LOG:-}" "${LOGFILE:-}" "${GENERALLOG:-}" "${SLOWLOG:-}" "${PIDFILE:-}" "${SOCKET:-}" "${SOCKET:-}.lock" "${MYSQLX_SOCKET:-}" "${MYSQLX_SOCKET:-}.lock"; do
         [ -n "$_f" ] && [ "$_f" != ".lock" ] && rm -f "$_f" 2>/dev/null || true
     done
     for _p in ${SELINUX_PORT_ADDED:-}; do semanage port -d -p tcp "$_p" >/dev/null 2>&1 || true; done
@@ -603,7 +603,7 @@ validate_log_paths() {
         case "${_log_other%/}/" in "$LOGDIR/"*) block "Log directory contains $_log_other" ;; esac
     done
     _log_seen=""
-    for _log_file in ${LOGFILE:+"$LOGFILE"} "$LOGDIR/initialize.log" "$SLOWLOG"; do
+    for _log_file in ${LOGFILE:+"$LOGFILE"} "$LOGDIR/initialize.log" ${GENERALLOG:+"$GENERALLOG"} ${SLOWLOG:+"$SLOWLOG"}; do
         case " $_log_seen " in *" $_log_file "*) block "Log file paths collide: $_log_file" ;; esac
         _log_seen="$_log_seen $_log_file"
         [ ! -e "$_log_file" ] && [ ! -L "$_log_file" ] || block "Log path already exists: $_log_file"
@@ -813,7 +813,8 @@ collect_instance_inputs() {
     done
     if ask_yn "Enable Error Log file (log-error)" yes; then
         ERROR_LOG=yes
-        show_runtime_file_example "${LOGDIR%/}/$OS_USER.log" log
+        echo "  Recommended filename: mysqld.err (Error Log)" >&2
+        show_runtime_file_example "${LOGDIR%/}/mysqld.err" log
         ask_runtime_path "Error log file (absolute path including filename)"
         LOGFILE=$ASK_RESULT
         [ "$(dirname "$LOGFILE")" = "$LOGDIR" ] || die "Error log file must be inside the selected Log directory: $LOGDIR"
@@ -924,6 +925,7 @@ collect_network_inputs() {
 collect_profile_inputs() {
     if ask_yn "Enable Binary Log (log-bin)" yes; then
         BINARY_LOG=yes
+        echo "  Recommended basename: mysql-bin (Binary Log creates numbered files such as mysql-bin.000001)" >&2
         show_runtime_file_example "${INSTANCE_ROOT%/}/binlog/mysql-bin" log
         ask_runtime_path "Binary log basename (absolute path including basename, e.g. /path/mysql-bin)"
         BINLOG_BASE=$ASK_RESULT
@@ -938,11 +940,27 @@ collect_profile_inputs() {
     else
         PERFORMANCE_SCHEMA=OFF
     fi
+
+    GENERAL_LOG=no
+    GENERALLOG=""
+    if ask_yn "Enable General Log (general_log)" no; then
+        GENERAL_LOG=yes
+        echo "  Recommended filename: general.log (General Query Log)" >&2
+        show_runtime_file_example "${LOGDIR%/}/general.log" log
+        ask_runtime_path "General log file (absolute path including filename)"
+        GENERALLOG=$ASK_RESULT
+        [ "$(dirname "$GENERALLOG")" = "$LOGDIR" ] || die "General log file must be inside the selected Log directory: $LOGDIR"
+        echo "  Note: General Log records client connections and statements and can grow quickly; normally keep it OFF unless needed." >&2
+    fi
+
+    SLOW_QUERY=no
+    SLOWLOG=""
+    LONG_QUERY_TIME=2
     while :; do
         ask "my.cnf profile: 1=minimum, 2=production" "1"; PROFILE=$ASK_RESULT
         case "$PROFILE" in 1) PROFILE_NAME=minimum; break ;; 2) PROFILE_NAME=production; break ;; esac
     done
-    DEDICATED=no; BUFFER_POOL_MB=0; MAX_CONNECTIONS=151; SLOW_QUERY=no; LONG_QUERY_TIME=2
+    DEDICATED=no; BUFFER_POOL_MB=0; MAX_CONNECTIONS=151
     [ "$PROFILE" = "2" ] || return 0
 
     _running=$(mysqld_pids | wc -l | awk '{print $1}')
@@ -967,8 +985,13 @@ collect_profile_inputs() {
     ask "max_connections" "151"; MAX_CONNECTIONS=$ASK_RESULT
     case "$MAX_CONNECTIONS" in *[!0-9]*|'') die "Invalid max_connections" ;; esac
     [ "$MAX_CONNECTIONS" -ge 1 ] || die "max_connections must be >= 1"
-    if ask_yn "Enable slow query log" yes; then
+    if ask_yn "Enable Slow Query Log (slow_query_log)" yes; then
         SLOW_QUERY=yes
+        echo "  Recommended filename: slow.log (Slow Query Log)" >&2
+        show_runtime_file_example "${LOGDIR%/}/slow.log" log
+        ask_runtime_path "Slow query log file (absolute path including filename)"
+        SLOWLOG=$ASK_RESULT
+        [ "$(dirname "$SLOWLOG")" = "$LOGDIR" ] || die "Slow query log file must be inside the selected Log directory: $LOGDIR"
         while :; do
             ask "long_query_time seconds" "2"; LONG_QUERY_TIME=$ASK_RESULT
             valid_nonnegative_number "$LONG_QUERY_TIME" && break
@@ -1043,7 +1066,6 @@ check_instance_collisions() {
     _sel_t=$(selinux_conflicting_port_type "$PORT" || true)
     [ -z "$_sel_t" ] || block "SQL port $PORT reserved by SELinux type $_sel_t"
     validate_runtime_paths
-    SLOWLOG="$LOGDIR/slow.log"
     validate_log_paths
     validate_binary_log_path
 
@@ -1058,6 +1080,7 @@ check_instance_collisions() {
         _bin_owner=$(configured_option_owner log-bin "$BINLOG_BASE")
         [ -z "$_bin_owner" ] || block "Binary Log basename already configured in $_bin_owner: $BINLOG_BASE"
     fi
+    [ "$GENERAL_LOG" = yes ] && [ -e "$GENERALLOG" ] && block "General log path already exists: $GENERALLOG"
     [ "$PROFILE" = "2" ] && [ "$SLOW_QUERY" = yes ] && [ -e "$SLOWLOG" ] && block "Slow query log path already exists: $SLOWLOG"
     path_nonempty "$DATADIR" && block "Data directory is not empty: $DATADIR"
     [ -e "$CONF" ] && block "Configuration file already exists: $CONF"
@@ -1086,6 +1109,14 @@ check_instance_collisions() {
     if [ "$ERROR_LOG" = yes ]; then
         _owner_cf=$(configured_option_owner log-error "$LOGFILE")
         [ -z "$_owner_cf" ] || block "log-error path already configured in $_owner_cf: $LOGFILE"
+    fi
+    if [ "$GENERAL_LOG" = yes ]; then
+        _owner_cf=$(configured_option_owner general-log-file "$GENERALLOG")
+        [ -z "$_owner_cf" ] || block "general-log-file path already configured in $_owner_cf: $GENERALLOG"
+    fi
+    if [ "$SLOW_QUERY" = yes ]; then
+        _owner_cf=$(configured_option_owner slow-query-log-file "$SLOWLOG")
+        [ -z "$_owner_cf" ] || block "slow-query-log-file path already configured in $_owner_cf: $SLOWLOG"
     fi
 
     case "$FILESDIR/" in "$DATADIR"/*) block "secure_file_priv directory must not be inside Data Directory" ;; esac
@@ -1136,6 +1167,12 @@ secure-file-priv=$FILESDIR
 EOF
     if [ "$ERROR_LOG" = yes ]; then
         echo "log-error=$LOGFILE"
+    fi
+    if [ "$GENERAL_LOG" = yes ]; then
+        echo "general-log=ON"
+        echo "general-log-file=$GENERALLOG"
+    else
+        echo "general-log=OFF"
     fi
     if [ "$BINARY_LOG" = yes ]; then
         echo "log-bin=$BINLOG_BASE"
@@ -1216,6 +1253,8 @@ show_plan() {
     echo "Data          : $DATADIR"
     echo "Log directory : $LOGDIR"
     echo "Error Log     : $ERROR_LOG${LOGFILE:+ ($LOGFILE)}"
+    echo "General Log   : $GENERAL_LOG${GENERALLOG:+ ($GENERALLOG)}"
+    echo "Slow Query Log: $SLOW_QUERY${SLOWLOG:+ ($SLOWLOG)}"
     echo "Binary Log    : $BINARY_LOG${BINLOG_BASE:+ ($BINLOG_BASE)}"
     echo "Performance Schema: $PERFORMANCE_SCHEMA"
     echo "Socket        : $SOCKET"
