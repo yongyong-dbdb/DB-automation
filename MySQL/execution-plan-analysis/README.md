@@ -2,9 +2,11 @@
 
 MySQL Optimizer 실행계획과 Connection / Thread 기반 Performance Schema 통계 진단 스크립트.
 
+검증 환경: MySQL Community Server **9.7.2**, Linux, `mysql` OS 계정, 기존 MySQL Login Path로 3306 인스턴스 접속.
+
 선택한 `EXPLAIN FORMAT` 출력, 내부 JSON Plan 기반 Object 진단, Table/Index 통계, Column Histogram, Index I/O 누적값, 동일 Connection에서 수집한 `EXPLAIN ANALYZE` Statement Event, Optimizer Trace 원본 수집 기능 포함.
 
-> 현재 구현 버전: `v0.2.0`
+> 현재 구현 버전: `v0.2.1`
 
 실행 파일:
 
@@ -231,7 +233,8 @@ Optimizer Trace 내부 형식은 MySQL Version에 따라 변경 가능하므로 
 | `index_io_delta.txt` | 비수집 안내(전역 지표의 SQL별 귀속 오류 방지) |
 | `analyze_session.txt` | 실제 ANALYZE Connection ID / P_S THREAD_ID |
 | `thread_statement_event.txt` | 실제 ANALYZE의 동일 Thread Statement Event |
-| `optimizer_trace.txt` | Optimizer Trace |
+| `optimizer_trace.txt` | Optimizer Trace 및 실행계획 수집 원본 |
+| `diagnostic_errors.txt` | Table/Index/Histogram 진단 SQL 오류(발생 시) |
 
 ## 현재 제한 사항
 
@@ -243,8 +246,31 @@ Optimizer Trace 내부 형식은 MySQL Version에 따라 변경 가능하므로 
 - Join Node별 Estimated / Actual 비교 자동화 미구현
 - Version별 JSON Plan 구조 차이 추가 검증 필요
 - Performance Schema Consumer/Instrument 수집 설정 의존
-- 실제 MySQL 서버에서 FORMAT 및 같은 Thread Event 조회 검증 필요
+- MySQL 9.7.2에서 TRADITIONAL / TREE / JSON / ALL, ANALYZE TREE / JSON v2, 동일 Thread 이벤트, Optimizer Trace 및 JOIN SQL 검증 완료
+- 다른 MySQL 버전에서 JSON Plan 구조 및 Analyzer 옵션 호환성 추가 검증 필요
 - 운영 서버 실측 기반 성능 영향 검증 필요
+
+## 실제 서버 검증
+
+| 테스트 항목 | MySQL 9.7.2 결과 |
+| --- | --- |
+| Login Path 접속 / Precheck | 통과 |
+| FORMAT=TRADITIONAL / TREE / JSON / ALL | 통과 |
+| EXPLAIN ANALYZE FORMAT=TREE | 통과 |
+| EXPLAIN ANALYZE FORMAT=JSON v2 | 통과 |
+| CONNECTION_ID / THREAD_ID / Statement Event | 통과 |
+| Table / InnoDB Statistics | 통과 |
+| Index Definition / I/O | 통과(`IS_VISIBLE` 컬럼 사용) |
+| Optimizer Trace | 통과 |
+| 두 테이블 JOIN 자동 추출 | 통과 |
+| DML ANALYZE 자동 실행 차단 | 통과 |
+| Shell `sh -n` | 통과 |
+
+- SELECT / JOIN 실습 쿼리만 실제 실행
+- DML / DDL / Server 설정 변경 미수행
+- `EXPLAIN`에서 Relation이 상수로 치환되면 JSON Plan에 Table Node가 없을 수 있으며, 이는 분석 오류와 구분
+- Performance Schema의 Statement History Consumer가 비활성화된 환경에서는 Thread Event 누락 가능
+- 인스턴스 전역 Index I/O 통계를 단일 SQL의 I/O로 해석하지 않음
 
 ## 공식 문서
 
