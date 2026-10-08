@@ -338,6 +338,10 @@ menu_choice() {
 }
 
 choose_analysis_options() {
+    # Reject incompatible explicit input in both interactive and --batch modes.
+    if [ -n "$CONNECTION_ID" ] && { [ -n "$SQL_FILE" ] || [ -n "$SQL_TEXT" ]; }; then
+        die "Cannot combine --file/--sql with --for-connection"
+    fi
     if [ "$BATCH_MODE" -eq 0 ] && [ "$CHECK_ONLY" -eq 0 ]; then
         [ -t 0 ] || die "Interactive menu requires TTY. Use --batch for automated execution."
         printf '\n========== MySQL EXPLAIN Analysis ==========\n' >&2
