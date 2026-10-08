@@ -6,7 +6,7 @@ MySQL Optimizer 실행계획과 Connection / Thread 기반 Performance Schema �
 
 선택한 `EXPLAIN FORMAT` 출력, 내부 JSON Plan 기반 Object 진단, Table/Index 통계, Column Histogram, Index I/O 누적값, 동일 Connection에서 수집한 `EXPLAIN ANALYZE` Statement Event, Optimizer Trace 원본 수집 기능 포함.
 
-> 현재 구현 버전: `v0.4.4`
+> 현재 구현 버전: `v0.4.5`
 
 실행 파일:
 
@@ -148,6 +148,7 @@ sh explain.sh \
 | `--optimizer-trace` | Optimizer Trace 수집 |
 | `--check-only` | 접속 / 기본 Capability 확인만 수행 |
 | `--output DIR` | 결과 Directory 지정 |
+| `--no-print-plan` | TREE/ALL 선택 시 실행계획의 터미널 자동 출력 생략(파일 저장 유지) |
 
 Password Command Line Argument 미지원.
 
@@ -211,6 +212,9 @@ sh explain.sh query.sql --format JSON --analyze --analyze-format JSON \
   --login-path local_mysql --database tuning_lab
 ```
 
+- `--format TREE` 또는 `--format ALL` 실행이 성공하면 `explain_tree.txt`의 전체 내용을 터미널에도 표시(파일 저장 유지)
+- `--no-print-plan`을 지정하면 터미널 출력만 생략. `explain_tree.txt`는 계속 저장
+- `--format JSON` 또는 `TRADITIONAL`만 선택한 경우에는 TREE 출력 파일을 생성하지 않으므로 TREE 결과를 표시하지 않음
 - `EXPLAIN ANALYZE FORMAT=TRADITIONAL` 미지원
 - `EXPLAIN ANALYZE FORMAT=JSON`: `explain_json_format_version=2` 설정 지원 환경만 가능
 - 미지원 형식인 경우 임의 형식으로 대체하지 않고 오류 보고
