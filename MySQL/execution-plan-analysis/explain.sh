@@ -1,13 +1,13 @@
 #!/bin/sh
 # MySQL Execution Plan Analysis
-# Version: 0.2.1
+# Version: 0.3.0
 #
 # Oracle MySQL execution-plan / optimizer diagnostic collector.
 # No Python / jq / external package dependency.
 
 set -u
 
-VERSION="0.2.1"
+VERSION="0.3.0"
 
 MYSQL_BIN="${MYSQL_BIN:-mysql}"
 MYSQL_HOST="${MYSQL_HOST:-}"
@@ -307,14 +307,42 @@ collect_plan() {
 }
 
 extract_objects() {
-    JSON_FILE="$PLAN_JSON_FILE"
-    OBJECT_FILE="$OUTPUT_DIR/objects.txt"
+    OBJECT_FILE="$OUTPUT_DIR/objects.tsv"
 
-    sed -n 's/.*"table_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$JSON_FILE" |
-        sort -u > "$OBJECT_FILE"
+    # MySQL 9.x JSON v2 includes schema_name for every base relation.
+    # The same server session holds the plan in @diag_plan and pairs the
+    # schema/table arrays by ordinality. Avoid shell regex JSON parsing.
+    EXTRACT_SQL="EXPLAIN FORMAT=JSON INTO @diag_plan $SQL_TEXT;
+SET @diag_tables=JSON_EXTRACT(@diag_plan, '\$**.table_name');
+SET @diag_schemas=JSON_EXTRACT(@diag_plan, '\$**.schema_name');
+SELECT DISTINCT COALESCE(s.schema_name, DATABASE()), t.table_name
+FROM JSON_TABLE(
+  CASE
+    WHEN @diag_tables IS NULL THEN JSON_ARRAY()
+    WHEN JSON_TYPE(@diag_tables)='ARRAY' THEN @diag_tables
+    ELSE JSON_ARRAY(@diag_tables)
+  END, '\$[*]' COLUMNS(n FOR ORDINALITY, table_name VARCHAR(128) PATH '\$')
+) AS t
+LEFT JOIN JSON_TABLE(
+  CASE
+    WHEN @diag_schemas IS NULL THEN JSON_ARRAY()
+    WHEN JSON_TYPE(@diag_schemas)='ARRAY' THEN @diag_schemas
+    ELSE JSON_ARRAY(@diag_schemas)
+  END, '\$[*]' COLUMNS(n FOR ORDINALITY, schema_name VARCHAR(128) PATH '\$')
+) AS s ON s.n=t.n
+WHERE t.table_name IS NOT NULL
+ORDER BY 1,2;"
 
+    if ! mysql_raw "$EXTRACT_SQL" > "$OBJECT_FILE" \
+      2> "$OUTPUT_DIR/objects.err"; then
+        DIAG_ERRORS=1
+        warn "MySQL JSON object extraction failed; see objects.err"
+        : > "$OBJECT_FILE"
+    fi
+
+    awk -F '\t' 'NF>=2 {print $1 "." $2}' "$OBJECT_FILE" > "$OUTPUT_DIR/objects.txt"
     if [ ! -s "$OBJECT_FILE" ]; then
-        warn "No base table in JSON plan (e.g. optimized-away relation or constant-only SQL)"
+        warn "No base relation in JSON plan, or extraction unavailable"
     fi
 }
 
@@ -324,17 +352,16 @@ collect_object_stats() {
     : > "$OUTPUT_DIR/index_io.txt"
     : > "$OUTPUT_DIR/column_histograms.txt"
 
-    [ -s "$OUTPUT_DIR/objects.txt" ] || return 0
+    [ -s "$OUTPUT_DIR/objects.tsv" ] || return 0
 
-    DB_ESC="$(sql_quote "$MYSQL_DATABASE")"
-
-    while IFS= read -r TBL; do
+    while IFS="$(printf '\t')" read -r OBJ_SCHEMA TBL; do
+        DB_ESC="$(sql_quote "$OBJ_SCHEMA")"
         [ -n "$TBL" ] || continue
 
         TBL_ESC="$(sql_quote "$TBL")"
 
         {
-            printf '\n### %s.%s\n' "$MYSQL_DATABASE" "$TBL"
+            printf '\n### %s.%s\n' "$OBJ_SCHEMA" "$TBL"
 
             mysql_exec "
 SELECT
@@ -365,7 +392,7 @@ WHERE database_name='$DB_ESC'
         } >> "$OUTPUT_DIR/table_stats.txt"
 
         {
-            printf '\n### %s.%s\n' "$MYSQL_DATABASE" "$TBL"
+            printf '\n### %s.%s\n' "$OBJ_SCHEMA" "$TBL"
 
             mysql_exec "
 SELECT
@@ -390,7 +417,7 @@ ORDER BY INDEX_NAME, SEQ_IN_INDEX;
         } >> "$OUTPUT_DIR/index_definitions.txt"
 
         {
-            printf '\n### %s.%s\n' "$MYSQL_DATABASE" "$TBL"
+            printf '\n### %s.%s\n' "$OBJ_SCHEMA" "$TBL"
 
             mysql_exec "
 SELECT
@@ -413,7 +440,7 @@ ORDER BY COUNT_STAR DESC;
         } >> "$OUTPUT_DIR/index_io.txt"
 
         {
-            printf '\n### %s.%s\n' "$MYSQL_DATABASE" "$TBL"
+            printf '\n### %s.%s\n' "$OBJ_SCHEMA" "$TBL"
 
             mysql_exec "
 SELECT
@@ -428,7 +455,7 @@ ORDER BY COLUMN_NAME;
 " 2>&1
         } >> "$OUTPUT_DIR/column_histograms.txt"
 
-    done < "$OUTPUT_DIR/objects.txt"
+    done < "$OUTPUT_DIR/objects.tsv"
 
     : > "$OUTPUT_DIR/diagnostic_errors.txt"
     for DIAG_FILE in table_stats.txt index_definitions.txt index_io.txt column_histograms.txt; do
