@@ -1,13 +1,13 @@
 #!/bin/sh
 # MySQL Execution Plan Analysis
-# Version: 0.2.0
+# Version: 0.2.1
 #
 # Oracle MySQL execution-plan / optimizer diagnostic collector.
 # No Python / jq / external package dependency.
 
 set -u
 
-VERSION="0.2.0"
+VERSION="0.2.1"
 
 MYSQL_BIN="${MYSQL_BIN:-mysql}"
 MYSQL_HOST="${MYSQL_HOST:-}"
@@ -296,6 +296,7 @@ collect_plan() {
                     die "FORMAT=TREE failed: $OUTPUT_DIR/explain_tree.err"
                 fi
                 warn "FORMAT=TREE unavailable; see explain_tree.err"
+                DIAG_ERRORS=1
             fi
             ;;
     esac
@@ -313,7 +314,7 @@ extract_objects() {
         sort -u > "$OBJECT_FILE"
 
     if [ ! -s "$OBJECT_FILE" ]; then
-        warn "No base table extracted from EXPLAIN JSON"
+        warn "No base table in JSON plan (e.g. optimized-away relation or constant-only SQL)"
     fi
 }
 
@@ -452,6 +453,7 @@ SET optimizer_trace='enabled=off';"
 
     if ! mysql_raw "$TRACE_SQL"         > "$OUTPUT_DIR/optimizer_trace.txt"         2> "$OUTPUT_DIR/optimizer_trace.err"; then
         warn "Optimizer Trace failed. See optimizer_trace.err"
+        DIAG_ERRORS=1
     fi
 }
 
@@ -492,6 +494,7 @@ SELECT CONCAT('##EVENT##',COALESCE((
     if ! mysql_raw "$ANALYZE_SQL" > "$TMP_DIR/analyze_all.txt" \
       2> "$OUTPUT_DIR/explain_analyze.err"; then
         warn "EXPLAIN ANALYZE unavailable; see explain_analyze.err"
+        DIAG_ERRORS=1
         return 0
     fi
 
@@ -727,5 +730,5 @@ write_summary "$TYPE"
 
 log "Done: $OUTPUT_DIR"
 if [ "$DIAG_ERRORS" -ne 0 ]; then
-    die "One or more diagnostic queries failed; inspect diagnostic_errors.txt"
+    die "One or more requested diagnostics failed; inspect report .err files and diagnostic_errors.txt"
 fi
