@@ -1,13 +1,13 @@
 #!/bin/sh
 # MySQL Execution Plan Analysis
-# Version: 0.1.0
+# Version: 0.2.0
 #
 # Oracle MySQL execution-plan / optimizer diagnostic collector.
 # No Python / jq / external package dependency.
 
 set -u
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 
 MYSQL_BIN="${MYSQL_BIN:-mysql}"
 MYSQL_HOST="${MYSQL_HOST:-}"
@@ -21,6 +21,8 @@ DEFAULTS_FILE=""
 NO_PASSWORD=0
 ANALYZE=0
 ANALYZE_DML=0
+EXPLAIN_FORMAT=""
+ANALYZE_FORMAT="TREE"
 OPTIMIZER_TRACE=0
 CHECK_ONLY=0
 OUTPUT_DIR=""
@@ -51,8 +53,11 @@ Connection:
   --no-password              Do not prompt for a password
 
 Analysis:
-  --analyze                   Run EXPLAIN ANALYZE for SELECT/TABLE only
-  --analyze-dml               Run UPDATE/DELETE EXPLAIN ANALYZE in transaction + ROLLBACK
+  --format NAME               TRADITIONAL | TREE | JSON | ALL
+  --analyze                   EXPLAIN ANALYZE for SELECT/TABLE only (executes SQL)
+  --analyze-format NAME       TREE | JSON (JSON requires explain_json_format_version=2)
+  --analyze-dml               Disabled for safety in v0.2
+  TTY without --format       Choose interactively; otherwise TRADITIONAL
   --optimizer-trace           Collect INFORMATION_SCHEMA.OPTIMIZER_TRACE
   --check-only                Connection / capability precheck only
   --output DIR                Report output directory
@@ -226,24 +231,76 @@ UNION ALL SELECT 'optimizer_switch', @@optimizer_switch;
     } > "$PRECHECK_FILE"
 }
 
+choose_explain_format() {
+    if [ -z "$EXPLAIN_FORMAT" ]; then
+        if [ -t 0 ]; then
+            printf 'EXPLAIN FORMAT: 1) TRADITIONAL  2) TREE  3) JSON  4) ALL [1]: ' >&2
+            IFS= read -r CHOICE
+            case "$CHOICE" in
+                ""|1) EXPLAIN_FORMAT="TRADITIONAL" ;;
+                2) EXPLAIN_FORMAT="TREE" ;;
+                3) EXPLAIN_FORMAT="JSON" ;;
+                4) EXPLAIN_FORMAT="ALL" ;;
+                *) die "Invalid EXPLAIN FORMAT selection" ;;
+            esac
+        else
+            EXPLAIN_FORMAT="TRADITIONAL"
+        fi
+    fi
+
+    EXPLAIN_FORMAT="$(printf '%s' "$EXPLAIN_FORMAT" | tr '[:lower:]' '[:upper:]')"
+    ANALYZE_FORMAT="$(printf '%s' "$ANALYZE_FORMAT" | tr '[:lower:]' '[:upper:]')"
+
+    case "$EXPLAIN_FORMAT" in
+        TRADITIONAL|TREE|JSON|ALL) ;;
+        *) die "--format must be TRADITIONAL, TREE, JSON, or ALL" ;;
+    esac
+
+    case "$ANALYZE_FORMAT" in
+        TREE|JSON) ;;
+        *) die "--analyze-format must be TREE or JSON" ;;
+    esac
+}
+
 collect_plan() {
-    log "[1/7] EXPLAIN FORMAT=TRADITIONAL"
+    # MySQL JSON plan remains internal input for object diagnostics, even
+    # when a different human-readable EXPLAIN FORMAT is selected.
+    PLAN_JSON_FILE="$OUTPUT_DIR/explain_internal.json"
+    case "$EXPLAIN_FORMAT" in
+        JSON|ALL) PLAN_JSON_FILE="$PLAN_JSON_FILE" ;;
+    esac
 
-    if ! mysql_exec "EXPLAIN FORMAT=TRADITIONAL $SQL_TEXT"         > "$OUTPUT_DIR/explain_traditional.txt"         2> "$OUTPUT_DIR/explain_traditional.err"; then
-        die "EXPLAIN failed. See $OUTPUT_DIR/explain_traditional.err"
+    log "[PLAN] Internal MySQL JSON plan"
+    if ! mysql_raw "EXPLAIN FORMAT=JSON $SQL_TEXT" \
+        > "$PLAN_JSON_FILE" 2> "$OUTPUT_DIR/explain_json.err"; then
+        die "EXPLAIN FORMAT=JSON failed: $OUTPUT_DIR/explain_json.err"
     fi
 
-    log "[2/7] EXPLAIN FORMAT=JSON"
+    case "$EXPLAIN_FORMAT" in
+        TRADITIONAL|ALL)
+            log "[PLAN] FORMAT=TRADITIONAL"
+            if ! mysql_exec "EXPLAIN FORMAT=TRADITIONAL $SQL_TEXT" \
+                > "$OUTPUT_DIR/explain_traditional.txt" 2> "$OUTPUT_DIR/explain_traditional.err"; then
+                die "FORMAT=TRADITIONAL failed: $OUTPUT_DIR/explain_traditional.err"
+            fi
+            ;;
+    esac
 
-    if ! mysql_raw "EXPLAIN FORMAT=JSON $SQL_TEXT"         > "$OUTPUT_DIR/explain.json"         2> "$OUTPUT_DIR/explain_json.err"; then
-        die "EXPLAIN FORMAT=JSON failed. See $OUTPUT_DIR/explain_json.err"
-    fi
+    case "$EXPLAIN_FORMAT" in
+        TREE|ALL)
+            log "[PLAN] FORMAT=TREE"
+            if ! mysql_raw "EXPLAIN FORMAT=TREE $SQL_TEXT" \
+                > "$OUTPUT_DIR/explain_tree.txt" 2> "$OUTPUT_DIR/explain_tree.err"; then
+                if [ "$EXPLAIN_FORMAT" = "TREE" ]; then
+                    die "FORMAT=TREE failed: $OUTPUT_DIR/explain_tree.err"
+                fi
+                warn "FORMAT=TREE unavailable; see explain_tree.err"
+            fi
+            ;;
+    esac
 
-    log "[3/7] EXPLAIN FORMAT=TREE"
-
-    if ! mysql_raw "EXPLAIN FORMAT=TREE $SQL_TEXT"         > "$OUTPUT_DIR/explain_tree.txt"         2> "$OUTPUT_DIR/explain_tree.err"; then
-        warn "FORMAT=TREE unavailable or failed. See explain_tree.err"
-        : > "$OUTPUT_DIR/explain_tree.txt"
+    if [ "$EXPLAIN_FORMAT" = "JSON" ]; then
+        log "[PLAN] FORMAT=JSON"
     fi
 }
 
@@ -492,6 +549,8 @@ write_summary() {
         printf 'Script Version : %s\n' "$VERSION"
         printf 'Statement Type : %s\n' "$TYPE"
         printf 'Database       : %s\n' "$MYSQL_DATABASE"
+        printf 'EXPLAIN Format : %s\n' "$EXPLAIN_FORMAT"
+        printf 'Analyze Format : %s\n' "$ANALYZE_FORMAT"
         printf 'Analyze        : %s\n' "$ANALYZE"
         printf 'Analyze DML    : %s\n' "$ANALYZE_DML"
         printf 'Optimizer Trace: %s\n' "$OPTIMIZER_TRACE"
@@ -578,10 +637,30 @@ while [ "$#" -gt 0 ]; do
             shift
             ;;
 
-        --analyze-dml)
-            ANALYZE=1
-            ANALYZE_DML=1
+        --format|--explain-format)
+            [ "$#" -ge 2 ] || die "--format requires a value"
+            EXPLAIN_FORMAT="$2"
+            shift 2
+            ;;
+
+        --format=*|--explain-format=*)
+            EXPLAIN_FORMAT="${1#*=}"
             shift
+            ;;
+
+        --analyze-format)
+            [ "$#" -ge 2 ] || die "--analyze-format requires a value"
+            ANALYZE_FORMAT="$2"
+            shift 2
+            ;;
+
+        --analyze-format=*)
+            ANALYZE_FORMAT="${1#*=}"
+            shift
+            ;;
+
+        --analyze-dml)
+            die "--analyze-dml disabled: only multi-table UPDATE/DELETE supported by MySQL EXPLAIN ANALYZE; rollback alone cannot guarantee isolation"
             ;;
 
         --optimizer-trace)
@@ -627,6 +706,7 @@ need_cmd awk
 need_cmd sed
 need_cmd sort
 need_cmd mktemp
+need_cmd tr
 
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/mysql-explain-work.XXXXXX")" || die "mktemp failed"
 
@@ -636,6 +716,7 @@ if [ -z "$LOGIN_PATH" ] && [ -z "$DEFAULTS_FILE" ]; then
 fi
 
 read_sql
+choose_explain_format
 make_output_dir
 
 log "[0/7] Connection / capability precheck"
