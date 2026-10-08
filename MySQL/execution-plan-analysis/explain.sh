@@ -1,13 +1,13 @@
 #!/bin/sh
 # MySQL Execution Plan Analysis
-# Version: 0.4.1
+# Version: 0.4.2
 #
 # Oracle MySQL execution-plan / optimizer diagnostic collector.
 # No Python / jq / external package dependency.
 
 set -u
 
-VERSION="0.4.1"
+VERSION="0.4.2"
 
 MYSQL_BIN="${MYSQL_BIN:-mysql}"
 MYSQL_HOST="${MYSQL_HOST:-}"
@@ -273,7 +273,7 @@ SET @diag_bind_$BIND_COUNT = $EXPR;"
 prepare_diagnostic_sql() {
     STATEMENT="$1"
     if [ "$BIND_COUNT" -eq 0 ]; then
-        printf '%s\n' "$STATEMENT"
+        printf '%s;\n' "$STATEMENT"
         return 0
     fi
     HEX="$(hex_utf8 "$STATEMENT")"
@@ -864,6 +864,14 @@ TYPE="$(statement_type)"
 [ -n "$TYPE" ] || TYPE="UNKNOWN"
 
 collect_plan
+if [ "$TYPE" = "WITH" ]; then
+    # EXPLAIN JSON v2 reports the final statement type, even for CTE SQL.
+    CTE_TYPE="$(sed -n 's/^[[:space:]]*"query_type":[[:space:]]*"\([^"]*\)".*/\1/p' "$PLAN_JSON_FILE" | head -n 1)"
+    case "$CTE_TYPE" in
+        select) TYPE="SELECT" ;;
+        *) warn "WITH statement type not confidently SELECT; EXPLAIN ANALYZE disabled" ;;
+    esac
+fi
 
 log "[4/7] Base table / statistics / index diagnostics"
 extract_objects
