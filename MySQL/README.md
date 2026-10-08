@@ -1,6 +1,6 @@
 # MySQL Automation
 
-MySQL 설치, In-place Upgrade, GTID Replication, Group Replication, InnoDB Cluster 구성을 자동화한 프로젝트 모음입니다.
+MySQL 설치, In-place Upgrade, GTID Replication, Group Replication, InnoDB Cluster 구성과 SQL 실행계획 분석을 자동화한 프로젝트 모음입니다.
 
 ## 구성
 
@@ -11,6 +11,7 @@ MySQL 설치, In-place Upgrade, GTID Replication, Group Replication, InnoDB Clus
 | `Replication(GTID)/` | GTID 기반 Source / Replica 구성 |
 | `Group-Replication/` | Standalone 또는 GTID Replication의 Group Replication 전환 |
 | `InnoDB-Cluster/` | 신규 InnoDB Cluster 구성 또는 기존 Group Replication Adopt |
+| `execution-plan-analysis/` | EXPLAIN / Optimizer / Table·Index Statistics 통합 분석 |
 
 ## 설계 기준
 
