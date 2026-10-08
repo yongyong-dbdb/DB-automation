@@ -1,13 +1,13 @@
 #!/bin/sh
 # MySQL Execution Plan Analysis
-# Version: 0.4.0
+# Version: 0.4.1
 #
 # Oracle MySQL execution-plan / optimizer diagnostic collector.
 # No Python / jq / external package dependency.
 
 set -u
 
-VERSION="0.4.0"
+VERSION="0.4.1"
 
 MYSQL_BIN="${MYSQL_BIN:-mysql}"
 MYSQL_HOST="${MYSQL_HOST:-}"
@@ -574,25 +574,59 @@ run_explain_analyze() {
 
     log "[ANALYZE] $ANALYZE_FORMAT (same MySQL session)"
     INIT=""
+    ANALYZE_STATEMENT="EXPLAIN ANALYZE FORMAT=$ANALYZE_FORMAT $SQL_TEXT"
+    AFTER_SQL=""
     if [ "$ANALYZE_FORMAT" = "JSON" ]; then
         INIT="SET SESSION explain_json_format_version=2;"
+        ANALYZE_STATEMENT="EXPLAIN ANALYZE FORMAT=JSON INTO @diag_actual $SQL_TEXT"
+        AFTER_SQL="
+SELECT JSON_PRETTY(@diag_actual);
+SET @diag_ops=JSON_EXTRACT(@diag_actual, '\$**.operation');
+SET @diag_est=JSON_EXTRACT(@diag_actual, '\$**.estimated_rows');
+SET @diag_act=JSON_EXTRACT(@diag_actual, '\$**.actual_rows');
+SET @diag_loops=JSON_EXTRACT(@diag_actual, '\$**.actual_loops');
+SELECT CONCAT('##METRIC##',o.n,CHAR(9),
+              REPLACE(o.operation,CHAR(9),' '),CHAR(9),
+              e.est,CHAR(9),a.act,CHAR(9),l.loops,CHAR(9),
+              COALESCE(ROUND(a.act/NULLIF(e.est,0),3),0))
+FROM JSON_TABLE(
+  IF(JSON_TYPE(@diag_ops)='ARRAY',@diag_ops,JSON_ARRAY(@diag_ops)),
+  '\$[*]' COLUMNS(n FOR ORDINALITY, operation VARCHAR(512) PATH '\$')
+) o
+JOIN JSON_TABLE(
+  IF(JSON_TYPE(@diag_est)='ARRAY',@diag_est,JSON_ARRAY(@diag_est)),
+  '\$[*]' COLUMNS(n FOR ORDINALITY, est DOUBLE PATH '\$')
+) e ON e.n=o.n
+JOIN JSON_TABLE(
+  IF(JSON_TYPE(@diag_act)='ARRAY',@diag_act,JSON_ARRAY(@diag_act)),
+  '\$[*]' COLUMNS(n FOR ORDINALITY, act DOUBLE PATH '\$')
+) a ON a.n=o.n
+JOIN JSON_TABLE(
+  IF(JSON_TYPE(@diag_loops)='ARRAY',@diag_loops,JSON_ARRAY(@diag_loops)),
+  '\$[*]' COLUMNS(n FOR ORDINALITY, loops DOUBLE PATH '\$')
+) l ON l.n=o.n
+ORDER BY o.n;"
     fi
 
-    # One mysql connection preserves CONNECTION_ID -> P_S THREAD_ID mapping.
+    # EXPLAIN and the Performance Schema snapshot share one server session.
+    # A prepared EXPLAIN is tracked as execute_sql, not dealloc_sql.
     ANALYZE_SQL="$INIT
 SET @diag_thread = (
   SELECT THREAD_ID FROM performance_schema.threads
   WHERE PROCESSLIST_ID = CONNECTION_ID()
 );
 SELECT CONCAT('##SESSION##', CONNECTION_ID(), '|', COALESCE(@diag_thread,'NULL'));
-$(prepare_diagnostic_sql "EXPLAIN ANALYZE FORMAT=$ANALYZE_FORMAT $SQL_TEXT")
+$(prepare_diagnostic_sql "$ANALYZE_STATEMENT")
+$AFTER_SQL
 SELECT CONCAT('##EVENT##',COALESCE((
   SELECT CONCAT_WS('|',EVENT_ID,EVENT_NAME,
     ROUND(TIMER_WAIT/1000000000,3),
     ROUND(LOCK_TIME/1000000000,3),
     ROWS_EXAMINED,ROWS_SENT,MYSQL_ERRNO)
   FROM performance_schema.events_statements_history
-  WHERE THREAD_ID = @diag_thread AND (SQL_TEXT LIKE 'EXPLAIN ANALYZE%' OR SQL_TEXT LIKE 'EXECUTE diag_explain_stmt%')
+  WHERE THREAD_ID = @diag_thread
+    AND SQL_TEXT LIKE 'EXPLAIN ANALYZE%'
+    AND EVENT_NAME IN ('statement/sql/select', 'statement/sql/execute_sql')
   ORDER BY EVENT_ID DESC LIMIT 1
 ),'NOT_COLLECTED'));"
 
@@ -605,10 +639,12 @@ SELECT CONCAT('##EVENT##',COALESCE((
 
     awk '/^##SESSION##/ {print}' "$TMP_DIR/analyze_all.txt" > "$OUTPUT_DIR/analyze_session.txt"
     awk '/^##EVENT##/ {print}' "$TMP_DIR/analyze_all.txt" > "$OUTPUT_DIR/thread_statement_event.txt"
-    awk 'NR>1 && $0 !~ /^##SESSION##/ && $0 !~ /^##EVENT##/ {print}' \
+    awk '/^##METRIC##/ {sub(/^##METRIC##/,"");print}' \
+      "$TMP_DIR/analyze_all.txt" > "$OUTPUT_DIR/estimated_actual.tsv"
+    awk 'NR>1 && $0 !~ /^##SESSION##/ && $0 !~ /^##EVENT##/ && $0 !~ /^##METRIC##/ {print}' \
       "$TMP_DIR/analyze_all.txt" > "$OUTPUT_DIR/explain_analyze.txt"
 
-    printf '%s\n' 'Disabled: index I/O counters are global across all server threads.' \
+    printf '%s\n' 'Not collected: index I/O counters are global across all server threads.' \
       > "$OUTPUT_DIR/index_io_delta.txt"
 }
 
