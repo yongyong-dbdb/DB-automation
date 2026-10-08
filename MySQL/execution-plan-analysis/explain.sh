@@ -429,68 +429,6 @@ ORDER BY COLUMN_NAME;
     done < "$OUTPUT_DIR/objects.txt"
 }
 
-snapshot_index_io() {
-    OUT="$1"
-    : > "$OUT"
-
-    [ -s "$OUTPUT_DIR/objects.txt" ] || return 0
-
-    DB_ESC="$(sql_quote "$MYSQL_DATABASE")"
-
-    while IFS= read -r TBL; do
-        [ -n "$TBL" ] || continue
-        TBL_ESC="$(sql_quote "$TBL")"
-
-        mysql_raw "
-SELECT
-    OBJECT_SCHEMA,
-    OBJECT_NAME,
-    COALESCE(INDEX_NAME, '<NO_INDEX>'),
-    COUNT_STAR,
-    COUNT_READ,
-    COUNT_WRITE,
-    COUNT_FETCH,
-    COUNT_INSERT,
-    COUNT_UPDATE,
-    COUNT_DELETE,
-    SUM_TIMER_WAIT
-FROM performance_schema.table_io_waits_summary_by_index_usage
-WHERE OBJECT_SCHEMA='$DB_ESC'
-  AND OBJECT_NAME='$TBL_ESC';
-" >> "$OUT" 2>/dev/null || true
-
-    done < "$OUTPUT_DIR/objects.txt"
-}
-
-make_index_delta() {
-    BEFORE="$1"
-    AFTER="$2"
-    OUT="$OUTPUT_DIR/index_io_delta.txt"
-
-    awk -F '\t' '
-    BEGIN {
-        OFS="\t"
-        print "OBJECT_SCHEMA","OBJECT_NAME","INDEX_NAME",
-              "COUNT_STAR_DELTA","COUNT_READ_DELTA","COUNT_WRITE_DELTA",
-              "COUNT_FETCH_DELTA","COUNT_INSERT_DELTA","COUNT_UPDATE_DELTA",
-              "COUNT_DELETE_DELTA","SUM_TIMER_WAIT_DELTA"
-    }
-
-    NR==FNR {
-        k=$1 SUBSEP $2 SUBSEP $3
-        for (i=4;i<=11;i++) b[k,i]=$i+0
-        next
-    }
-
-    {
-        k=$1 SUBSEP $2 SUBSEP $3
-        printf "%s\t%s\t%s", $1,$2,$3
-        for (i=4;i<=11;i++) printf "\t%.0f", ($i+0)-b[k,i]
-        printf "\n"
-    }
-    ' "$BEFORE" "$AFTER" > "$OUT"
-}
-
 collect_optimizer_trace() {
     log "[6/7] Optimizer Trace"
 
@@ -507,37 +445,51 @@ SET optimizer_trace='enabled=off';"
 
 run_explain_analyze() {
     TYPE="$1"
-    BEFORE="$TMP_DIR/index_before.tsv"
-    AFTER="$TMP_DIR/index_after.tsv"
-
-    snapshot_index_io "$BEFORE"
-
-    log "[5/7] EXPLAIN ANALYZE"
-
     case "$TYPE" in
-        SELECT|TABLE)
-            if ! mysql_raw "EXPLAIN ANALYZE $SQL_TEXT"                 > "$OUTPUT_DIR/explain_analyze.txt"                 2> "$OUTPUT_DIR/explain_analyze.err"; then
-                warn "EXPLAIN ANALYZE failed. See explain_analyze.err"
-            fi
-            ;;
-
-        UPDATE|DELETE)
-            if [ "$ANALYZE_DML" -eq 1 ]; then
-                if ! mysql_raw "START TRANSACTION; EXPLAIN ANALYZE $SQL_TEXT; ROLLBACK;"                     > "$OUTPUT_DIR/explain_analyze.txt"                     2> "$OUTPUT_DIR/explain_analyze.err"; then
-                    warn "DML EXPLAIN ANALYZE failed or is unsupported for this statement form. See explain_analyze.err"
-                fi
-            else
-                warn "DML EXPLAIN ANALYZE skipped. Use --analyze-dml for explicit transaction + ROLLBACK execution."
-            fi
-            ;;
-
+        SELECT|TABLE) ;;
         *)
-            warn "EXPLAIN ANALYZE skipped for statement type: $TYPE"
+            warn "EXPLAIN ANALYZE skipped: SELECT/TABLE only in safe mode"
+            return 0
             ;;
     esac
 
-    snapshot_index_io "$AFTER"
-    make_index_delta "$BEFORE" "$AFTER"
+    log "[ANALYZE] $ANALYZE_FORMAT (same MySQL session)"
+    INIT=""
+    if [ "$ANALYZE_FORMAT" = "JSON" ]; then
+        INIT="SET SESSION explain_json_format_version=2;"
+    fi
+
+    # One mysql connection preserves CONNECTION_ID -> P_S THREAD_ID mapping.
+    ANALYZE_SQL="$INIT
+SET @diag_thread = (
+  SELECT THREAD_ID FROM performance_schema.threads
+  WHERE PROCESSLIST_ID = CONNECTION_ID()
+);
+SELECT CONCAT('##SESSION##', CONNECTION_ID(), '|', COALESCE(@diag_thread,'NULL'));
+EXPLAIN ANALYZE FORMAT=$ANALYZE_FORMAT $SQL_TEXT;
+SELECT CONCAT('##EVENT##',COALESCE((
+  SELECT CONCAT_WS('|',EVENT_ID,EVENT_NAME,
+    ROUND(TIMER_WAIT/1000000000,3),
+    ROUND(LOCK_TIME/1000000000,3),
+    ROWS_EXAMINED,ROWS_SENT,MYSQL_ERRNO)
+  FROM performance_schema.events_statements_history
+  WHERE THREAD_ID = @diag_thread AND SQL_TEXT LIKE 'EXPLAIN ANALYZE%'
+  ORDER BY EVENT_ID DESC LIMIT 1
+),'NOT_COLLECTED'));"
+
+    if ! mysql_raw "$ANALYZE_SQL" > "$TMP_DIR/analyze_all.txt" \
+      2> "$OUTPUT_DIR/explain_analyze.err"; then
+        warn "EXPLAIN ANALYZE unavailable; see explain_analyze.err"
+        return 0
+    fi
+
+    awk '/^##SESSION##/ {print}' "$TMP_DIR/analyze_all.txt" > "$OUTPUT_DIR/analyze_session.txt"
+    awk '/^##EVENT##/ {print}' "$TMP_DIR/analyze_all.txt" > "$OUTPUT_DIR/thread_statement_event.txt"
+    awk 'NR>1 && $0 !~ /^##SESSION##/ && $0 !~ /^##EVENT##/ {print}' \
+      "$TMP_DIR/analyze_all.txt" > "$OUTPUT_DIR/explain_analyze.txt"
+
+    printf '%s\n' 'Disabled: index I/O counters are global across all server threads.' \
+      > "$OUTPUT_DIR/index_io_delta.txt"
 }
 
 write_summary() {
