@@ -1,13 +1,13 @@
 #!/bin/sh
 # MySQL Execution Plan Analysis
-# Version: 0.4.4
+# Version: 0.4.5
 #
 # Oracle MySQL execution-plan / optimizer diagnostic collector.
 # No Python / jq / external package dependency.
 
 set -u
 
-VERSION="0.4.4"
+VERSION="0.4.5"
 
 MYSQL_BIN="${MYSQL_BIN:-mysql}"
 MYSQL_HOST="${MYSQL_HOST:-}"
@@ -26,6 +26,7 @@ ANALYZE_FORMAT="TREE"
 OPTIMIZER_TRACE=0
 DIAG_ERRORS=0
 CHECK_ONLY=0
+PRINT_PLAN=1
 OUTPUT_DIR=""
 SQL_TEXT=""
 SQL_FILE=""
@@ -67,6 +68,7 @@ Analysis:
   --optimizer-trace           Collect INFORMATION_SCHEMA.OPTIMIZER_TRACE
   --check-only                Connection / capability precheck only
   --output DIR                Report output directory
+  --no-print-plan             Save results without displaying TREE plan
 
 Other:
   -h, --help                  Show help
@@ -828,6 +830,11 @@ ${1#*=}"
             shift
             ;;
 
+        --no-print-plan)
+            PRINT_PLAN=0
+            shift
+            ;;
+
         --output)
             [ "$#" -ge 2 ] || die "--output requires a value"
             OUTPUT_DIR="$2"
@@ -931,7 +938,15 @@ fi
 log "[7/7] Report summary"
 write_summary "$TYPE"
 
-log "Done: $OUTPUT_DIR"
 if [ "$DIAG_ERRORS" -ne 0 ]; then
     die "One or more requested diagnostics failed; inspect report .err files and diagnostic_errors.txt"
+fi
+
+log "Done: $OUTPUT_DIR"
+
+# Print the TREE plan for TREE/ALL selections while retaining its report file.
+if [ "$PRINT_PLAN" -eq 1 ] && [ -s "$OUTPUT_DIR/explain_tree.txt" ]; then
+    printf '\n===== EXPLAIN FORMAT=TREE =====\n'
+    cat "$OUTPUT_DIR/explain_tree.txt"
+    printf '===== END EXPLAIN FORMAT=TREE =====\n'
 fi
