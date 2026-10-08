@@ -1,13 +1,13 @@
 #!/bin/sh
 # MySQL Execution Plan Analysis
-# Version: 0.3.0
+# Version: 0.4.0
 #
 # Oracle MySQL execution-plan / optimizer diagnostic collector.
 # No Python / jq / external package dependency.
 
 set -u
 
-VERSION="0.3.0"
+VERSION="0.4.0"
 
 MYSQL_BIN="${MYSQL_BIN:-mysql}"
 MYSQL_HOST="${MYSQL_HOST:-}"
@@ -29,6 +29,10 @@ CHECK_ONLY=0
 OUTPUT_DIR=""
 SQL_TEXT=""
 SQL_FILE=""
+BIND_VALUES=""
+BIND_SETUP=""
+BIND_USING=""
+BIND_COUNT=0
 
 TMP_CNF=""
 TMP_DIR=""
@@ -41,6 +45,7 @@ Usage:
 SQL input:
   --sql SQL                  SQL text
   --file FILE                SQL file
+  --bind TYPE:VALUE          Repeatable INT / DECIMAL / STR / DATE / NULL
   positional FILE            Same as --file FILE
 
 Connection:
@@ -272,7 +277,7 @@ collect_plan() {
     esac
 
     log "[PLAN] Internal MySQL JSON plan"
-    if ! mysql_raw "EXPLAIN FORMAT=JSON $SQL_TEXT" \
+    if ! mysql_raw "$(prepare_diagnostic_sql "EXPLAIN FORMAT=JSON $SQL_TEXT")" \
         > "$PLAN_JSON_FILE" 2> "$OUTPUT_DIR/explain_json.err"; then
         die "EXPLAIN FORMAT=JSON failed: $OUTPUT_DIR/explain_json.err"
     fi
@@ -280,7 +285,7 @@ collect_plan() {
     case "$EXPLAIN_FORMAT" in
         TRADITIONAL|ALL)
             log "[PLAN] FORMAT=TRADITIONAL"
-            if ! mysql_exec "EXPLAIN FORMAT=TRADITIONAL $SQL_TEXT" \
+            if ! mysql_exec "$(prepare_diagnostic_sql "EXPLAIN FORMAT=TRADITIONAL $SQL_TEXT")" \
                 > "$OUTPUT_DIR/explain_traditional.txt" 2> "$OUTPUT_DIR/explain_traditional.err"; then
                 die "FORMAT=TRADITIONAL failed: $OUTPUT_DIR/explain_traditional.err"
             fi
@@ -290,7 +295,7 @@ collect_plan() {
     case "$EXPLAIN_FORMAT" in
         TREE|ALL)
             log "[PLAN] FORMAT=TREE"
-            if ! mysql_raw "EXPLAIN FORMAT=TREE $SQL_TEXT" \
+            if ! mysql_raw "$(prepare_diagnostic_sql "EXPLAIN FORMAT=TREE $SQL_TEXT")" \
                 > "$OUTPUT_DIR/explain_tree.txt" 2> "$OUTPUT_DIR/explain_tree.err"; then
                 if [ "$EXPLAIN_FORMAT" = "TREE" ]; then
                     die "FORMAT=TREE failed: $OUTPUT_DIR/explain_tree.err"
@@ -312,7 +317,8 @@ extract_objects() {
     # MySQL 9.x JSON v2 includes schema_name for every base relation.
     # The same server session holds the plan in @diag_plan and pairs the
     # schema/table arrays by ordinality. Avoid shell regex JSON parsing.
-    EXTRACT_SQL="EXPLAIN FORMAT=JSON INTO @diag_plan $SQL_TEXT;
+    EXTRACT_SQL="$(prepare_diagnostic_sql "EXPLAIN FORMAT=JSON INTO @diag_plan $SQL_TEXT")
+
 SET @diag_tables=JSON_EXTRACT(@diag_plan, '\$**.table_name');
 SET @diag_schemas=JSON_EXTRACT(@diag_plan, '\$**.schema_name');
 SELECT DISTINCT COALESCE(s.schema_name, DATABASE()), t.table_name
@@ -474,7 +480,7 @@ collect_optimizer_trace() {
 SET optimizer_trace_max_mem_size=1048576;
 SELECT CONCAT('diagnostic_connection=', CONNECTION_ID(),
               ',ps_thread=', COALESCE(PS_CURRENT_THREAD_ID(), 'NULL'));
-EXPLAIN FORMAT=JSON $SQL_TEXT;
+$(prepare_diagnostic_sql "EXPLAIN FORMAT=JSON $SQL_TEXT")
 SELECT TRACE FROM information_schema.optimizer_trace;
 SET optimizer_trace='enabled=off';"
 
@@ -507,14 +513,14 @@ SET @diag_thread = (
   WHERE PROCESSLIST_ID = CONNECTION_ID()
 );
 SELECT CONCAT('##SESSION##', CONNECTION_ID(), '|', COALESCE(@diag_thread,'NULL'));
-EXPLAIN ANALYZE FORMAT=$ANALYZE_FORMAT $SQL_TEXT;
+$(prepare_diagnostic_sql "EXPLAIN ANALYZE FORMAT=$ANALYZE_FORMAT $SQL_TEXT")
 SELECT CONCAT('##EVENT##',COALESCE((
   SELECT CONCAT_WS('|',EVENT_ID,EVENT_NAME,
     ROUND(TIMER_WAIT/1000000000,3),
     ROUND(LOCK_TIME/1000000000,3),
     ROWS_EXAMINED,ROWS_SENT,MYSQL_ERRNO)
   FROM performance_schema.events_statements_history
-  WHERE THREAD_ID = @diag_thread AND SQL_TEXT LIKE 'EXPLAIN ANALYZE%'
+  WHERE THREAD_ID = @diag_thread AND (SQL_TEXT LIKE 'EXPLAIN ANALYZE%' OR SQL_TEXT LIKE 'EXECUTE diag_explain_stmt%')
   ORDER BY EVENT_ID DESC LIMIT 1
 ),'NOT_COLLECTED'));"
 
@@ -549,6 +555,7 @@ write_summary() {
         printf 'DML Analyze    : disabled (safety / SQL restrictions)\n'
         printf 'P_S metrics    : same-session THREAD_ID statement event\n'
         printf 'Optimizer Trace: %s\n' "$OPTIMIZER_TRACE"
+        printf 'Bind Count     : %s\n' "$BIND_COUNT"
         printf 'Stats SQL errors: %s\n' "$DIAG_ERRORS"
 
         printf '\nBase Tables\n'
@@ -579,6 +586,19 @@ while [ "$#" -gt 0 ]; do
             [ "$#" -ge 2 ] || die "--file requires a value"
             SQL_FILE="$2"
             shift 2
+            ;;
+
+        --bind)
+            [ "$#" -ge 2 ] || die "--bind requires TYPE:VALUE"
+            BIND_VALUES="$BIND_VALUES
+$2"
+            shift 2
+            ;;
+
+        --bind=*)
+            BIND_VALUES="$BIND_VALUES
+${1#*=}"
+            shift
             ;;
 
         --host)
@@ -703,6 +723,7 @@ need_cmd sed
 need_cmd sort
 need_cmd mktemp
 need_cmd tr
+need_cmd od
 
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/mysql-explain-work.XXXXXX")" || die "mktemp failed"
 
@@ -713,6 +734,7 @@ fi
 
 read_sql
 choose_explain_format
+compile_bind_values
 make_output_dir
 
 log "[0/7] Connection / capability precheck"
