@@ -1,13 +1,13 @@
 #!/bin/sh
 # MySQL Execution Plan Analysis
-# Version: 0.4.2
+# Version: 0.4.3
 #
 # Oracle MySQL execution-plan / optimizer diagnostic collector.
 # No Python / jq / external package dependency.
 
 set -u
 
-VERSION="0.4.2"
+VERSION="0.4.3"
 
 MYSQL_BIN="${MYSQL_BIN:-mysql}"
 MYSQL_HOST="${MYSQL_HOST:-}"
@@ -605,6 +605,9 @@ JOIN JSON_TABLE(
   IF(JSON_TYPE(@diag_loops)='ARRAY',@diag_loops,JSON_ARRAY(@diag_loops)),
   '\$[*]' COLUMNS(n FOR ORDINALITY, loops DOUBLE PATH '\$')
 ) l ON l.n=o.n
+WHERE JSON_LENGTH(@diag_ops)=JSON_LENGTH(@diag_est)
+  AND JSON_LENGTH(@diag_ops)=JSON_LENGTH(@diag_act)
+  AND JSON_LENGTH(@diag_ops)=JSON_LENGTH(@diag_loops)
 ORDER BY o.n;"
     fi
 
@@ -665,6 +668,7 @@ write_summary() {
         printf 'Optimizer Trace: %s\n' "$OPTIMIZER_TRACE"
         printf 'Bind Count     : %s\n' "$BIND_COUNT"
         printf 'Stats SQL errors: %s\n' "$DIAG_ERRORS"
+        printf 'Ratio format    : %s\n' "${ANALYZE_FORMAT}"
 
         printf '\nBase Tables\n'
         printf '%s\n' '-----------'
@@ -870,6 +874,13 @@ if [ "$TYPE" = "WITH" ]; then
     case "$CTE_TYPE" in
         select) TYPE="SELECT" ;;
         *) warn "WITH statement type not confidently SELECT; EXPLAIN ANALYZE disabled" ;;
+    esac
+fi
+
+if [ "$ANALYZE" -eq 1 ]; then
+    case "$TYPE" in
+        SELECT|TABLE) ;;
+        *) die "EXPLAIN ANALYZE explicitly requested but statement type $TYPE is not a verified read-only SELECT/TABLE" ;;
     esac
 fi
 
