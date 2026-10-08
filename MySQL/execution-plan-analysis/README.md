@@ -2,11 +2,11 @@
 
 MySQL Optimizer 실행계획과 Connection / Thread 기반 Performance Schema 통계 진단 스크립트.
 
-검증 환경: MySQL Community Server **9.7.2**, Linux, `mysql` OS 계정, 기존 MySQL Login Path로 3306 인스턴스 접속.
+검증 환경: MySQL Community Server **9.7.2**, Linux, `mysql` OS 계정. 3306에서 분석/테스트 데이터 생성, 3307·3308에서 읽기 전용 EXPLAIN/Precheck 검증.
 
 선택한 `EXPLAIN FORMAT` 출력, 내부 JSON Plan 기반 Object 진단, Table/Index 통계, Column Histogram, Index I/O 누적값, 동일 Connection에서 수집한 `EXPLAIN ANALYZE` Statement Event, Optimizer Trace 원본 수집 기능 포함.
 
-> 현재 구현 버전: `v0.2.1`
+> 현재 구현 버전: `v0.4.4`
 
 실행 파일:
 
@@ -23,7 +23,10 @@ explain.sh
 - 내부 Table 추출용 JSON Plan 별도 수집
 - `--analyze-format TREE|JSON` 실제 실행계획 형식 별도 선택
 - `EXPLAIN ANALYZE`
-- JSON Plan 기반 Base Table 자동 추출
+- MySQL Server JSON 함수 기반 Schema-qualified Base Table 자동 추출
+- 타입 명시 Bind Parameter (`PREPARE → EXECUTE USING`)
+- CTE 선행 SELECT의 Query Type 확인
+- JSON / TREE Actual Iterator별 Estimated Rows / Actual Rows / Loops / 오차 배율 산출
 - `INFORMATION_SCHEMA.TABLES` Table 상태
 - `mysql.innodb_table_stats` InnoDB Persistent Statistics
 - `INFORMATION_SCHEMA.STATISTICS` Index 정의 / Cardinality
@@ -50,6 +53,8 @@ awk
 sed
 sort
 mktemp
+od
+tr
 stty
 ```
 
@@ -94,11 +99,39 @@ sh explain.sh query.sql \
   --database tuning_lab
 ```
 
+## Bind Parameter 예시
+
+MySQL Prepared Statement의 `?` Parameter Marker를 자동 처리. `--bind`를 여러 번 지정하면 SQL의 `?` 위치 순서대로 대응.
+
+```sh
+sh explain.sh \
+  --sql 'SELECT id,segment FROM diag_explain_a.customer_probe WHERE segment=? AND id>?' \
+  --bind STR:B --bind INT:2 \
+  --format JSON --analyze --analyze-format JSON \
+  --login-path local_mysql --database tuning_lab
+```
+
+지원 타입:
+
+| 형식 | 의미 | 예시 |
+| --- | --- | --- |
+| `INT:value` | Integer | `--bind INT:42` |
+| `DECIMAL:value` | Decimal | `--bind DECIMAL:12.50` |
+| `STR:value` | UTF-8 String | `--bind STR:서울` |
+| `DATE:value` | ISO Date | `--bind DATE:2026-10-08` |
+| `NULL` | SQL NULL | `--bind NULL` |
+
+- String Bind 값은 Hex Encoding 이후 MySQL 세션 변수로 전달. SQL 문자 인용 오류 방지.
+- Bind 값은 해당 세션의 `PREPARE → EXECUTE ... USING → DEALLOCATE PREPARE` 순서로 사용.
+- Bind 수 불일치 시 MySQL 오류로 실패(정상으로 오인 금지).
+- Bash/POSIX 셸 인자의 개행 문자를 포함한 `STR` 값은 현재 미지원.
+
 ## 주요 옵션
 
 | 옵션 | 내용 |
 | --- | --- |
 | `--sql SQL` | SQL 직접 입력 |
+| `--bind TYPE:VALUE` | Typed Bind Parameter, 반복 지정 가능 |
 | `--file FILE` | SQL File 입력 |
 | `--host HOST` | MySQL Host |
 | `--port PORT` | MySQL Port |
@@ -142,6 +175,8 @@ Performance Schema Index I/O 누적 통계 확인
 동일 Connection ID → Performance Schema THREAD_ID 매핑
   ↓
 동일 Thread의 Statement Event 조회(수집 활성화 시)
+  ↓
+JSON / TREE 연산자별 Estimated/Actual/Loops 비교
   ↓
 Optimizer Trace(별도 동일 세션 흐름) 및 결과 저장
 ```
@@ -224,8 +259,10 @@ Optimizer Trace 내부 형식은 MySQL Version에 따라 변경 가능하므로 
 | `explain.json` | JSON Plan 원본 (JSON/ALL 선택 시) |
 | `explain_internal.json` | Object 진단용 내부 JSON Plan (TRADITIONAL/TREE 선택 시) |
 | `explain_tree.txt` | TREE Plan (선택 시) |
-| `explain_analyze.txt` | Actual Plan |
-| `objects.txt` | JSON Plan에서 추출한 Table |
+| `explain_analyze.txt` | 실제 실행계획 (지정한 TREE/JSON) |
+| `estimated_actual.tsv` | Iterator별 예상 Row, 실제 Row(Loop당), Loops, Actual/Estimated 배율 |
+| `objects.txt` | 완전 수식된 `Schema.Table` 목록 |
+| `objects.tsv` | Schema / Table 컬럼 분리 자료 |
 | `table_stats.txt` | Table / InnoDB Statistics |
 | `index_definitions.txt` | Index 정의 / Cardinality |
 | `column_histograms.txt` | Column Histogram |
@@ -238,39 +275,40 @@ Optimizer Trace 내부 형식은 MySQL Version에 따라 변경 가능하므로 
 
 ## 현재 제한 사항
 
-- JSON Plan의 `table_name` 기반 Table 식별(내부 JSON 형식·객체 종류별 정확성 추가 검증 필요)
-- Cross-Schema SQL의 동일 Table Name 중복 식별 보강 필요
-- CTE 선행 SQL의 Statement Type 상세 판별 보강 필요
-- `?` Parameter Marker 기반 Prepared Statement 자동 Bind 미구현
-- Estimated Rows ↔ Actual Rows 자동 오차율 계산 미구현
-- Join Node별 Estimated / Actual 비교 자동화 미구현
-- Version별 JSON Plan 구조 차이 추가 검증 필요
-- Performance Schema Consumer/Instrument 수집 설정 의존
-- MySQL 9.7.2에서 TRADITIONAL / TREE / JSON / ALL, ANALYZE TREE / JSON v2, 동일 Thread 이벤트, Optimizer Trace 및 JOIN SQL 검증 완료
-- 다른 MySQL 버전에서 JSON Plan 구조 및 Analyzer 옵션 호환성 추가 검증 필요
-- 운영 서버 실측 기반 성능 영향 검증 필요
+- **MySQL 9.7.2** 대상 구현 및 실측 검증. 다른 MySQL 버전(8.0/8.4 포함)별 JSON Plan 구조, `explain_json_format_version`, `EXPLAIN ANALYZE FORMAT=JSON` 호환성 추가 확인 필요
+- Schema 추출은 JSON Plan v2의 `schema_name` / `table_name` 배열 순서를 기반으로 매핑. Schema 정보가 없는 JSON v1에서는 명확하지 않은 Cross-Schema 객체 판별 한계
+- `EXPLAIN ANALYZE`는 실제 SELECT 실행. 운영 환경에서 비용·잠금·트랜잭션 영향 검토 필요
+- JSON Actual Metrics는 배열 길이 일치 시 Iterator별 비교. TREE는 완전한 Estimated/Actual 수치가 표시된 Iterator 행만 추출
+- Row 오차 배율 = `Actual Rows (Loop당 평균) / Estimated Rows`. `loops>1`은 별도 해석 필요
+- 단순 `?` Bind 지원. 복잡한 SQL Placeholder의 정적 위치 파싱/의미 분석 및 Application Prepared Statement 실행 이력 재현 기능 없음
+- Performance Schema Statement History 및 Instrument 설정에 따라 Thread Event 미수집 가능
+- 인스턴스 전역 Index I/O는 개별 SQL의 기여분으로 귀속하지 않음
+- Column Histogram/인덱스 변경 권고 자동 수행 없음. DML ANALYZE 차단
 
 ## 실제 서버 검증
 
-| 테스트 항목 | MySQL 9.7.2 결과 |
+| 테스트 항목 | 결과 |
 | --- | --- |
-| Login Path 접속 / Precheck | 통과 |
-| FORMAT=TRADITIONAL / TREE / JSON / ALL | 통과 |
-| EXPLAIN ANALYZE FORMAT=TREE | 통과 |
-| EXPLAIN ANALYZE FORMAT=JSON v2 | 통과 |
-| CONNECTION_ID / THREAD_ID / Statement Event | 통과 |
-| Table / InnoDB Statistics | 통과 |
-| Index Definition / I/O | 통과(`IS_VISIBLE` 컬럼 사용) |
-| Optimizer Trace | 통과 |
-| 두 테이블 JOIN 자동 추출 | 통과 |
-| DML ANALYZE 자동 실행 차단 | 통과 |
-| Shell `sh -n` | 통과 |
+| 3306 MySQL 9.7.2 Login Path / Precheck | 통과 |
+| 3307 / 3308 Read-only 인스턴스 Precheck / EXPLAIN | 통과 |
+| 대화형 EXPLAIN FORMAT 선택 및 TRADITIONAL/TREE/JSON/ALL | 통과 |
+| EXPLAIN ANALYZE TREE / JSON v2 | 통과 |
+| 동일 세션 CONNECTION_ID / THREAD_ID / Statement Event | 통과 |
+| Typed Bind (`INT`, `STR`, `DATE`, `NULL`), 다중 Bind | 통과 |
+| Prepared Statement `execute_sql` 이벤트 선별 | 통과 |
+| Cross-Schema JOIN (`diag_explain_a` + `diag_explain_b`) | 통과 |
+| 두 Schema의 동일한 `same_name_probe` 테이블 식별 | 통과 |
+| CTE 기반 SELECT / Schema Object 추출 | 통과 |
+| JSON / TREE Iterator별 Estimated/Actual Rows 비율 | 통과 |
+| Table / InnoDB Statistics, Index, I/O, Optimizer Trace | 통과 |
+| Bind 개수 불일치 및 DML ANALYZE 안전 차단 | 통과 |
+| `sh -n` 및 진단 SQL 오류 감지 | 통과 |
 
-- SELECT / JOIN 실습 쿼리만 실제 실행
-- DML / DDL / Server 설정 변경 미수행
-- `EXPLAIN`에서 Relation이 상수로 치환되면 JSON Plan에 Table Node가 없을 수 있으며, 이는 분석 오류와 구분
-- Performance Schema의 Statement History Consumer가 비활성화된 환경에서는 Thread Event 누락 가능
-- 인스턴스 전역 Index I/O 통계를 단일 SQL의 I/O로 해석하지 않음
+- 테스트 전용 데이터: `diag_explain_a.customer_probe` 600건, `diag_explain_b.order_probe` 600건 및 양쪽 `same_name_probe` 각각 4건. 기존 `tuning_lab` 데이터 변경 없음
+- 별도 테스트 Schema/테이블 생성과 INSERT는 사용자가 허용한 테스트 인스턴스 3306에서만 수행
+- 3307 / 3308은 GR Secondary(Read-only)이므로 데이터 생성·변경 미수행
+- 테스트 객체는 재현용으로 유지. 정리 시 테스트 Schema만 별도 삭제 필요
+- MySQL 8.0 / 8.4 등 타 버전의 실제 연결 테스트는 미수행
 
 ## 공식 문서
 
