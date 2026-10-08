@@ -1,13 +1,13 @@
 #!/bin/sh
 # MySQL Execution Plan Analysis
-# Version: 0.5.0
+# Version: 0.5.1
 #
 # Oracle MySQL execution-plan / optimizer diagnostic collector.
 # No Python / jq / external package dependency.
 
 set -u
 
-VERSION="0.5.0"
+VERSION="0.5.1"
 
 MYSQL_BIN="${MYSQL_BIN:-mysql}"
 MYSQL_HOST="${MYSQL_HOST:-}"
@@ -338,15 +338,36 @@ menu_choice() {
 }
 
 choose_analysis_options() {
+    # Reject incompatible explicit input in both interactive and --batch modes.
+    if [ -n "$CONNECTION_ID" ] && { [ -n "$SQL_FILE" ] || [ -n "$SQL_TEXT" ]; }; then
+        die "Cannot combine --file/--sql with --for-connection"
+    fi
     if [ "$BATCH_MODE" -eq 0 ] && [ "$CHECK_ONLY" -eq 0 ]; then
         [ -t 0 ] || die "Interactive menu requires TTY. Use --batch for automated execution."
         printf '\n========== MySQL EXPLAIN Analysis ==========\n' >&2
-        menu_choice "Target: 1) SQL query/file  2) Running Connection : " "1 2"
-        case "$CHOICE" in
-            1) ANALYSIS_MODE="SQL" ;;
-            2) ANALYSIS_MODE="CONNECTION" ;;
-        esac
-        if [ "$ANALYSIS_MODE" = "CONNECTION" ]; then
+        # An explicit SQL input or Connection ID already identifies the target.
+        # Ask only when neither was supplied by the caller.
+        if [ -n "$SQL_FILE" ] || [ -n "$SQL_TEXT" ]; then
+            [ -z "$CONNECTION_ID" ] ||
+                die "Cannot combine --file/--sql with --for-connection"
+            ANALYSIS_MODE="SQL"
+            printf 'Target: SQL query/file (specified by argument)\n' >&2
+        elif [ -n "$CONNECTION_ID" ]; then
+            ANALYSIS_MODE="CONNECTION"
+            printf 'Target: Running Connection %s (specified by argument)\n' "$CONNECTION_ID" >&2
+        else
+            menu_choice "Target: 1) SQL query/file  2) Running Connection : " "1 2"
+            case "$CHOICE" in
+                1) ANALYSIS_MODE="SQL" ;;
+                2) ANALYSIS_MODE="CONNECTION" ;;
+            esac
+        fi
+
+        if [ "$ANALYSIS_MODE" = "SQL" ] && [ -z "$SQL_FILE" ] && [ -z "$SQL_TEXT" ]; then
+            printf 'SQL file path: ' >&2
+            IFS= read -r SQL_FILE || die "SQL file path input cancelled"
+            [ -n "$SQL_FILE" ] || die "SQL file path is required"
+        elif [ "$ANALYSIS_MODE" = "CONNECTION" ] && [ -z "$CONNECTION_ID" ]; then
             printf 'Connection ID: ' >&2
             IFS= read -r CONNECTION_ID || die "Connection ID input cancelled"
         fi
