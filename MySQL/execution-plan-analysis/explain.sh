@@ -1,13 +1,13 @@
 #!/bin/sh
 # MySQL Execution Plan Analysis
-# Version: 0.5.1
+# Version: 0.5.2
 #
 # Oracle MySQL execution-plan / optimizer diagnostic collector.
 # No Python / jq / external package dependency.
 
 set -u
 
-VERSION="0.5.1"
+VERSION="0.5.2"
 
 MYSQL_BIN="${MYSQL_BIN:-mysql}"
 MYSQL_HOST="${MYSQL_HOST:-}"
@@ -78,7 +78,7 @@ Analysis:
   --for-connection ID         Inspect running connection (instead of SQL file)
   --check-only                Connection / capability precheck only
   --output DIR                Report output directory
-  --no-print-plan             Save results without displaying TREE plan
+  --no-print-plan             Save results without displaying plans/ANALYZE/warnings
 
 Other:
   -h, --help                  Show help
@@ -857,6 +857,45 @@ write_summary() {
     } > "$OUTPUT_DIR/summary.txt"
 }
 
+print_saved_result() {
+    REPORT_FILENAME="$1"
+    REPORT_LABEL="$2"
+    [ -s "$OUTPUT_DIR/$REPORT_FILENAME" ] || return 0
+    printf '\n========== %s ==========\n' "$REPORT_LABEL"
+    cat "$OUTPUT_DIR/$REPORT_FILENAME"
+    printf '\n========== END %s ==========\n' "$REPORT_LABEL"
+}
+
+print_console_results() {
+    [ "$PRINT_PLAN" -eq 1 ] || return 0
+
+    # Display all selected plan formats, never just TREE.  All files are
+    # already saved and are not consumed or modified by terminal output.
+    print_saved_result "explain_traditional.txt" "EXPLAIN FORMAT=TRADITIONAL"
+    print_saved_result "explain_tree.txt" "EXPLAIN FORMAT=TREE"
+    print_saved_result "explain.json" "EXPLAIN FORMAT=JSON"
+
+    if [ "$ANALYSIS_MODE" = "SQL" ]; then
+        if [ "$ANALYZE" -eq 1 ]; then
+            print_saved_result "explain_analyze.txt" "EXPLAIN ANALYZE FORMAT=$ANALYZE_FORMAT"
+            if [ -s "$OUTPUT_DIR/estimated_actual.tsv" ]; then
+                printf '\n========== ESTIMATED / ACTUAL ROWS ==========\n'
+                printf 'Iterator\tOperation\tEstimated\tActual/loop\tLoops\tActual/Estimated\n'
+                cat "$OUTPUT_DIR/estimated_actual.tsv"
+                printf '\n========== END ESTIMATED / ACTUAL ROWS ==========\n'
+            fi
+        fi
+        if [ "$SHOW_REWRITE" -eq 1 ]; then
+            print_saved_result "show_warnings.txt" "SHOW WARNINGS (OPTIMIZER REWRITE)"
+        fi
+        if [ "$OPTIMIZER_TRACE" -eq 1 ]; then
+            printf '\nOptimizer Trace saved: %s/optimizer_trace.txt\n' "$OUTPUT_DIR"
+        fi
+    fi
+
+    printf '\nFull report: %s\n' "$OUTPUT_DIR"
+}
+
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --sql)
@@ -1055,11 +1094,7 @@ collect_precheck
 if [ "$ANALYSIS_MODE" = "CONNECTION" ]; then
     collect_connection_plan
     log "Done: $OUTPUT_DIR"
-    if [ "$PRINT_PLAN" -eq 1 ] && [ -s "$OUTPUT_DIR/explain_tree.txt" ]; then
-        printf '\n===== EXPLAIN FOR CONNECTION TREE =====\n'
-        cat "$OUTPUT_DIR/explain_tree.txt"
-        printf '===== END EXPLAIN TREE =====\n'
-    fi
+    print_console_results
     exit 0
 fi
 
@@ -1117,10 +1152,4 @@ if [ "$DIAG_ERRORS" -ne 0 ]; then
 fi
 
 log "Done: $OUTPUT_DIR"
-
-# Print the TREE plan for TREE/ALL selections while retaining its report file.
-if [ "$PRINT_PLAN" -eq 1 ] && [ -s "$OUTPUT_DIR/explain_tree.txt" ]; then
-    printf '\n===== EXPLAIN FORMAT=TREE =====\n'
-    cat "$OUTPUT_DIR/explain_tree.txt"
-    printf '===== END EXPLAIN FORMAT=TREE =====\n'
-fi
+print_console_results

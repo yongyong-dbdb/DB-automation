@@ -6,7 +6,7 @@ MySQL Optimizer 실행계획과 Connection / Thread 기반 Performance Schema �
 
 선택한 `EXPLAIN FORMAT` 출력, 내부 JSON Plan 기반 Object 진단, Table/Index 통계, Column Histogram, Index I/O 누적값, 동일 Connection에서 수집한 `EXPLAIN ANALYZE` Statement Event, Optimizer Trace 원본 수집 기능 포함.
 
-> 현재 구현 버전: `v0.5.1`
+> 현재 구현 버전: `v0.5.2`
 
 실행 파일:
 
@@ -191,7 +191,7 @@ sh explain.sh \
 | `--for-connection ID` | 실행 중인 Connection의 예상 실행계획 조회 (PROCESS 권한 필요할 수 있음) |
 | `--check-only` | 접속 / 기본 Capability 확인만 수행 |
 | `--output DIR` | 결과 Directory 지정 |
-| `--no-print-plan` | TREE/ALL 선택 시 실행계획의 터미널 자동 출력 생략(파일 저장 유지) |
+| `--no-print-plan` | 선택한 EXPLAIN/ANALYZE/WARNINGS의 터미널 출력 생략(파일 저장 유지) |
 
 Password Command Line Argument 미지원.
 
@@ -255,9 +255,12 @@ sh explain.sh query.sql --format JSON --analyze --analyze-format JSON \
   --login-path local_mysql --database tuning_lab
 ```
 
-- `--format TREE` 또는 `--format ALL` 실행이 성공하면 `explain_tree.txt`의 전체 내용을 터미널에도 표시(파일 저장 유지)
-- `--no-print-plan`을 지정하면 터미널 출력만 생략. `explain_tree.txt`는 계속 저장
-- `--format JSON` 또는 `TRADITIONAL`만 선택한 경우에는 TREE 출력 파일을 생성하지 않으므로 TREE 결과를 표시하지 않음
+- 정상 종료 시 선택한 EXPLAIN FORMAT의 결과를 터미널에 출력: TRADITIONAL → `explain_traditional.txt`, TREE → `explain_tree.txt`, JSON → `explain.json`, ALL → 세 가지 모두
+- `EXPLAIN ANALYZE` 사용 시 실제 실행계획(`explain_analyze.txt`) 및 Estimated/Actual Rows 요약(`estimated_actual.tsv`)도 함께 출력
+- `SHOW WARNINGS` 사용 시 `show_warnings.txt`의 Rewrite Note를 출력
+- Optimizer Trace는 큰 JSON 문서이므로 전체 내용을 터미널에 출력하지 않고 파일 저장 경로를 안내
+- `--no-print-plan` 지정 시 선택 결과의 터미널 출력만 생략. 결과 파일들은 그대로 저장
+- `EXPLAIN FOR CONNECTION`도 선택한 FORMAT에 맞춰 터미널 출력
 - `EXPLAIN ANALYZE FORMAT=TRADITIONAL` 미지원
 - `EXPLAIN ANALYZE FORMAT=JSON`: `explain_json_format_version=2` 설정 지원 환경만 가능
 - 미지원 형식인 경우 임의 형식으로 대체하지 않고 오류 보고
@@ -333,6 +336,16 @@ Optimizer Trace 내부 형식은 MySQL Version에 따라 변경 가능하므로 
 - Performance Schema Statement History 및 Instrument 설정에 따라 Thread Event 미수집 가능
 - 인스턴스 전역 Index I/O는 개별 SQL의 기여분으로 귀속하지 않음
 - Column Histogram/인덱스 변경 권고 자동 수행 없음. DML ANALYZE 차단
+
+## 선택 결과 터미널 출력 검증 (v0.5.2)
+
+- MySQL 9.7.2에서 TRADITIONAL + EXPLAIN ANALYZE JSON v2 + SHOW WARNINGS 조합 실제 메뉴 테스트 통과
+- TRADITIONAL/TREE/JSON 각각 독립 실행 시 선택한 FORMAT만 출력됨을 확인
+- ALL 실행 시 TRADITIONAL, TREE, JSON 세 계획 모두 출력됨을 확인
+- ANALYZE 실제 실행계획 및 Iterator별 Estimated/Actual/Loops 지표 출력 확인
+- `--no-print-plan` 지정 시 출력만 생략하고 TRADITIONAL/TREE/JSON 파일 저장 확인
+- ANALYZE, WARNINGS 포함 모든 분석 자료는 기존과 같이 별도 파일 저장
+- 실행 종료 시 선택한 결과와 전체 Report 저장 경로 출력
 
 ## 대화형 메뉴 검증 (v0.5.0)
 
