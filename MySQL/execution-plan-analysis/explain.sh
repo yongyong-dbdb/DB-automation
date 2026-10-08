@@ -1,13 +1,13 @@
 #!/bin/sh
 # MySQL Execution Plan Analysis
-# Version: 0.4.3
+# Version: 0.4.4
 #
 # Oracle MySQL execution-plan / optimizer diagnostic collector.
 # No Python / jq / external package dependency.
 
 set -u
 
-VERSION="0.4.3"
+VERSION="0.4.4"
 
 MYSQL_BIN="${MYSQL_BIN:-mysql}"
 MYSQL_HOST="${MYSQL_HOST:-}"
@@ -646,6 +646,33 @@ SELECT CONCAT('##EVENT##',COALESCE((
       "$TMP_DIR/analyze_all.txt" > "$OUTPUT_DIR/estimated_actual.tsv"
     awk 'NR>1 && $0 !~ /^##SESSION##/ && $0 !~ /^##EVENT##/ && $0 !~ /^##METRIC##/ {print}' \
       "$TMP_DIR/analyze_all.txt" > "$OUTPUT_DIR/explain_analyze.txt"
+
+    if [ "$ANALYZE_FORMAT" = "TREE" ]; then
+        # MySQL TREE prints estimated and actual rows per iterator.  Parse
+        # only complete lines with BOTH values; do not execute the SQL again.
+        awk '
+            /\(cost=.*rows=/ && /\(actual time=.*rows=/ {
+                op=$0
+                sub(/[[:space:]]+\(cost=.*/, "", op)
+                sub(/^[[:space:]]*->[[:space:]]*/, "", op)
+                gsub(/\t/, " ", op)
+                est=$0
+                sub(/^.*\(cost=[^)]*rows=/, "", est)
+                sub(/\).*/, "", est)
+                act=$0
+                sub(/^.*\(actual time=[^)]*rows=/, "", act)
+                sub(/[[:space:]]+loops=.*/, "", act)
+                loops=$0
+                sub(/^.*loops=/, "", loops)
+                sub(/\).*/, "", loops)
+                if (est ~ /^[0-9]+([.][0-9]+)?$/ && act ~ /^[0-9]+([.][0-9]+)?$/ && loops ~ /^[0-9]+([.][0-9]+)?$/) {
+                    n++
+                    ratio=(est+0)>0 ? (act+0)/(est+0) : 0
+                    printf "%d\t%s\t%s\t%s\t%s\t%.3f\n", n,op,est,act,loops,ratio
+                }
+            }
+        ' "$OUTPUT_DIR/explain_analyze.txt" > "$OUTPUT_DIR/estimated_actual.tsv"
+    fi
 
     printf '%s\n' 'Not collected: index I/O counters are global across all server threads.' \
       > "$OUTPUT_DIR/index_io_delta.txt"
