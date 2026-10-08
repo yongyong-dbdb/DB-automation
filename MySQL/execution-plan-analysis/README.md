@@ -6,7 +6,7 @@ MySQL Optimizer 실행계획과 Connection / Thread 기반 Performance Schema �
 
 선택한 `EXPLAIN FORMAT` 출력, 내부 JSON Plan 기반 Object 진단, Table/Index 통계, Column Histogram, Index I/O 누적값, 동일 Connection에서 수집한 `EXPLAIN ANALYZE` Statement Event, Optimizer Trace 원본 수집 기능 포함.
 
-> 현재 구현 버전: `v0.5.0`
+> 현재 구현 버전: `v0.5.1`
 
 실행 파일:
 
@@ -61,11 +61,11 @@ stty
 
 ## 대화형 실행 (기본 동작)
 
-**터미널에서 실행하면 메뉴를 생략할 수 없음.** `--file` 또는 `--sql`을 전달한 뒤 MySQL 접속 정보로 연결하고, 아래 옵션을 매번 선택.
+**터미널에서 실행하면 분석 옵션을 선택하는 메뉴가 표시됨.** 단, 분석 대상은 입력 파라미터에서 자동 결정: `--file`/`--sql`이면 SQL, `--for-connection`이면 Connection. 대상 파라미터가 없을 때만 Target 메뉴를 표시. FORMAT/ANALYZE/Optimizer Trace/SHOW WARNINGS/FOR SCHEMA는 기존처럼 선택형.
 
 | 순서 | 선택 항목 | 메뉴 |
 | --- | --- | --- |
-| 1 | 분석 대상 | SQL File/Query 또는 실행 중인 Connection |
+| 1 | 분석 대상 (미지정 시에만 질문) | SQL File/Query 또는 실행 중인 Connection |
 | 2 | EXPLAIN FORMAT | TRADITIONAL / TREE / JSON / ALL |
 | 3 | EXPLAIN ANALYZE | No / Yes (실제 SQL 실행) |
 | 4 | ANALYZE FORMAT | TREE / JSON v2 (Yes일 때만 표시) |
@@ -74,6 +74,8 @@ stty
 | 7 | SHOW WARNINGS | No / Yes — Optimizer Rewrite SQL 수집 |
 | 8 | FOR SCHEMA | 기본 Database 사용 / 별도 Schema 입력 |
 
+`--for-connection ID`를 지정했다면 Connection ID는 다시 입력하지 않음. 대상 미지정 상태에서 `FOR CONNECTION`을 선택한 경우에만 ID 입력. `--file`/`--sql`과 `--for-connection`은 동시 지정 불가.
+
 `FOR CONNECTION`을 선택하면 Connection ID와 FORMAT만 입력. 실행 중인 Connection의 Plan을 조회하며, `ANALYZE`·`FOR SCHEMA`는 호환되지 않으므로 제공하지 않음.
 
 ```sh
@@ -81,6 +83,8 @@ sh explain.sh --file wait.sql \
   --login-path 'root@/home/mysql/mysqld/mysql.sock' \
   --database mysql
 ```
+
+**실제 확인:** `--file`/`--sql` 입력 시 Target 메뉴 생략, 분석 대상 미지정 시 Target 표시. 단, 선택형 분석 옵션은 유지.
 
 입력 SQL은 **한 문장만 허용**. 여러 SQL 문장 또는 SQL 내부 세미콜론이 포함된 경우 안전하게 거부. 파일 끝 세미콜론 1개는 허용.
 
