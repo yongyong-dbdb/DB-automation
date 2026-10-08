@@ -24,6 +24,7 @@ ANALYZE_DML=0
 EXPLAIN_FORMAT=""
 ANALYZE_FORMAT="TREE"
 OPTIMIZER_TRACE=0
+DIAG_ERRORS=0
 CHECK_ONLY=0
 OUTPUT_DIR=""
 SQL_TEXT=""
@@ -378,7 +379,7 @@ SELECT
     SUB_PART,
     NULLABLE,
     INDEX_TYPE,
-    VISIBLE,
+    IS_VISIBLE,
     EXPRESSION
 FROM information_schema.statistics
 WHERE TABLE_SCHEMA='$DB_ESC'
@@ -427,6 +428,15 @@ ORDER BY COLUMN_NAME;
         } >> "$OUTPUT_DIR/column_histograms.txt"
 
     done < "$OUTPUT_DIR/objects.txt"
+
+    : > "$OUTPUT_DIR/diagnostic_errors.txt"
+    for DIAG_FILE in table_stats.txt index_definitions.txt index_io.txt column_histograms.txt; do
+        if grep -Eq '^ERROR [0-9]+' "$OUTPUT_DIR/$DIAG_FILE"; then
+            warn "Diagnostic SQL failed in $DIAG_FILE; see report"
+            grep -E '^ERROR [0-9]+' "$OUTPUT_DIR/$DIAG_FILE" >> "$OUTPUT_DIR/diagnostic_errors.txt"
+            DIAG_ERRORS=1
+        fi
+    done
 }
 
 collect_optimizer_trace() {
@@ -509,6 +519,7 @@ write_summary() {
         printf 'DML Analyze    : disabled (safety / SQL restrictions)\n'
         printf 'P_S metrics    : same-session THREAD_ID statement event\n'
         printf 'Optimizer Trace: %s\n' "$OPTIMIZER_TRACE"
+        printf 'Stats SQL errors: %s\n' "$DIAG_ERRORS"
 
         printf '\nBase Tables\n'
         printf '%s\n' '-----------'
@@ -715,3 +726,6 @@ log "[7/7] Report summary"
 write_summary "$TYPE"
 
 log "Done: $OUTPUT_DIR"
+if [ "$DIAG_ERRORS" -ne 0 ]; then
+    die "One or more diagnostic queries failed; inspect diagnostic_errors.txt"
+fi
