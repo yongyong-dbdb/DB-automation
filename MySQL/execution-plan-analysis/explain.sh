@@ -409,6 +409,52 @@ choose_analysis_options() {
     fi
 }
 
+collect_connection_plan() {
+    log "[PLAN] EXPLAIN FOR CONNECTION $CONNECTION_ID"
+    if [ "$EXPLAIN_FORMAT" = "TRADITIONAL" ] || [ "$EXPLAIN_FORMAT" = "ALL" ]; then
+        mysql_exec "EXPLAIN FORMAT=TRADITIONAL FOR CONNECTION $CONNECTION_ID" \
+            > "$OUTPUT_DIR/explain_traditional.txt" 2> "$OUTPUT_DIR/explain_connection.err" ||
+            die "FOR CONNECTION failed; see explain_connection.err"
+    fi
+    if [ "$EXPLAIN_FORMAT" = "TREE" ] || [ "$EXPLAIN_FORMAT" = "ALL" ]; then
+        mysql_raw "EXPLAIN FORMAT=TREE FOR CONNECTION $CONNECTION_ID" \
+            > "$OUTPUT_DIR/explain_tree.txt" 2> "$OUTPUT_DIR/explain_connection.err" ||
+            die "FOR CONNECTION TREE failed; see explain_connection.err"
+    fi
+    if [ "$EXPLAIN_FORMAT" = "JSON" ] || [ "$EXPLAIN_FORMAT" = "ALL" ]; then
+        mysql_raw "EXPLAIN FORMAT=JSON FOR CONNECTION $CONNECTION_ID" \
+            > "$OUTPUT_DIR/explain.json" 2> "$OUTPUT_DIR/explain_connection.err" ||
+            die "FOR CONNECTION JSON failed; see explain_connection.err"
+    fi
+    {
+        printf 'MySQL EXPLAIN FOR CONNECTION\n'
+        printf 'Script Version : %s\n' "$VERSION"
+        printf 'Connection ID  : %s\n' "$CONNECTION_ID"
+        printf 'EXPLAIN Format : %s\n' "$EXPLAIN_FORMAT"
+        printf 'Output Directory: %s\n' "$OUTPUT_DIR"
+    } > "$OUTPUT_DIR/summary.txt"
+}
+
+collect_rewrite_warnings() {
+    [ "$SHOW_REWRITE" -eq 1 ] || return 0
+    log "[WARNINGS] optimizer rewrite and hints"
+    WARN_QUERY="$(prepare_diagnostic_sql "EXPLAIN FORMAT=JSON INTO @diag_warning_plan ${SCHEMA_CLAUSE}${SQL_TEXT}")"
+    if [ "$BIND_COUNT" -gt 0 ]; then
+        WARN_QUERY="$(printf '%s\n' "$WARN_QUERY" | awk '
+            /^DEALLOCATE PREPARE diag_explain_stmt;/ {print "SHOW WARNINGS;";print;next}
+            {print}
+        ')"
+    else
+        WARN_QUERY="$WARN_QUERY
+SHOW WARNINGS;"
+    fi
+    if ! mysql_raw "$WARN_QUERY" > "$OUTPUT_DIR/show_warnings.txt" \
+        2> "$OUTPUT_DIR/show_warnings.err"; then
+        warn "SHOW WARNINGS failed; see show_warnings.err"
+        DIAG_ERRORS=1
+    fi
+}
+
 collect_plan() {
     # MySQL JSON plan remains internal input for object diagnostics, even
     # when a different human-readable EXPLAIN FORMAT is selected.
@@ -418,7 +464,7 @@ collect_plan() {
     esac
 
     log "[PLAN] Internal MySQL JSON plan"
-    if ! mysql_raw "$(prepare_diagnostic_sql "EXPLAIN FORMAT=JSON $SQL_TEXT")" \
+    if ! mysql_raw "$(prepare_diagnostic_sql "EXPLAIN FORMAT=JSON ${SCHEMA_CLAUSE}${SQL_TEXT}")" \
         > "$PLAN_JSON_FILE" 2> "$OUTPUT_DIR/explain_json.err"; then
         die "EXPLAIN FORMAT=JSON failed: $OUTPUT_DIR/explain_json.err"
     fi
@@ -426,7 +472,7 @@ collect_plan() {
     case "$EXPLAIN_FORMAT" in
         TRADITIONAL|ALL)
             log "[PLAN] FORMAT=TRADITIONAL"
-            if ! mysql_exec "$(prepare_diagnostic_sql "EXPLAIN FORMAT=TRADITIONAL $SQL_TEXT")" \
+            if ! mysql_exec "$(prepare_diagnostic_sql "EXPLAIN FORMAT=TRADITIONAL ${SCHEMA_CLAUSE}${SQL_TEXT}")" \
                 > "$OUTPUT_DIR/explain_traditional.txt" 2> "$OUTPUT_DIR/explain_traditional.err"; then
                 die "FORMAT=TRADITIONAL failed: $OUTPUT_DIR/explain_traditional.err"
             fi
@@ -436,7 +482,7 @@ collect_plan() {
     case "$EXPLAIN_FORMAT" in
         TREE|ALL)
             log "[PLAN] FORMAT=TREE"
-            if ! mysql_raw "$(prepare_diagnostic_sql "EXPLAIN FORMAT=TREE $SQL_TEXT")" \
+            if ! mysql_raw "$(prepare_diagnostic_sql "EXPLAIN FORMAT=TREE ${SCHEMA_CLAUSE}${SQL_TEXT}")" \
                 > "$OUTPUT_DIR/explain_tree.txt" 2> "$OUTPUT_DIR/explain_tree.err"; then
                 if [ "$EXPLAIN_FORMAT" = "TREE" ]; then
                     die "FORMAT=TREE failed: $OUTPUT_DIR/explain_tree.err"
@@ -458,7 +504,7 @@ extract_objects() {
     # MySQL 9.x JSON v2 includes schema_name for every base relation.
     # The same server session holds the plan in @diag_plan and pairs the
     # schema/table arrays by ordinality. Avoid shell regex JSON parsing.
-    EXTRACT_SQL="$(prepare_diagnostic_sql "EXPLAIN FORMAT=JSON INTO @diag_plan $SQL_TEXT")
+    EXTRACT_SQL="$(prepare_diagnostic_sql "EXPLAIN FORMAT=JSON INTO @diag_plan ${SCHEMA_CLAUSE}${SQL_TEXT}")
 
 SET @diag_tables=JSON_EXTRACT(@diag_plan, '\$**.table_name');
 SET @diag_schemas=JSON_EXTRACT(@diag_plan, '\$**.schema_name');
@@ -621,7 +667,7 @@ collect_optimizer_trace() {
 SET optimizer_trace_max_mem_size=1048576;
 SELECT CONCAT('diagnostic_connection=', CONNECTION_ID(),
               ',ps_thread=', COALESCE(PS_CURRENT_THREAD_ID(), 'NULL'));
-$(prepare_diagnostic_sql "EXPLAIN FORMAT=JSON $SQL_TEXT")
+$(prepare_diagnostic_sql "EXPLAIN FORMAT=JSON ${SCHEMA_CLAUSE}${SQL_TEXT}")
 SELECT TRACE FROM information_schema.optimizer_trace;
 SET optimizer_trace='enabled=off';"
 
@@ -643,11 +689,11 @@ run_explain_analyze() {
 
     log "[ANALYZE] $ANALYZE_FORMAT (same MySQL session)"
     INIT=""
-    ANALYZE_STATEMENT="EXPLAIN ANALYZE FORMAT=$ANALYZE_FORMAT $SQL_TEXT"
+    ANALYZE_STATEMENT="EXPLAIN ANALYZE FORMAT=$ANALYZE_FORMAT ${SCHEMA_CLAUSE}${SQL_TEXT}"
     AFTER_SQL=""
     if [ "$ANALYZE_FORMAT" = "JSON" ]; then
         INIT="SET SESSION explain_json_format_version=2;"
-        ANALYZE_STATEMENT="EXPLAIN ANALYZE FORMAT=JSON INTO @diag_actual $SQL_TEXT"
+        ANALYZE_STATEMENT="EXPLAIN ANALYZE FORMAT=JSON INTO @diag_actual ${SCHEMA_CLAUSE}${SQL_TEXT}"
         AFTER_SQL="
 SELECT JSON_PRETTY(@diag_actual);
 SET @diag_ops=JSON_EXTRACT(@diag_actual, '\$**.operation');
@@ -762,6 +808,8 @@ write_summary() {
         printf 'DML Analyze    : disabled (safety / SQL restrictions)\n'
         printf 'P_S metrics    : same-session THREAD_ID statement event\n'
         printf 'Optimizer Trace: %s\n' "$OPTIMIZER_TRACE"
+        printf 'SHOW WARNINGS  : %s\n' "$SHOW_REWRITE"
+        printf 'EXPLAIN Schema: %s\n' "$EXPLAIN_SCHEMA"
         printf 'Bind Count     : %s\n' "$BIND_COUNT"
         printf 'Stats SQL errors: %s\n' "$DIAG_ERRORS"
         printf 'Ratio format    : %s\n' "${ANALYZE_FORMAT}"
@@ -977,6 +1025,17 @@ fi
 
 collect_precheck
 
+if [ "$ANALYSIS_MODE" = "CONNECTION" ]; then
+    collect_connection_plan
+    log "Done: $OUTPUT_DIR"
+    if [ "$PRINT_PLAN" -eq 1 ] && [ -s "$OUTPUT_DIR/explain_tree.txt" ]; then
+        printf '\n===== EXPLAIN FOR CONNECTION TREE =====\n'
+        cat "$OUTPUT_DIR/explain_tree.txt"
+        printf '===== END EXPLAIN TREE =====\n'
+    fi
+    exit 0
+fi
+
 if [ "$CHECK_ONLY" -eq 1 ]; then
     log "Precheck complete: $OUTPUT_DIR"
     exit 0
@@ -1020,6 +1079,8 @@ if [ "$OPTIMIZER_TRACE" -eq 1 ]; then
 else
     : > "$OUTPUT_DIR/optimizer_trace.txt"
 fi
+
+collect_rewrite_warnings
 
 log "[7/7] Report summary"
 write_summary "$TYPE"
