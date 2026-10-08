@@ -438,7 +438,7 @@ collect_connection_plan() {
 collect_rewrite_warnings() {
     [ "$SHOW_REWRITE" -eq 1 ] || return 0
     log "[WARNINGS] optimizer rewrite and hints"
-    WARN_QUERY="$(prepare_diagnostic_sql "EXPLAIN FORMAT=JSON INTO @diag_warning_plan ${SCHEMA_CLAUSE}${SQL_TEXT}")"
+    WARN_QUERY="$(prepare_diagnostic_sql "EXPLAIN FORMAT=TRADITIONAL ${SCHEMA_CLAUSE}${SQL_TEXT}")"
     if [ "$BIND_COUNT" -gt 0 ]; then
         WARN_QUERY="$(printf '%s\n' "$WARN_QUERY" | awk '
             /^DEALLOCATE PREPARE diag_explain_stmt;/ {print "SHOW WARNINGS;";print;next}
@@ -448,10 +448,16 @@ collect_rewrite_warnings() {
         WARN_QUERY="$WARN_QUERY
 SHOW WARNINGS;"
     fi
-    if ! mysql_raw "$WARN_QUERY" > "$OUTPUT_DIR/show_warnings.txt" \
+    if ! mysql_raw "$WARN_QUERY" > "$TMP_DIR/show_warnings_full.txt" \
         2> "$OUTPUT_DIR/show_warnings.err"; then
         warn "SHOW WARNINGS failed; see show_warnings.err"
         DIAG_ERRORS=1
+    else
+        # Traditional EXPLAIN emits a plan row followed by warning rows.
+        # Preserve actual warning lines; a preceding JSON INTO statement
+        # suppresses rewrite notes, so do not use it for this diagnostic.
+        awk -F '\t' '($1=="Note" || $1=="Warning" || $1=="Error") && $2 ~ /^[0-9]+$/ {print}' \
+          "$TMP_DIR/show_warnings_full.txt" > "$OUTPUT_DIR/show_warnings.txt"
     fi
 }
 
