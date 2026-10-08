@@ -267,7 +267,7 @@ collect_plan() {
     # when a different human-readable EXPLAIN FORMAT is selected.
     PLAN_JSON_FILE="$OUTPUT_DIR/explain_internal.json"
     case "$EXPLAIN_FORMAT" in
-        JSON|ALL) PLAN_JSON_FILE="$PLAN_JSON_FILE" ;;
+        JSON|ALL) PLAN_JSON_FILE="$OUTPUT_DIR/explain.json" ;;
     esac
 
     log "[PLAN] Internal MySQL JSON plan"
@@ -305,7 +305,7 @@ collect_plan() {
 }
 
 extract_objects() {
-    JSON_FILE="$OUTPUT_DIR/explain.json"
+    JSON_FILE="$PLAN_JSON_FILE"
     OBJECT_FILE="$OUTPUT_DIR/objects.txt"
 
     sed -n 's/.*"table_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$JSON_FILE" |
