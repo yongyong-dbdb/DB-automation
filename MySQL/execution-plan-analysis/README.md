@@ -6,7 +6,7 @@ MySQL Optimizer 실행계획과 Connection / Thread 기반 Performance Schema �
 
 선택한 `EXPLAIN FORMAT` 출력, 내부 JSON Plan 기반 Object 진단, Table/Index 통계, Column Histogram, Index I/O 누적값, 동일 Connection에서 수집한 `EXPLAIN ANALYZE` Statement Event, Optimizer Trace 원본 수집 기능 포함.
 
-> 현재 구현 버전: `v0.4.5`
+> 현재 구현 버전: `v0.5.0`
 
 실행 파일:
 
@@ -18,6 +18,7 @@ explain.sh
 
 ## 분석 영역
 
+- 일반 터미널 실행: **모든 EXPLAIN 분석 옵션을 반드시 대화형 메뉴에서 선택** (`--format`, `--analyze` 등을 지정했어도 메뉴 선택값이 우선)
 - `--format TRADITIONAL|TREE|JSON|ALL` 출력 형식 선택
 - 대화형 메뉴 선택 지원(TTY), 비대화형 기본값 `TRADITIONAL`
 - 내부 Table 추출용 JSON Plan 별도 수집
@@ -56,6 +57,40 @@ mktemp
 od
 tr
 stty
+```
+
+## 대화형 실행 (기본 동작)
+
+**터미널에서 실행하면 메뉴를 생략할 수 없음.** `--file` 또는 `--sql`을 전달한 뒤 MySQL 접속 정보로 연결하고, 아래 옵션을 매번 선택.
+
+| 순서 | 선택 항목 | 메뉴 |
+| --- | --- | --- |
+| 1 | 분석 대상 | SQL File/Query 또는 실행 중인 Connection |
+| 2 | EXPLAIN FORMAT | TRADITIONAL / TREE / JSON / ALL |
+| 3 | EXPLAIN ANALYZE | No / Yes (실제 SQL 실행) |
+| 4 | ANALYZE FORMAT | TREE / JSON v2 (Yes일 때만 표시) |
+| 5 | 실제 SQL 실행 최종 확인 | 취소 / 실행 (Yes일 때만 표시) |
+| 6 | Optimizer Trace | No / Yes |
+| 7 | SHOW WARNINGS | No / Yes — Optimizer Rewrite SQL 수집 |
+| 8 | FOR SCHEMA | 기본 Database 사용 / 별도 Schema 입력 |
+
+`FOR CONNECTION`을 선택하면 Connection ID와 FORMAT만 입력. 실행 중인 Connection의 Plan을 조회하며, `ANALYZE`·`FOR SCHEMA`는 호환되지 않으므로 제공하지 않음.
+
+```sh
+sh explain.sh --file wait.sql \
+  --login-path 'root@/home/mysql/mysqld/mysql.sock' \
+  --database mysql
+```
+
+입력 SQL은 **한 문장만 허용**. 여러 SQL 문장 또는 SQL 내부 세미콜론이 포함된 경우 안전하게 거부. 파일 끝 세미콜론 1개는 허용.
+
+### 비대화형 실행
+
+Cron/CI/자동화처럼 TTY가 없고 명령행 옵션만으로 실행해야 한다면 **`--batch`를 명시**. 이 모드에서만 메뉴를 건너뛰며, `--format`, `--analyze`, `--analyze-format`, `--optimizer-trace`, `--show-warnings`, `--schema`, `--for-connection` 옵션을 직접 적용.
+
+```sh
+sh explain.sh --batch --file wait.sql --format TREE \
+  --login-path local_mysql --database tuning_lab
 ```
 
 ## 실행
@@ -130,6 +165,7 @@ sh explain.sh \
 
 | 옵션 | 내용 |
 | --- | --- |
+| `--batch` | 명시적 비대화형 실행(자동화 전용); 기본값은 모든 항목 대화형 선택 |
 | `--sql SQL` | SQL 직접 입력 |
 | `--bind TYPE:VALUE` | Typed Bind Parameter, 반복 지정 가능 |
 | `--file FILE` | SQL File 입력 |
@@ -146,6 +182,9 @@ sh explain.sh \
 | `--analyze` | SELECT/TABLE 대상 `EXPLAIN ANALYZE` 수행 |
 | `--analyze-dml` | 안전 문제로 차단. DML은 기본 `EXPLAIN`만 수행 |
 | `--optimizer-trace` | Optimizer Trace 수집 |
+| `--show-warnings` | EXPLAIN 직후 SHOW WARNINGS로 SQL Rewrite 수집 |
+| `--schema NAME` | EXPLAIN FOR SCHEMA (입력 SQL의 기본 Schema 지정) |
+| `--for-connection ID` | 실행 중인 Connection의 예상 실행계획 조회 (PROCESS 권한 필요할 수 있음) |
 | `--check-only` | 접속 / 기본 Capability 확인만 수행 |
 | `--output DIR` | 결과 Directory 지정 |
 | `--no-print-plan` | TREE/ALL 선택 시 실행계획의 터미널 자동 출력 생략(파일 저장 유지) |
@@ -275,6 +314,8 @@ Optimizer Trace 내부 형식은 MySQL Version에 따라 변경 가능하므로 
 | `analyze_session.txt` | 실제 ANALYZE Connection ID / P_S THREAD_ID |
 | `thread_statement_event.txt` | 실제 ANALYZE의 동일 Thread Statement Event |
 | `optimizer_trace.txt` | Optimizer Trace 및 실행계획 수집 원본 |
+| `show_warnings.txt` | SHOW WARNINGS에 나타난 Rewrite Note/Warning |
+| `explain_connection.err` | FOR CONNECTION 조회 실패 시 오류 |
 | `diagnostic_errors.txt` | Table/Index/Histogram 진단 SQL 오류(발생 시) |
 
 ## 현재 제한 사항
@@ -288,6 +329,19 @@ Optimizer Trace 내부 형식은 MySQL Version에 따라 변경 가능하므로 
 - Performance Schema Statement History 및 Instrument 설정에 따라 Thread Event 미수집 가능
 - 인스턴스 전역 Index I/O는 개별 SQL의 기여분으로 귀속하지 않음
 - Column Histogram/인덱스 변경 권고 자동 수행 없음. DML ANALYZE 차단
+
+## 대화형 메뉴 검증 (v0.5.0)
+
+- MySQL 9.7.2, OS 계정 mysql, 3306 인스턴스 PTY 기반 실제 메뉴 응답 테스트 통과
+- SQL 파일에서 TREE FORMAT 선택 및 EXPLAIN ANALYZE JSON v2 선택·실행 성공
+- CLI의 `--format JSON`이 있어도 대화형 TREE 선택을 우선 적용함을 확인
+- EXPLAIN ANALYZE 실행 확인에서 취소를 선택한 경우 실제 SQL 실행 건너뜀
+- FORMAT ALL + ANALYZE TREE + Optimizer Trace + SHOW WARNINGS + FOR SCHEMA 조합 정상 수집
+- 다른 세션에서 실행 중인 SQL을 `EXPLAIN FOR CONNECTION`으로 조회 성공
+- Rewrite Note(`SHOW WARNINGS`) 실제 출력 검증; Prepared Statement Bind 포함한 Rewrite 수집 검증
+- `--batch`에서 JSON ANALYZE 및 Bind/Trace/Warnings 연동 정상
+- TTY 없는 실행에서 `--batch` 미지정 시 명확한 오류
+- SQL 파일의 다중 SQL 문장 차단 확인
 
 ## 실제 서버 검증
 

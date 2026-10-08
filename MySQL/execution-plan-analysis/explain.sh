@@ -1,13 +1,13 @@
 #!/bin/sh
 # MySQL Execution Plan Analysis
-# Version: 0.4.5
+# Version: 0.5.0
 #
 # Oracle MySQL execution-plan / optimizer diagnostic collector.
 # No Python / jq / external package dependency.
 
 set -u
 
-VERSION="0.4.5"
+VERSION="0.5.0"
 
 MYSQL_BIN="${MYSQL_BIN:-mysql}"
 MYSQL_HOST="${MYSQL_HOST:-}"
@@ -26,6 +26,12 @@ ANALYZE_FORMAT="TREE"
 OPTIMIZER_TRACE=0
 DIAG_ERRORS=0
 CHECK_ONLY=0
+BATCH_MODE=0
+SHOW_REWRITE=0
+EXPLAIN_SCHEMA=""
+SCHEMA_CLAUSE=""
+ANALYSIS_MODE="SQL"
+CONNECTION_ID=""
 PRINT_PLAN=1
 OUTPUT_DIR=""
 SQL_TEXT=""
@@ -63,9 +69,13 @@ Analysis:
   --format NAME               TRADITIONAL | TREE | JSON | ALL
   --analyze                   EXPLAIN ANALYZE for SELECT/TABLE only (executes SQL)
   --analyze-format NAME       TREE | JSON (JSON requires explain_json_format_version=2)
-  --analyze-dml               Disabled for safety in v0.2
-  TTY without --format       Choose interactively; otherwise TRADITIONAL
+  --analyze-dml               Disabled for safety
+  Interactive use            Always select FORMAT, ANALYZE, TRACE, WARNINGS, SCHEMA
+  --batch                     Non-interactive execution with explicit CLI options
   --optimizer-trace           Collect INFORMATION_SCHEMA.OPTIMIZER_TRACE
+  --show-warnings             Optimizer rewritten SQL (SHOW WARNINGS)
+  --schema NAME               EXPLAIN FOR SCHEMA NAME
+  --for-connection ID         Inspect running connection (instead of SQL file)
   --check-only                Connection / capability precheck only
   --output DIR                Report output directory
   --no-print-plan             Save results without displaying TREE plan
@@ -172,10 +182,13 @@ read_sql() {
         SQL_TEXT="$(cat "$SQL_FILE")"
     fi
 
-    [ -n "$SQL_TEXT" ] || [ "$CHECK_ONLY" -eq 1 ] || die "SQL input required"
+    [ -n "$SQL_TEXT" ] || [ "$CHECK_ONLY" -eq 1 ] || [ "$ANALYSIS_MODE" = "CONNECTION" ] || die "SQL input required"
 
     if [ -n "$SQL_TEXT" ]; then
         SQL_TEXT="$(printf '%s' "$SQL_TEXT" | sed 's/[[:space:]]*;[[:space:]]*$//')"
+        case "$SQL_TEXT" in
+            *';'*) die "Multiple SQL statements / embedded semicolons are not accepted" ;;
+        esac
     fi
 }
 
@@ -311,35 +324,141 @@ UNION ALL SELECT 'optimizer_switch', @@optimizer_switch;
     } > "$PRECHECK_FILE"
 }
 
-choose_explain_format() {
-    if [ -z "$EXPLAIN_FORMAT" ]; then
-        if [ -t 0 ]; then
-            printf 'EXPLAIN FORMAT: 1) TRADITIONAL  2) TREE  3) JSON  4) ALL [1]: ' >&2
-            IFS= read -r CHOICE
-            case "$CHOICE" in
-                ""|1) EXPLAIN_FORMAT="TRADITIONAL" ;;
-                2) EXPLAIN_FORMAT="TREE" ;;
-                3) EXPLAIN_FORMAT="JSON" ;;
-                4) EXPLAIN_FORMAT="ALL" ;;
-                *) die "Invalid EXPLAIN FORMAT selection" ;;
-            esac
+menu_choice() {
+    MENU_LABEL="$1"
+    MENU_VALUES="$2"
+    while :; do
+        printf '%s' "$MENU_LABEL" >&2
+        IFS= read -r CHOICE || die "Interactive selection cancelled"
+        for VALID_CHOICE in $MENU_VALUES; do
+            [ "$CHOICE" = "$VALID_CHOICE" ] && return 0
+        done
+        printf 'Invalid selection. Available numbers: %s\n' "$MENU_VALUES" >&2
+    done
+}
+
+choose_analysis_options() {
+    if [ "$BATCH_MODE" -eq 0 ] && [ "$CHECK_ONLY" -eq 0 ]; then
+        [ -t 0 ] || die "Interactive menu requires TTY. Use --batch for automated execution."
+        printf '\n========== MySQL EXPLAIN Analysis ==========\n' >&2
+        menu_choice "Target: 1) SQL query/file  2) Running Connection : " "1 2"
+        case "$CHOICE" in
+            1) ANALYSIS_MODE="SQL" ;;
+            2) ANALYSIS_MODE="CONNECTION" ;;
+        esac
+        if [ "$ANALYSIS_MODE" = "CONNECTION" ]; then
+            printf 'Connection ID: ' >&2
+            IFS= read -r CONNECTION_ID || die "Connection ID input cancelled"
+        fi
+        menu_choice "EXPLAIN FORMAT: 1) TRADITIONAL  2) TREE  3) JSON  4) ALL : " "1 2 3 4"
+        case "$CHOICE" in
+            1) EXPLAIN_FORMAT=TRADITIONAL ;;
+            2) EXPLAIN_FORMAT=TREE ;;
+            3) EXPLAIN_FORMAT=JSON ;;
+            4) EXPLAIN_FORMAT=ALL ;;
+        esac
+        if [ "$ANALYSIS_MODE" = "SQL" ]; then
+            printf '\nNote: EXPLAIN ANALYZE runs the query, unlike normal EXPLAIN.\n' >&2
+            menu_choice "EXPLAIN ANALYZE: 1) No  2) Yes : " "1 2"
+            if [ "$CHOICE" = "2" ]; then
+                ANALYZE=1
+                menu_choice "ANALYZE FORMAT: 1) TREE  2) JSON v2 : " "1 2"
+                case "$CHOICE" in
+                    1) ANALYZE_FORMAT=TREE ;;
+                    2) ANALYZE_FORMAT=JSON ;;
+                esac
+                menu_choice "Confirm actual SQL execution: 1) Cancel ANALYZE  2) Execute : " "1 2"
+                [ "$CHOICE" = "2" ] || ANALYZE=0
+            else
+                ANALYZE=0
+            fi
+            menu_choice "Optimizer Trace: 1) No  2) Yes : " "1 2"
+            [ "$CHOICE" = "2" ] && OPTIMIZER_TRACE=1 || OPTIMIZER_TRACE=0
+            menu_choice "SHOW WARNINGS (rewritten SQL): 1) No  2) Yes : " "1 2"
+            [ "$CHOICE" = "2" ] && SHOW_REWRITE=1 || SHOW_REWRITE=0
+            menu_choice "FOR SCHEMA: 1) Use default database  2) Specify schema : " "1 2"
+            if [ "$CHOICE" = "2" ]; then
+                printf 'Schema name: ' >&2
+                IFS= read -r EXPLAIN_SCHEMA || die "Schema input cancelled"
+            else
+                EXPLAIN_SCHEMA=""
+            fi
         else
-            EXPLAIN_FORMAT="TRADITIONAL"
+            ANALYZE=0
+            OPTIMIZER_TRACE=0
+            SHOW_REWRITE=0
+            EXPLAIN_SCHEMA=""
+            printf 'FOR CONNECTION cannot run EXPLAIN ANALYZE or FOR SCHEMA.\n' >&2
         fi
     fi
-
     EXPLAIN_FORMAT="$(printf '%s' "$EXPLAIN_FORMAT" | tr '[:lower:]' '[:upper:]')"
     ANALYZE_FORMAT="$(printf '%s' "$ANALYZE_FORMAT" | tr '[:lower:]' '[:upper:]')"
+    [ -n "$EXPLAIN_FORMAT" ] || EXPLAIN_FORMAT=TRADITIONAL
+    case "$EXPLAIN_FORMAT" in TRADITIONAL|TREE|JSON|ALL) ;; *) die "Invalid EXPLAIN FORMAT" ;; esac
+    case "$ANALYZE_FORMAT" in TREE|JSON) ;; *) die "Invalid ANALYZE FORMAT" ;; esac
+    if [ "$ANALYSIS_MODE" = "CONNECTION" ]; then
+        printf '%s\n' "$CONNECTION_ID" | grep -Eq '^[1-9][0-9]*$' ||
+            die "Connection ID must be a positive integer"
+    fi
+    SCHEMA_CLAUSE=""
+    if [ -n "$EXPLAIN_SCHEMA" ]; then
+        printf '%s\n' "$EXPLAIN_SCHEMA" | grep -Eq '^[A-Za-z_][A-Za-z_0-9]*$' ||
+            die "Schema name must contain letters, digits and underscores"
+        [ "$ANALYSIS_MODE" = "SQL" ] || die "FOR SCHEMA incompatible with FOR CONNECTION"
+        SCHEMA_CLAUSE="FOR SCHEMA \`$EXPLAIN_SCHEMA\` "
+    fi
+}
 
-    case "$EXPLAIN_FORMAT" in
-        TRADITIONAL|TREE|JSON|ALL) ;;
-        *) die "--format must be TRADITIONAL, TREE, JSON, or ALL" ;;
-    esac
+collect_connection_plan() {
+    log "[PLAN] EXPLAIN FOR CONNECTION $CONNECTION_ID"
+    if [ "$EXPLAIN_FORMAT" = "TRADITIONAL" ] || [ "$EXPLAIN_FORMAT" = "ALL" ]; then
+        mysql_exec "EXPLAIN FORMAT=TRADITIONAL FOR CONNECTION $CONNECTION_ID" \
+            > "$OUTPUT_DIR/explain_traditional.txt" 2> "$OUTPUT_DIR/explain_connection.err" ||
+            die "FOR CONNECTION failed; see explain_connection.err"
+    fi
+    if [ "$EXPLAIN_FORMAT" = "TREE" ] || [ "$EXPLAIN_FORMAT" = "ALL" ]; then
+        mysql_raw "EXPLAIN FORMAT=TREE FOR CONNECTION $CONNECTION_ID" \
+            > "$OUTPUT_DIR/explain_tree.txt" 2> "$OUTPUT_DIR/explain_connection.err" ||
+            die "FOR CONNECTION TREE failed; see explain_connection.err"
+    fi
+    if [ "$EXPLAIN_FORMAT" = "JSON" ] || [ "$EXPLAIN_FORMAT" = "ALL" ]; then
+        mysql_raw "EXPLAIN FORMAT=JSON FOR CONNECTION $CONNECTION_ID" \
+            > "$OUTPUT_DIR/explain.json" 2> "$OUTPUT_DIR/explain_connection.err" ||
+            die "FOR CONNECTION JSON failed; see explain_connection.err"
+    fi
+    {
+        printf 'MySQL EXPLAIN FOR CONNECTION\n'
+        printf 'Script Version : %s\n' "$VERSION"
+        printf 'Connection ID  : %s\n' "$CONNECTION_ID"
+        printf 'EXPLAIN Format : %s\n' "$EXPLAIN_FORMAT"
+        printf 'Output Directory: %s\n' "$OUTPUT_DIR"
+    } > "$OUTPUT_DIR/summary.txt"
+}
 
-    case "$ANALYZE_FORMAT" in
-        TREE|JSON) ;;
-        *) die "--analyze-format must be TREE or JSON" ;;
-    esac
+collect_rewrite_warnings() {
+    [ "$SHOW_REWRITE" -eq 1 ] || return 0
+    log "[WARNINGS] optimizer rewrite and hints"
+    WARN_QUERY="$(prepare_diagnostic_sql "EXPLAIN FORMAT=TRADITIONAL ${SCHEMA_CLAUSE}${SQL_TEXT}")"
+    if [ "$BIND_COUNT" -gt 0 ]; then
+        WARN_QUERY="$(printf '%s\n' "$WARN_QUERY" | awk '
+            /^DEALLOCATE PREPARE diag_explain_stmt;/ {print "SHOW WARNINGS;";print;next}
+            {print}
+        ')"
+    else
+        WARN_QUERY="$WARN_QUERY
+SHOW WARNINGS;"
+    fi
+    if ! mysql_raw "$WARN_QUERY" > "$TMP_DIR/show_warnings_full.txt" \
+        2> "$OUTPUT_DIR/show_warnings.err"; then
+        warn "SHOW WARNINGS failed; see show_warnings.err"
+        DIAG_ERRORS=1
+    else
+        # Traditional EXPLAIN emits a plan row followed by warning rows.
+        # Preserve actual warning lines; a preceding JSON INTO statement
+        # suppresses rewrite notes, so do not use it for this diagnostic.
+        awk -F '\t' '($1=="Note" || $1=="Warning" || $1=="Error") && $2 ~ /^[0-9]+$/ {print}' \
+          "$TMP_DIR/show_warnings_full.txt" > "$OUTPUT_DIR/show_warnings.txt"
+    fi
 }
 
 collect_plan() {
@@ -351,7 +470,7 @@ collect_plan() {
     esac
 
     log "[PLAN] Internal MySQL JSON plan"
-    if ! mysql_raw "$(prepare_diagnostic_sql "EXPLAIN FORMAT=JSON $SQL_TEXT")" \
+    if ! mysql_raw "$(prepare_diagnostic_sql "EXPLAIN FORMAT=JSON ${SCHEMA_CLAUSE}${SQL_TEXT}")" \
         > "$PLAN_JSON_FILE" 2> "$OUTPUT_DIR/explain_json.err"; then
         die "EXPLAIN FORMAT=JSON failed: $OUTPUT_DIR/explain_json.err"
     fi
@@ -359,7 +478,7 @@ collect_plan() {
     case "$EXPLAIN_FORMAT" in
         TRADITIONAL|ALL)
             log "[PLAN] FORMAT=TRADITIONAL"
-            if ! mysql_exec "$(prepare_diagnostic_sql "EXPLAIN FORMAT=TRADITIONAL $SQL_TEXT")" \
+            if ! mysql_exec "$(prepare_diagnostic_sql "EXPLAIN FORMAT=TRADITIONAL ${SCHEMA_CLAUSE}${SQL_TEXT}")" \
                 > "$OUTPUT_DIR/explain_traditional.txt" 2> "$OUTPUT_DIR/explain_traditional.err"; then
                 die "FORMAT=TRADITIONAL failed: $OUTPUT_DIR/explain_traditional.err"
             fi
@@ -369,7 +488,7 @@ collect_plan() {
     case "$EXPLAIN_FORMAT" in
         TREE|ALL)
             log "[PLAN] FORMAT=TREE"
-            if ! mysql_raw "$(prepare_diagnostic_sql "EXPLAIN FORMAT=TREE $SQL_TEXT")" \
+            if ! mysql_raw "$(prepare_diagnostic_sql "EXPLAIN FORMAT=TREE ${SCHEMA_CLAUSE}${SQL_TEXT}")" \
                 > "$OUTPUT_DIR/explain_tree.txt" 2> "$OUTPUT_DIR/explain_tree.err"; then
                 if [ "$EXPLAIN_FORMAT" = "TREE" ]; then
                     die "FORMAT=TREE failed: $OUTPUT_DIR/explain_tree.err"
@@ -391,7 +510,7 @@ extract_objects() {
     # MySQL 9.x JSON v2 includes schema_name for every base relation.
     # The same server session holds the plan in @diag_plan and pairs the
     # schema/table arrays by ordinality. Avoid shell regex JSON parsing.
-    EXTRACT_SQL="$(prepare_diagnostic_sql "EXPLAIN FORMAT=JSON INTO @diag_plan $SQL_TEXT")
+    EXTRACT_SQL="$(prepare_diagnostic_sql "EXPLAIN FORMAT=JSON INTO @diag_plan ${SCHEMA_CLAUSE}${SQL_TEXT}")
 
 SET @diag_tables=JSON_EXTRACT(@diag_plan, '\$**.table_name');
 SET @diag_schemas=JSON_EXTRACT(@diag_plan, '\$**.schema_name');
@@ -554,7 +673,7 @@ collect_optimizer_trace() {
 SET optimizer_trace_max_mem_size=1048576;
 SELECT CONCAT('diagnostic_connection=', CONNECTION_ID(),
               ',ps_thread=', COALESCE(PS_CURRENT_THREAD_ID(), 'NULL'));
-$(prepare_diagnostic_sql "EXPLAIN FORMAT=JSON $SQL_TEXT")
+$(prepare_diagnostic_sql "EXPLAIN FORMAT=JSON ${SCHEMA_CLAUSE}${SQL_TEXT}")
 SELECT TRACE FROM information_schema.optimizer_trace;
 SET optimizer_trace='enabled=off';"
 
@@ -576,11 +695,11 @@ run_explain_analyze() {
 
     log "[ANALYZE] $ANALYZE_FORMAT (same MySQL session)"
     INIT=""
-    ANALYZE_STATEMENT="EXPLAIN ANALYZE FORMAT=$ANALYZE_FORMAT $SQL_TEXT"
+    ANALYZE_STATEMENT="EXPLAIN ANALYZE FORMAT=$ANALYZE_FORMAT ${SCHEMA_CLAUSE}${SQL_TEXT}"
     AFTER_SQL=""
     if [ "$ANALYZE_FORMAT" = "JSON" ]; then
         INIT="SET SESSION explain_json_format_version=2;"
-        ANALYZE_STATEMENT="EXPLAIN ANALYZE FORMAT=JSON INTO @diag_actual $SQL_TEXT"
+        ANALYZE_STATEMENT="EXPLAIN ANALYZE FORMAT=JSON INTO @diag_actual ${SCHEMA_CLAUSE}${SQL_TEXT}"
         AFTER_SQL="
 SELECT JSON_PRETTY(@diag_actual);
 SET @diag_ops=JSON_EXTRACT(@diag_actual, '\$**.operation');
@@ -695,6 +814,8 @@ write_summary() {
         printf 'DML Analyze    : disabled (safety / SQL restrictions)\n'
         printf 'P_S metrics    : same-session THREAD_ID statement event\n'
         printf 'Optimizer Trace: %s\n' "$OPTIMIZER_TRACE"
+        printf 'SHOW WARNINGS  : %s\n' "$SHOW_REWRITE"
+        printf 'EXPLAIN Schema: %s\n' "$EXPLAIN_SCHEMA"
         printf 'Bind Count     : %s\n' "$BIND_COUNT"
         printf 'Stats SQL errors: %s\n' "$DIAG_ERRORS"
         printf 'Ratio format    : %s\n' "${ANALYZE_FORMAT}"
@@ -824,6 +945,25 @@ ${1#*=}"
             OPTIMIZER_TRACE=1
             shift
             ;;
+        --show-warnings)
+            SHOW_REWRITE=1
+            shift
+            ;;
+        --schema)
+            [ "$#" -ge 2 ] || die "--schema requires a name"
+            EXPLAIN_SCHEMA="$2"
+            shift 2
+            ;;
+        --for-connection)
+            [ "$#" -ge 2 ] || die "--for-connection requires an ID"
+            CONNECTION_ID="$2"
+            ANALYSIS_MODE="CONNECTION"
+            shift 2
+            ;;
+        --batch)
+            BATCH_MODE=1
+            shift
+            ;;
 
         --check-only)
             CHECK_ONLY=1
@@ -878,8 +1018,8 @@ if [ -z "$LOGIN_PATH" ] && [ -z "$DEFAULTS_FILE" ]; then
     make_temp_cnf
 fi
 
+choose_analysis_options
 read_sql
-choose_explain_format
 compile_bind_values
 make_output_dir
 
@@ -890,6 +1030,17 @@ if ! mysql_raw "SELECT 1;" >/dev/null 2> "$OUTPUT_DIR/connection.err"; then
 fi
 
 collect_precheck
+
+if [ "$ANALYSIS_MODE" = "CONNECTION" ]; then
+    collect_connection_plan
+    log "Done: $OUTPUT_DIR"
+    if [ "$PRINT_PLAN" -eq 1 ] && [ -s "$OUTPUT_DIR/explain_tree.txt" ]; then
+        printf '\n===== EXPLAIN FOR CONNECTION TREE =====\n'
+        cat "$OUTPUT_DIR/explain_tree.txt"
+        printf '===== END EXPLAIN TREE =====\n'
+    fi
+    exit 0
+fi
 
 if [ "$CHECK_ONLY" -eq 1 ]; then
     log "Precheck complete: $OUTPUT_DIR"
@@ -934,6 +1085,8 @@ if [ "$OPTIMIZER_TRACE" -eq 1 ]; then
 else
     : > "$OUTPUT_DIR/optimizer_trace.txt"
 fi
+
+collect_rewrite_warnings
 
 log "[7/7] Report summary"
 write_summary "$TYPE"
