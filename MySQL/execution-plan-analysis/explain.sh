@@ -434,6 +434,8 @@ collect_optimizer_trace() {
 
     TRACE_SQL="SET optimizer_trace='enabled=on';
 SET optimizer_trace_max_mem_size=1048576;
+SELECT CONCAT('diagnostic_connection=', CONNECTION_ID(),
+              ',ps_thread=', COALESCE(PS_CURRENT_THREAD_ID(), 'NULL'));
 EXPLAIN FORMAT=JSON $SQL_TEXT;
 SELECT TRACE FROM information_schema.optimizer_trace;
 SET optimizer_trace='enabled=off';"
@@ -504,7 +506,8 @@ write_summary() {
         printf 'EXPLAIN Format : %s\n' "$EXPLAIN_FORMAT"
         printf 'Analyze Format : %s\n' "$ANALYZE_FORMAT"
         printf 'Analyze        : %s\n' "$ANALYZE"
-        printf 'Analyze DML    : %s\n' "$ANALYZE_DML"
+        printf 'DML Analyze    : disabled (safety / SQL restrictions)\n'
+        printf 'P_S metrics    : same-session THREAD_ID statement event\n'
         printf 'Optimizer Trace: %s\n' "$OPTIMIZER_TRACE"
 
         printf '\nBase Tables\n'
