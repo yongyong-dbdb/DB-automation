@@ -479,10 +479,14 @@ choose_analysis_options() {
     fi
     SCHEMA_CLAUSE=""
     if [ -n "$EXPLAIN_SCHEMA" ]; then
-        printf '%s\n' "$EXPLAIN_SCHEMA" | grep -Eq '^[A-Za-z_][A-Za-z_0-9]*$' ||
-            die "Schema name must contain letters, digits and underscores"
+        # Quote and escape MySQL identifiers, including reserved words and Unicode.
+        # MySQL itself checks the 64-character identifier limit.
+        if printf '%s' "$EXPLAIN_SCHEMA" | LC_ALL=C grep '[[:cntrl:]]' >/dev/null; then
+            die "Schema name must not contain control characters"
+        fi
         [ "$ANALYSIS_MODE" = "SQL" ] || die "FOR SCHEMA incompatible with FOR CONNECTION"
-        SCHEMA_CLAUSE="FOR SCHEMA \`$EXPLAIN_SCHEMA\` "
+        QUOTED_SCHEMA="$(printf '%s' "$EXPLAIN_SCHEMA" | sed 's/`/``/g')"
+        SCHEMA_CLAUSE="FOR SCHEMA \`$QUOTED_SCHEMA\` "
     fi
 }
 
@@ -1181,10 +1185,10 @@ write_summary() {
         printf 'EXPLAIN Schema: %s\n' "$EXPLAIN_SCHEMA"
         printf 'Bind Count     : %s\n' "$BIND_COUNT"
         printf 'Stats SQL errors: %s\n' "$DIAG_ERRORS"
-        printf 'Ratio format    : %s\n' "${ANALYZE_FORMAT}"
+        printf 'Row ratio       : Actual rows per loop / estimated rows (script-calculated; N/A if estimated=0)\n'
 
-        printf '\nBase Tables\n'
-        printf '%s\n' '-----------'
+        printf '\nExecution Plan Table References (not necessarily base tables)\n'
+        printf '%s\n' '----------------------------------------------------------'
 
         if [ -s "$OUTPUT_DIR/objects.txt" ]; then
             cat "$OUTPUT_DIR/objects.txt"
@@ -1229,7 +1233,7 @@ print_console_results() {
             print_saved_result "explain_analyze.txt" "EXPLAIN ANALYZE FORMAT=$ANALYZE_FORMAT"
             if [ -s "$OUTPUT_DIR/estimated_actual.tsv" ]; then
                 printf '\n========== ESTIMATED / ACTUAL ROWS ==========\n'
-                printf 'Iterator\tOperation\tEstimated\tActual/loop\tLoops\tActual/Estimated\n'
+                printf 'Iterator\tOperation\tEstimated rows\tActual rows/loop\tLoops\tActual/Estimated (calculated)\n'
                 cat "$OUTPUT_DIR/estimated_actual.tsv"
                 printf '\n========== END ESTIMATED / ACTUAL ROWS ==========\n'
             fi
