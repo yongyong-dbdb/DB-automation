@@ -758,14 +758,14 @@ SELECT CONCAT('##IDXDELTA##',CONCAT_WS(CHAR(9),
        CAST(p.COUNT_FETCH AS DECIMAL(30,0))-b.nfetch,
        CAST(p.COUNT_WRITE AS DECIMAL(30,0))-b.nwrite,
        ROUND((CAST(p.SUM_TIMER_WAIT AS DECIMAL(30,0))-b.nwait)/1000000000,3)))
-FROM JSON_TABLE(@diag_io_before, '$[*]' COLUMNS(
-  db_name VARCHAR(128) PATH '$.db',
-  table_name VARCHAR(128) PATH '$.tbl',
-  index_name VARCHAR(128) PATH '$.idx',
-  nread DECIMAL(30,0) PATH '$.nread',
-  nfetch DECIMAL(30,0) PATH '$.nfetch',
-  nwrite DECIMAL(30,0) PATH '$.nwrite',
-  nwait DECIMAL(30,0) PATH '$.nwait'
+FROM JSON_TABLE(@diag_io_before, '\$[*]' COLUMNS(
+  db_name VARCHAR(128) PATH '\$.db',
+  table_name VARCHAR(128) PATH '\$.tbl',
+  index_name VARCHAR(128) PATH '\$.idx',
+  nread DECIMAL(30,0) PATH '\$.nread',
+  nfetch DECIMAL(30,0) PATH '\$.nfetch',
+  nwrite DECIMAL(30,0) PATH '\$.nwrite',
+  nwait DECIMAL(30,0) PATH '\$.nwait'
 )) AS b
 JOIN performance_schema.table_io_waits_summary_by_index_usage p
   ON p.OBJECT_SCHEMA=b.db_name AND p.OBJECT_NAME=b.table_name
