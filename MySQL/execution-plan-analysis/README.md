@@ -6,7 +6,7 @@ MySQL Optimizer 실행계획과 Connection / Thread 기반 Performance Schema �
 
 선택한 `EXPLAIN FORMAT` 출력, 내부 JSON Plan 기반 Object 진단, Table/Index 통계, Column Histogram, Index I/O 누적값, 동일 Connection에서 수집한 `EXPLAIN ANALYZE` Statement Event, Optimizer Trace 원본 수집 기능 포함.
 
-> 현재 구현 버전: `v0.6.1`
+> 현재 구현 버전: `v0.6.2`
 
 실행 파일:
 
@@ -63,7 +63,7 @@ stty
 
 ## 대화형 실행 (기본 동작)
 
-**터미널에서 실행하면 분석 옵션을 선택하는 메뉴가 표시됨.** 단, 분석 대상은 입력 파라미터에서 자동 결정: `--file`/`--sql`이면 SQL, `--for-connection`이면 Connection. 대상 파라미터가 없을 때만 Target 메뉴를 표시. FORMAT/ANALYZE/Optimizer Trace/SHOW WARNINGS/FOR SCHEMA는 기존처럼 선택형.
+**MySQL 접속 성공을 확인한 다음에만** 터미널 분석 옵션 선택 메뉴를 표시함. Password/Login Path로 최초 인증을 시도하고 실패하면 MySQL의 실제 오류 코드/내용을 즉시 출력한 뒤 메뉴 없이 종료. **터미널에서 실행하면 분석 옵션을 선택하는 메뉴가 표시됨.** 단, 분석 대상은 입력 파라미터에서 자동 결정: `--file`/`--sql`이면 SQL, `--for-connection`이면 Connection. 대상 파라미터가 없을 때만 Target 메뉴를 표시. FORMAT/ANALYZE/Optimizer Trace/SHOW WARNINGS/FOR SCHEMA는 기존처럼 선택형.
 
 | 순서 | 선택 항목 | 메뉴 |
 | --- | --- | --- |
@@ -207,9 +207,13 @@ Password Command Line Argument 미지원.
 ## 분석 흐름
 
 ```text
-SQL 입력 / MySQL 접속
+접속 정보/Password 입력
   ↓
-EXPLAIN FORMAT 선택(명시적 옵션 또는 대화형 메뉴)
+SELECT 1로 Connection 성공 여부 즉시 검증
+  ├─ 실패: MySQL ERROR 원문 출력 후 종료 (메뉴 표시 안 함)
+  └─ 성공: 메뉴 진행
+  ↓
+SQL 입력 / EXPLAIN FORMAT 선택(명시적 옵션 또는 대화형 메뉴)
   ├─ TRADITIONAL
   ├─ TREE
   ├─ JSON
@@ -399,12 +403,23 @@ sh explain.sh --batch --digest <64자리_SHA256_DIGEST> \
 - **MySQL 9.7.2** 대상 구현 및 실측 검증. 다른 MySQL 버전(8.0/8.4 포함)별 JSON Plan 구조, `explain_json_format_version`, `EXPLAIN ANALYZE FORMAT=JSON` 호환성 추가 확인 필요
 - Schema 추출은 JSON Plan v2의 `schema_name` / `table_name` 배열 순서를 기반으로 매핑. Schema 정보가 없는 JSON v1에서는 명확하지 않은 Cross-Schema 객체 판별 한계
 - `EXPLAIN ANALYZE`는 실제 SELECT 실행. 운영 환경에서 비용·잠금·트랜잭션 영향 검토 필요
+- ANALYZE 활성화 시 일반 EXPLAIN은 **터미널에서 생략**하지만, 예상 계획 파일은 정상 저장하며 내부 JSON 진단에도 이용함. 취소하거나 미선택 시 선택한 일반 EXPLAIN을 터미널에 출력
 - JSON Actual Metrics는 배열 길이 일치 시 Iterator별 비교. TREE는 완전한 Estimated/Actual 수치가 표시된 Iterator 행만 추출
 - Row 오차 배율 = `Actual Rows (Loop당 평균) / Estimated Rows`. `loops>1`은 별도 해석 필요
 - 단순 `?` Bind 지원. 복잡한 SQL Placeholder의 정적 위치 파싱/의미 분석 및 Application Prepared Statement 실행 이력 재현 기능 없음
 - Performance Schema Statement History 및 Instrument 설정에 따라 Thread Event 미수집 가능
 - Index I/O Delta는 인스턴스 전역 누적값의 Before/After 차이일 뿐 개별 SQL의 기여분으로 귀속하지 않음
 - Column Histogram/인덱스 변경 권고 자동 수행 없음. DML ANALYZE 차단
+
+## 접속 사전 검증 및 출력 중복 제거 (v0.6.2)
+
+- Password / Login Path 입력 직후 별도 경량 `SELECT 1`로 Connection 확인. 성공 시에만 Target·FORMAT·ANALYZE·TRACE·WARNINGS·SCHEMA 메뉴 표시
+- 유효하지 않은 DB 계정: MySQL ERROR 1045를 바로 출력, FORMAT 메뉴 횟수 0회, 보고서 생성 전 종료
+- 존재하지 않는 Database: MySQL ERROR 1049를 바로 출력, FORMAT 메뉴 횟수 0회
+- `--batch`, Digest, FOR CONNECTION 포함 동일 Connection Preflight 순서 적용
+- ANALYZE=Yes, FORMAT=TREE 실사용 TTY 테스트: 일반 EXPLAIN 터미널 출력 0회, Actual ANALYZE TREE 출력 1회
+- 일반 TREE 계획 파일(`explain_tree.txt`)과 Actual TREE(`explain_analyze.txt`)는 기존처럼 모두 저장. 내부 JSON/진단 수집·동일 ANALYZE 1회 규칙 유지
+- ANALYZE=No 또는 FOR CONNECTION 실행은 선택한 일반 EXPLAIN을 기존처럼 터미널에 출력
 
 ## 저부하 I/O 분류·원본 보존 검증 (v0.6.1)
 

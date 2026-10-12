@@ -1,13 +1,13 @@
 #!/bin/sh
 # MySQL Execution Plan Analysis
-# Version: 0.6.1
+# Version: 0.6.2
 #
 # Oracle MySQL execution-plan / optimizer diagnostic collector.
 # No Python / jq / external package dependency.
 
 set -u
 
-VERSION="0.6.1"
+VERSION="0.6.2"
 
 MYSQL_BIN="${MYSQL_BIN:-mysql}"
 MYSQL_HOST="${MYSQL_HOST:-}"
@@ -1151,11 +1151,15 @@ print_saved_result() {
 print_console_results() {
     [ "$PRINT_PLAN" -eq 1 ] || return 0
 
-    # Display all selected plan formats, never just TREE.  All files are
-    # already saved and are not consumed or modified by terminal output.
-    print_saved_result "explain_traditional.txt" "EXPLAIN FORMAT=TRADITIONAL"
-    print_saved_result "explain_tree.txt" "EXPLAIN FORMAT=TREE"
-    print_saved_result "explain.json" "EXPLAIN FORMAT=JSON"
+    # A successful EXPLAIN ANALYZE already includes the estimated plan and
+    # actual timings. Avoid duplicating the planned EXPLAIN on the terminal,
+    # but always keep the planned results in report files.
+    # Normal EXPLAIN and FOR CONNECTION continue displaying selected plans.
+    if [ "$ANALYSIS_MODE" != "SQL" ] || [ "$ANALYZE" -ne 1 ]; then
+        print_saved_result "explain_traditional.txt" "EXPLAIN FORMAT=TRADITIONAL"
+        print_saved_result "explain_tree.txt" "EXPLAIN FORMAT=TREE"
+        print_saved_result "explain.json" "EXPLAIN FORMAT=JSON"
+    fi
 
     if [ "$ANALYSIS_MODE" = "DIGEST" ]; then
         print_saved_result "digest_summary.txt" "PERFORMANCE SCHEMA DIGEST SUMMARY"
@@ -1384,17 +1388,25 @@ if [ -z "$LOGIN_PATH" ] && [ -z "$DEFAULTS_FILE" ]; then
     make_temp_cnf
 fi
 
+# Verify credentials, transport, database and server reachability BEFORE
+# asking for any analysis options.  mysql_raw uses a short-lived client
+# session: no application SQL is executed on failed authentication.
+# Preflight errors go to a private temporary file and are shown immediately.
+log "[0/7] Checking MySQL connection before analysis options"
+if ! mysql_raw "SELECT 1;" >/dev/null 2> "$TMP_DIR/connection.err"; then
+    if [ -s "$TMP_DIR/connection.err" ]; then
+        cat "$TMP_DIR/connection.err" >&2
+    fi
+    die "MySQL connection failed. Check host/socket, port, user, password, database and network."
+fi
+log "[0/7] MySQL connection OK"
+
 choose_analysis_options
 read_sql
 compile_bind_values
 make_output_dir
-
-log "[0/7] Connection / capability precheck"
-
-if ! mysql_raw "SELECT 1;" >/dev/null 2> "$OUTPUT_DIR/connection.err"; then
-    die "MySQL connection failed. See $OUTPUT_DIR/connection.err"
-fi
-
+# Persist the successful preflight log for consistency with prior reports.
+: > "$OUTPUT_DIR/connection.err"
 collect_precheck
 
 if [ "$ANALYSIS_MODE" = "DIGEST" ]; then
