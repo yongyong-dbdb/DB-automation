@@ -732,7 +732,7 @@ ORDER BY INDEX_NAME, SEQ_IN_INDEX;
 SELECT
     OBJECT_SCHEMA,
     OBJECT_NAME,
-    COALESCE(INDEX_NAME, '<NO_INDEX>') AS INDEX_NAME,
+    COALESCE(INDEX_NAME, 'NULL (No Index)') AS INDEX_NAME,
     COUNT_STAR,
     COUNT_READ,
     COUNT_WRITE,
@@ -882,7 +882,7 @@ WHERE ($IO_METADATA_FILTER);" > "$INDEX_IO_ENGINES" 2>"$OUTPUT_DIR/index_io_scop
     INDEX_IO_BEFORE_SQL="SET @diag_io_before=(
       SELECT COALESCE(JSON_ARRAYAGG(JSON_OBJECT(
         'db',OBJECT_SCHEMA, 'tbl',OBJECT_NAME,
-        'idx',COALESCE(INDEX_NAME,'<NO_INDEX>'),
+        'idx',COALESCE(INDEX_NAME,'NULL (No Index)'),
         'nread',COUNT_READ, 'nfetch',COUNT_FETCH,
         'nwrite',COUNT_WRITE, 'nwait',SUM_TIMER_WAIT
       )), JSON_ARRAY())
@@ -921,7 +921,7 @@ FROM JSON_TABLE(
 )) AS b
 JOIN performance_schema.table_io_waits_summary_by_index_usage p
   ON p.OBJECT_SCHEMA=b.db_name AND p.OBJECT_NAME=b.table_name
- AND COALESCE(p.INDEX_NAME,'<NO_INDEX>')=b.index_name
+ AND COALESCE(p.INDEX_NAME,'NULL (No Index)')=b.index_name
 ORDER BY b.db_name,b.table_name,b.index_name;"
 }
 
@@ -1037,6 +1037,7 @@ $INDEX_IO_AFTER_SQL"
     {
         printf '%s\n' 'Scope: verified USER InnoDB table indexes only; other sessions may contribute.'
         printf '%s\n' 'System/virtual tables are excluded. See index_io_scope.tsv for every skipped object.'
+        printf '%s\n' 'NULL (No Index) = Performance Schema INDEX_NAME IS NULL; not proof of a full table scan.'
         printf '%s\n' 'Read/Fetch/Write = After - Before; Wait delta is milliseconds.'
         printf 'Bound: max %s tables, max %s index rows; no extra ANALYZE execution.\n' "$INDEX_IO_MAX_TABLES" "$INDEX_IO_MAX_INDEXES"
         # Human-readable report: dynamic widths, right-aligned numeric deltas.
