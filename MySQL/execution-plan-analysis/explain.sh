@@ -1,13 +1,13 @@
 #!/bin/sh
 # MySQL Execution Plan Analysis
-# Version: 0.5.2
+# Version: 0.6.0
 #
 # Oracle MySQL execution-plan / optimizer diagnostic collector.
 # No Python / jq / external package dependency.
 
 set -u
 
-VERSION="0.5.2"
+VERSION="0.6.0"
 
 MYSQL_BIN="${MYSQL_BIN:-mysql}"
 MYSQL_HOST="${MYSQL_HOST:-}"
@@ -23,6 +23,7 @@ ANALYZE=0
 ANALYZE_DML=0
 EXPLAIN_FORMAT=""
 ANALYZE_FORMAT="TREE"
+ANALYZE_TIMEOUT_MS=30000
 OPTIMIZER_TRACE=0
 DIAG_ERRORS=0
 CHECK_ONLY=0
@@ -32,6 +33,7 @@ EXPLAIN_SCHEMA=""
 SCHEMA_CLAUSE=""
 ANALYSIS_MODE="SQL"
 CONNECTION_ID=""
+DIGEST_ID=""
 PRINT_PLAN=1
 OUTPUT_DIR=""
 SQL_TEXT=""
@@ -69,6 +71,7 @@ Analysis:
   --format NAME               TRADITIONAL | TREE | JSON | ALL
   --analyze                   EXPLAIN ANALYZE for SELECT/TABLE only (executes SQL)
   --analyze-format NAME       TREE | JSON (JSON requires explain_json_format_version=2)
+  --analyze-timeout-ms N      SELECT limit in milliseconds (default 30000)
   --analyze-dml               Disabled for safety
   Interactive use            Always select FORMAT, ANALYZE, TRACE, WARNINGS, SCHEMA
   --batch                     Non-interactive execution with explicit CLI options
@@ -76,6 +79,7 @@ Analysis:
   --show-warnings             Optimizer rewritten SQL (SHOW WARNINGS)
   --schema NAME               EXPLAIN FOR SCHEMA NAME
   --for-connection ID         Inspect running connection (instead of SQL file)
+  --digest HEX                Read-only Performance Schema digest summary (64 hex)
   --check-only                Connection / capability precheck only
   --output DIR                Report output directory
   --no-print-plan             Save results without displaying plans/ANALYZE/warnings
@@ -182,12 +186,27 @@ read_sql() {
         SQL_TEXT="$(cat "$SQL_FILE")"
     fi
 
-    [ -n "$SQL_TEXT" ] || [ "$CHECK_ONLY" -eq 1 ] || [ "$ANALYSIS_MODE" = "CONNECTION" ] || die "SQL input required"
+    [ -n "$SQL_TEXT" ] || [ "$CHECK_ONLY" -eq 1 ] || [ "$ANALYSIS_MODE" = "CONNECTION" ] || [ "$ANALYSIS_MODE" = "DIGEST" ] || die "SQL input required"
 
     if [ -n "$SQL_TEXT" ]; then
         SQL_TEXT="$(printf '%s' "$SQL_TEXT" | sed 's/[[:space:]]*;[[:space:]]*$//')"
+        # Conservative SQL check: reject any interior semicolon, including one
+        # inside a quoted literal (rather than risk accidental multi-statement
+        # execution under differing sql_mode settings).
         case "$SQL_TEXT" in
             *';'*) die "Multiple SQL statements / embedded semicolons are not accepted" ;;
+        esac
+        # mysql -e processes client commands in addition to SQL. Refuse any
+        # line that can be interpreted as a client meta-command.
+        if printf '%s\n' "$SQL_TEXT" | grep -Eq '^[[:space:]]*\\'; then
+            die "MySQL client backslash commands are not accepted in SQL input"
+        fi
+        if printf '%s\n' "$SQL_TEXT" | grep -Eiq '^[[:space:]]*(DELIMITER|SOURCE)[[:space:]]+'; then
+            die "MySQL client SOURCE/DELIMITER commands are not accepted"
+        fi
+        case "$(statement_type)" in
+            SELECT|TABLE|WITH|INSERT|UPDATE|DELETE|REPLACE) ;;
+            *) die "SQL input must be a single EXPLAIN-able SELECT/TABLE/WITH/INSERT/UPDATE/DELETE/REPLACE" ;;
         esac
     fi
 }
@@ -339,15 +358,22 @@ menu_choice() {
 
 choose_analysis_options() {
     # Reject incompatible explicit input in both interactive and --batch modes.
-    if [ -n "$CONNECTION_ID" ] && { [ -n "$SQL_FILE" ] || [ -n "$SQL_TEXT" ]; }; then
-        die "Cannot combine --file/--sql with --for-connection"
+    if [ -n "$CONNECTION_ID" ] && { [ -n "$SQL_FILE" ] || [ -n "$SQL_TEXT" ] || [ -n "$DIGEST_ID" ]; }; then
+        die "Cannot combine --for-connection with SQL/DIGEST inputs"
     fi
+    if [ -n "$DIGEST_ID" ] && { [ -n "$SQL_FILE" ] || [ -n "$SQL_TEXT" ]; }; then
+        die "Cannot combine --digest with --file/--sql"
+    fi
+    if [ -n "$DIGEST_ID" ]; then ANALYSIS_MODE="DIGEST"; fi
     if [ "$BATCH_MODE" -eq 0 ] && [ "$CHECK_ONLY" -eq 0 ]; then
         [ -t 0 ] || die "Interactive menu requires TTY. Use --batch for automated execution."
         printf '\n========== MySQL EXPLAIN Analysis ==========\n' >&2
         # An explicit SQL input or Connection ID already identifies the target.
         # Ask only when neither was supplied by the caller.
-        if [ -n "$SQL_FILE" ] || [ -n "$SQL_TEXT" ]; then
+        if [ -n "$DIGEST_ID" ]; then
+            ANALYSIS_MODE="DIGEST"
+            printf 'Target: Performance Schema Digest (specified by argument)\n' >&2
+        elif [ -n "$SQL_FILE" ] || [ -n "$SQL_TEXT" ]; then
             [ -z "$CONNECTION_ID" ] ||
                 die "Cannot combine --file/--sql with --for-connection"
             ANALYSIS_MODE="SQL"
@@ -356,10 +382,11 @@ choose_analysis_options() {
             ANALYSIS_MODE="CONNECTION"
             printf 'Target: Running Connection %s (specified by argument)\n' "$CONNECTION_ID" >&2
         else
-            menu_choice "Target: 1) SQL query/file  2) Running Connection : " "1 2"
+            menu_choice "Target: 1) SQL query/file  2) Running Connection  3) Digest summary : " "1 2 3"
             case "$CHOICE" in
                 1) ANALYSIS_MODE="SQL" ;;
                 2) ANALYSIS_MODE="CONNECTION" ;;
+                3) ANALYSIS_MODE="DIGEST" ;;
             esac
         fi
 
@@ -370,7 +397,13 @@ choose_analysis_options() {
         elif [ "$ANALYSIS_MODE" = "CONNECTION" ] && [ -z "$CONNECTION_ID" ]; then
             printf 'Connection ID: ' >&2
             IFS= read -r CONNECTION_ID || die "Connection ID input cancelled"
+        elif [ "$ANALYSIS_MODE" = "DIGEST" ] && [ -z "$DIGEST_ID" ]; then
+            printf 'Performance Schema Digest SHA-256 (64 hex characters): ' >&2
+            IFS= read -r DIGEST_ID || die "Digest input cancelled"
         fi
+        if [ "$ANALYSIS_MODE" = "DIGEST" ]; then
+            printf 'Digest mode is read-only and does not run EXPLAIN/ANALYZE.\n' >&2
+        else
         menu_choice "EXPLAIN FORMAT: 1) TRADITIONAL  2) TREE  3) JSON  4) ALL : " "1 2 3 4"
         case "$CHOICE" in
             1) EXPLAIN_FORMAT=TRADITIONAL ;;
@@ -390,6 +423,18 @@ choose_analysis_options() {
                 esac
                 menu_choice "Confirm actual SQL execution: 1) Cancel ANALYZE  2) Execute : " "1 2"
                 [ "$CHOICE" = "2" ] || ANALYZE=0
+                if [ "$ANALYZE" -eq 1 ]; then
+                    menu_choice "ANALYZE timeout: 1) 5s  2) 30s  3) 60s  4) Custom milliseconds : " "1 2 3 4"
+                    case "$CHOICE" in
+                        1) ANALYZE_TIMEOUT_MS=5000 ;;
+                        2) ANALYZE_TIMEOUT_MS=30000 ;;
+                        3) ANALYZE_TIMEOUT_MS=60000 ;;
+                        4)
+                            printf 'Timeout in milliseconds (positive integer): ' >&2
+                            IFS= read -r ANALYZE_TIMEOUT_MS || die "Timeout input cancelled"
+                            ;;
+                    esac
+                fi
             else
                 ANALYZE=0
             fi
@@ -411,12 +456,23 @@ choose_analysis_options() {
             EXPLAIN_SCHEMA=""
             printf 'FOR CONNECTION cannot run EXPLAIN ANALYZE or FOR SCHEMA.\n' >&2
         fi
+        fi
     fi
     EXPLAIN_FORMAT="$(printf '%s' "$EXPLAIN_FORMAT" | tr '[:lower:]' '[:upper:]')"
     ANALYZE_FORMAT="$(printf '%s' "$ANALYZE_FORMAT" | tr '[:lower:]' '[:upper:]')"
     [ -n "$EXPLAIN_FORMAT" ] || EXPLAIN_FORMAT=TRADITIONAL
     case "$EXPLAIN_FORMAT" in TRADITIONAL|TREE|JSON|ALL) ;; *) die "Invalid EXPLAIN FORMAT" ;; esac
     case "$ANALYZE_FORMAT" in TREE|JSON) ;; *) die "Invalid ANALYZE FORMAT" ;; esac
+    case "$ANALYZE_TIMEOUT_MS" in
+        ''|*[!0-9]*) die "ANALYZE timeout must be positive milliseconds" ;;
+    esac
+    [ "$ANALYZE_TIMEOUT_MS" -gt 0 ] && [ "$ANALYZE_TIMEOUT_MS" -le 4294967295 ] ||
+        die "ANALYZE timeout must be 1..4294967295 milliseconds"
+    if [ "$ANALYSIS_MODE" = "DIGEST" ]; then
+        printf '%s\n' "$DIGEST_ID" | grep -Eq '^[[:xdigit:]]{64}$' ||
+            die "Digest must be 64 hexadecimal characters"
+        DIGEST_ID="$(printf '%s' "$DIGEST_ID" | tr '[:lower:]' '[:upper:]')"
+    fi
     if [ "$ANALYSIS_MODE" = "CONNECTION" ]; then
         printf '%s\n' "$CONNECTION_ID" | grep -Eq '^[1-9][0-9]*$' ||
             die "Connection ID must be a positive integer"
@@ -428,6 +484,39 @@ choose_analysis_options() {
         [ "$ANALYSIS_MODE" = "SQL" ] || die "FOR SCHEMA incompatible with FOR CONNECTION"
         SCHEMA_CLAUSE="FOR SCHEMA \`$EXPLAIN_SCHEMA\` "
     fi
+}
+
+collect_digest_report() {
+    log "[DIGEST] Read-only Performance Schema statement summary"
+    DIGEST_SCHEMA_FILTER=""
+    if [ -n "$MYSQL_DATABASE" ]; then
+        DIGEST_DB_HEX="$(hex_utf8 "$MYSQL_DATABASE")"
+        DIGEST_SCHEMA_FILTER="AND SCHEMA_NAME=CONVERT(0x$DIGEST_DB_HEX USING utf8mb4)"
+    fi
+    DIGEST_QUERY="SELECT SCHEMA_NAME, DIGEST, DIGEST_TEXT, COUNT_STAR,
+       ROUND(AVG_TIMER_WAIT/1000000000,3) AS avg_ms,
+       ROUND(SUM_TIMER_WAIT/1000000000,3) AS total_ms,
+       ROUND(SUM_LOCK_TIME/1000000000,3) AS lock_total_ms,
+       SUM_ROWS_EXAMINED, SUM_ROWS_SENT, SUM_NO_INDEX_USED,
+       SUM_ERRORS, SUM_WARNINGS, FIRST_SEEN, LAST_SEEN
+FROM performance_schema.events_statements_summary_by_digest
+WHERE DIGEST='$DIGEST_ID' $DIGEST_SCHEMA_FILTER
+ORDER BY COUNT_STAR DESC;"
+    if ! mysql_exec "$DIGEST_QUERY" --batch --raw \
+      > "$OUTPUT_DIR/digest_summary.txt" 2> "$OUTPUT_DIR/digest_summary.err"; then
+        die "Digest summary query failed; see $OUTPUT_DIR/digest_summary.err"
+    fi
+    if [ "$(wc -l < "$OUTPUT_DIR/digest_summary.txt")" -le 1 ]; then
+        die "Digest not found, schema filter excludes it, or Performance Schema digest collection is disabled"
+    fi
+    {
+        printf 'MySQL Performance Schema Digest Summary\n'
+        printf 'Script Version : %s\n' "$VERSION"
+        printf 'Digest         : %s\n' "$DIGEST_ID"
+        printf 'Schema filter  : %s\n' "\${MYSQL_DATABASE:-all schemas}"
+        printf 'SQL execution  : NONE (aggregated digest only)\n'
+        printf 'Note: normalized DIGEST_TEXT has no original literal/bind values.\n'
+    } > "$OUTPUT_DIR/summary.txt"
 }
 
 collect_connection_plan() {
@@ -704,6 +793,56 @@ SET optimizer_trace='enabled=off';"
     fi
 }
 
+build_index_io_delta_sql() {
+    INDEX_IO_BEFORE_SQL=""
+    INDEX_IO_AFTER_SQL=""
+    INDEX_IO_READY=0
+    [ -s "$OUTPUT_DIR/objects.tsv" ] || return 0
+    IO_FILTER="0"
+    while IFS="$(printf '\t')" read -r OBJ_SCHEMA OBJ_TABLE; do
+        [ -n "$OBJ_SCHEMA" ] && [ -n "$OBJ_TABLE" ] || continue
+        IO_SCHEMA_HEX="$(hex_utf8 "$OBJ_SCHEMA")"
+        IO_TABLE_HEX="$(hex_utf8 "$OBJ_TABLE")"
+        IO_FILTER="$IO_FILTER OR (OBJECT_SCHEMA=CONVERT(0x$IO_SCHEMA_HEX USING utf8mb4) AND OBJECT_NAME=CONVERT(0x$IO_TABLE_HEX USING utf8mb4))"
+    done < "$OUTPUT_DIR/objects.tsv"
+    [ "$IO_FILTER" != "0" ] || return 0
+    INDEX_IO_READY=1
+
+    # Performance Schema index I/O counters are GLOBAL for a table/index,
+    # even when sampled before/after by this diagnostic connection.
+    INDEX_IO_BEFORE_SQL="SET @diag_io_before=(
+      SELECT COALESCE(JSON_ARRAYAGG(JSON_OBJECT(
+        'db',OBJECT_SCHEMA, 'tbl',OBJECT_NAME,
+        'idx',COALESCE(INDEX_NAME,'<NO_INDEX>'),
+        'nread',COUNT_READ, 'nfetch',COUNT_FETCH,
+        'nwrite',COUNT_WRITE, 'nwait',SUM_TIMER_WAIT
+      )), JSON_ARRAY())
+      FROM performance_schema.table_io_waits_summary_by_index_usage
+      WHERE ($IO_FILTER)
+    );"
+
+    INDEX_IO_AFTER_SQL="
+SELECT CONCAT('##IDXDELTA##',CONCAT_WS(CHAR(9),
+       b.db_name,b.table_name,b.index_name,
+       CAST(p.COUNT_READ AS DECIMAL(30,0))-b.nread,
+       CAST(p.COUNT_FETCH AS DECIMAL(30,0))-b.nfetch,
+       CAST(p.COUNT_WRITE AS DECIMAL(30,0))-b.nwrite,
+       ROUND((CAST(p.SUM_TIMER_WAIT AS DECIMAL(30,0))-b.nwait)/1000000000,3)))
+FROM JSON_TABLE(@diag_io_before, '\$[*]' COLUMNS(
+  db_name VARCHAR(128) PATH '\$.db',
+  table_name VARCHAR(128) PATH '\$.tbl',
+  index_name VARCHAR(128) PATH '\$.idx',
+  nread DECIMAL(30,0) PATH '\$.nread',
+  nfetch DECIMAL(30,0) PATH '\$.nfetch',
+  nwrite DECIMAL(30,0) PATH '\$.nwrite',
+  nwait DECIMAL(30,0) PATH '\$.nwait'
+)) AS b
+JOIN performance_schema.table_io_waits_summary_by_index_usage p
+  ON p.OBJECT_SCHEMA=b.db_name AND p.OBJECT_NAME=b.table_name
+ AND COALESCE(p.INDEX_NAME,'<NO_INDEX>')=b.index_name
+ORDER BY b.db_name,b.table_name,b.index_name;"
+}
+
 run_explain_analyze() {
     TYPE="$1"
     case "$TYPE" in
@@ -714,7 +853,9 @@ run_explain_analyze() {
             ;;
     esac
 
-    log "[ANALYZE] $ANALYZE_FORMAT (same MySQL session)"
+    build_index_io_delta_sql
+    log "[ANALYZE] $ANALYZE_FORMAT (READ ONLY transaction, max_execution_time=${ANALYZE_TIMEOUT_MS}ms)"
+    warn "ANALYZE executes SELECT; MySQL max_execution_time is limited to supported SELECT statements and does not undo external side effects"
     INIT=""
     ANALYZE_STATEMENT="EXPLAIN ANALYZE FORMAT=$ANALYZE_FORMAT ${SCHEMA_CLAUSE}${SQL_TEXT}"
     AFTER_SQL=""
@@ -753,15 +894,31 @@ WHERE JSON_LENGTH(@diag_ops)=JSON_LENGTH(@diag_est)
 ORDER BY o.n;"
     fi
 
+    # Capture warnings immediately after ANALYZE, BEFORE prepared DEALLOCATE
+    # or any later SELECT clears the statement diagnostic area.
+    ANALYZE_RUN_SQL="$(prepare_diagnostic_sql "$ANALYZE_STATEMENT")"
+    if [ "$BIND_COUNT" -gt 0 ]; then
+        ANALYZE_RUN_SQL="$(printf '%s\n' "$ANALYZE_RUN_SQL" | awk '
+            /^DEALLOCATE PREPARE diag_explain_stmt;/ { print "SHOW WARNINGS;"; print; next }
+            { print }
+        ')"
+    else
+        ANALYZE_RUN_SQL="$ANALYZE_RUN_SQL
+SHOW WARNINGS;"
+    fi
+
     # EXPLAIN and the Performance Schema snapshot share one server session.
     # A prepared EXPLAIN is tracked as execute_sql, not dealloc_sql.
     ANALYZE_SQL="$INIT
+SET SESSION max_execution_time=$ANALYZE_TIMEOUT_MS;
+START TRANSACTION READ ONLY;
+$INDEX_IO_BEFORE_SQL
 SET @diag_thread = (
   SELECT THREAD_ID FROM performance_schema.threads
   WHERE PROCESSLIST_ID = CONNECTION_ID()
 );
 SELECT CONCAT('##SESSION##', CONNECTION_ID(), '|', COALESCE(@diag_thread,'NULL'));
-$(prepare_diagnostic_sql "$ANALYZE_STATEMENT")
+$ANALYZE_RUN_SQL
 $AFTER_SQL
 SELECT CONCAT('##EVENT##',COALESCE((
   SELECT CONCAT_WS('|',EVENT_ID,EVENT_NAME,
@@ -773,7 +930,9 @@ SELECT CONCAT('##EVENT##',COALESCE((
     AND SQL_TEXT LIKE 'EXPLAIN ANALYZE%'
     AND EVENT_NAME IN ('statement/sql/select', 'statement/sql/execute_sql')
   ORDER BY EVENT_ID DESC LIMIT 1
-),'NOT_COLLECTED'));"
+),'NOT_COLLECTED'));
+ROLLBACK;
+$INDEX_IO_AFTER_SQL"
 
     if ! mysql_raw "$ANALYZE_SQL" > "$TMP_DIR/analyze_all.txt" \
       2> "$OUTPUT_DIR/explain_analyze.err"; then
@@ -782,11 +941,30 @@ SELECT CONCAT('##EVENT##',COALESCE((
         return 0
     fi
 
+    {
+        printf '%s\n' 'Scope: global Performance Schema index I/O counters (other sessions may contribute).'
+        printf '%s\n' 'Read/Fetch/Write deltas are counter differences; Wait delta is milliseconds.'
+        printf 'Schema\tTable\tIndex\tRead Delta\tFetch Delta\tWrite Delta\tWait Delta (ms)\n'
+        awk '/^##IDXDELTA##/ {sub(/^##IDXDELTA##/,"");print}' "$TMP_DIR/analyze_all.txt"
+        if [ "$INDEX_IO_READY" -eq 0 ]; then
+            printf '%s\n' 'No eligible base tables in the current JSON plan.'
+        fi
+    } > "$OUTPUT_DIR/index_io_delta.txt"
+
+    awk -F '\t' '($1=="Warning" || $1=="Error" || $1=="Note") && $2 ~ /^[0-9]+$/ {print}' \
+        "$TMP_DIR/analyze_all.txt" > "$OUTPUT_DIR/analyze_warnings.txt"
+    # MySQL 9.7 can return success with Warning 1317 when a timed
+    # EXPLAIN ANALYZE was interrupted. Never treat it as a valid full plan.
+    if grep -Eq '^(Warning|Error)[[:space:]]+(1317|3024)[[:space:]]' "$OUTPUT_DIR/analyze_warnings.txt"; then
+        warn "EXPLAIN ANALYZE was interrupted or timed out; partial plan is not a successful analysis"
+        DIAG_ERRORS=1
+    fi
+
     awk '/^##SESSION##/ {print}' "$TMP_DIR/analyze_all.txt" > "$OUTPUT_DIR/analyze_session.txt"
     awk '/^##EVENT##/ {print}' "$TMP_DIR/analyze_all.txt" > "$OUTPUT_DIR/thread_statement_event.txt"
     awk '/^##METRIC##/ {sub(/^##METRIC##/,"");print}' \
       "$TMP_DIR/analyze_all.txt" > "$OUTPUT_DIR/estimated_actual.tsv"
-    awk 'NR>1 && $0 !~ /^##SESSION##/ && $0 !~ /^##EVENT##/ && $0 !~ /^##METRIC##/ {print}' \
+    awk 'NR>1 && $0 !~ /^##SESSION##/ && $0 !~ /^##EVENT##/ && $0 !~ /^##METRIC##/ && $0 !~ /^##IDXDELTA##/ && $0 !~ /^(Warning|Error|Note)[[:space:]]+[0-9]+[[:space:]]/ {print}' \
       "$TMP_DIR/analyze_all.txt" > "$OUTPUT_DIR/explain_analyze.txt"
 
     if [ "$ANALYZE_FORMAT" = "TREE" ]; then
@@ -816,8 +994,6 @@ SELECT CONCAT('##EVENT##',COALESCE((
         ' "$OUTPUT_DIR/explain_analyze.txt" > "$OUTPUT_DIR/estimated_actual.tsv"
     fi
 
-    printf '%s\n' 'Not collected: index I/O counters are global across all server threads.' \
-      > "$OUTPUT_DIR/index_io_delta.txt"
 }
 
 write_summary() {
@@ -832,6 +1008,9 @@ write_summary() {
         printf 'EXPLAIN Format : %s\n' "$EXPLAIN_FORMAT"
         printf 'Analyze Format : %s\n' "$ANALYZE_FORMAT"
         printf 'Analyze        : %s\n' "$ANALYZE"
+        printf 'Analyze TX     : %s\n' "START TRANSACTION READ ONLY / ROLLBACK"
+        printf 'Analyze Timeout: %s ms\n' "$ANALYZE_TIMEOUT_MS"
+        printf 'ANALYZE warnings: %s\n' "see analyze_warnings.txt"
         printf 'DML Analyze    : disabled (safety / SQL restrictions)\n'
         printf 'P_S metrics    : same-session THREAD_ID statement event\n'
         printf 'Optimizer Trace: %s\n' "$OPTIMIZER_TRACE"
@@ -875,6 +1054,9 @@ print_console_results() {
     print_saved_result "explain_tree.txt" "EXPLAIN FORMAT=TREE"
     print_saved_result "explain.json" "EXPLAIN FORMAT=JSON"
 
+    if [ "$ANALYSIS_MODE" = "DIGEST" ]; then
+        print_saved_result "digest_summary.txt" "PERFORMANCE SCHEMA DIGEST SUMMARY"
+    fi
     if [ "$ANALYSIS_MODE" = "SQL" ]; then
         if [ "$ANALYZE" -eq 1 ]; then
             print_saved_result "explain_analyze.txt" "EXPLAIN ANALYZE FORMAT=$ANALYZE_FORMAT"
@@ -884,6 +1066,7 @@ print_console_results() {
                 cat "$OUTPUT_DIR/estimated_actual.tsv"
                 printf '\n========== END ESTIMATED / ACTUAL ROWS ==========\n'
             fi
+            print_saved_result "index_io_delta.txt" "GLOBAL INDEX I/O BEFORE / AFTER DELTA"
         fi
         if [ "$SHOW_REWRITE" -eq 1 ]; then
             print_saved_result "show_warnings.txt" "SHOW WARNINGS (OPTIMIZER REWRITE)"
@@ -996,6 +1179,15 @@ ${1#*=}"
             ANALYZE_FORMAT="${1#*=}"
             shift
             ;;
+        --analyze-timeout-ms)
+            [ "$#" -ge 2 ] || die "--analyze-timeout-ms requires a positive integer"
+            ANALYZE_TIMEOUT_MS="$2"
+            shift 2
+            ;;
+        --analyze-timeout-ms=*)
+            ANALYZE_TIMEOUT_MS="${1#*=}"
+            shift
+            ;;
 
         --analyze-dml)
             die "--analyze-dml disabled: only multi-table UPDATE/DELETE supported by MySQL EXPLAIN ANALYZE; rollback alone cannot guarantee isolation"
@@ -1019,6 +1211,17 @@ ${1#*=}"
             CONNECTION_ID="$2"
             ANALYSIS_MODE="CONNECTION"
             shift 2
+            ;;
+        --digest)
+            [ "$#" -ge 2 ] || die "--digest requires 64 hex characters"
+            DIGEST_ID="$2"
+            ANALYSIS_MODE="DIGEST"
+            shift 2
+            ;;
+        --digest=*)
+            DIGEST_ID="${1#*=}"
+            ANALYSIS_MODE="DIGEST"
+            shift
             ;;
         --batch)
             BATCH_MODE=1
@@ -1090,6 +1293,13 @@ if ! mysql_raw "SELECT 1;" >/dev/null 2> "$OUTPUT_DIR/connection.err"; then
 fi
 
 collect_precheck
+
+if [ "$ANALYSIS_MODE" = "DIGEST" ]; then
+    collect_digest_report
+    log "Done: $OUTPUT_DIR"
+    print_console_results
+    exit 0
+fi
 
 if [ "$ANALYSIS_MODE" = "CONNECTION" ]; then
     collect_connection_plan
