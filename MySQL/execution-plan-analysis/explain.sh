@@ -1,13 +1,13 @@
 #!/bin/sh
 # MySQL Execution Plan Analysis
-# Version: 0.6.0
+# Version: 0.6.1
 #
 # Oracle MySQL execution-plan / optimizer diagnostic collector.
 # No Python / jq / external package dependency.
 
 set -u
 
-VERSION="0.6.0"
+VERSION="0.6.1"
 
 MYSQL_BIN="${MYSQL_BIN:-mysql}"
 MYSQL_HOST="${MYSQL_HOST:-}"
@@ -797,19 +797,88 @@ build_index_io_delta_sql() {
     INDEX_IO_BEFORE_SQL=""
     INDEX_IO_AFTER_SQL=""
     INDEX_IO_READY=0
+    INDEX_IO_MAX_TABLES=6
+    INDEX_IO_MAX_INDEXES=64
+    INDEX_IO_SCOPE_FILE="$OUTPUT_DIR/index_io_scope.tsv"
+    INDEX_IO_CANDIDATES="$TMP_DIR/io_candidates.tsv"
+    INDEX_IO_ENGINES="$TMP_DIR/io_engines.tsv"
+    : > "$INDEX_IO_CANDIDATES"
+    printf 'Schema\tTable\tEngine\tStatus\tReason\n' > "$INDEX_IO_SCOPE_FILE"
+
+    # Never probe system-schema index counters.  These can be virtual or
+    # instrument-specific objects rather than InnoDB B-tree I/O.
     [ -s "$OUTPUT_DIR/objects.tsv" ] || return 0
-    IO_FILTER="0"
     while IFS="$(printf '\t')" read -r OBJ_SCHEMA OBJ_TABLE; do
         [ -n "$OBJ_SCHEMA" ] && [ -n "$OBJ_TABLE" ] || continue
+        case "$(printf '%s' "$OBJ_SCHEMA" | tr '[:upper:]' '[:lower:]')" in
+            mysql|performance_schema|information_schema|sys)
+                printf '%s\t%s\tSYSTEM\tSKIPPED\tSystem/virtual table: index I/O delta is not comparable to user InnoDB I/O\n' \
+                    "$OBJ_SCHEMA" "$OBJ_TABLE" >> "$INDEX_IO_SCOPE_FILE"
+                ;;
+            *)
+                # TSV input cannot represent embedded newline/tab in a name.
+                if printf '%s%s' "$OBJ_SCHEMA" "$OBJ_TABLE" | grep -Eq '[[:cntrl:]]'; then
+                    printf '%s\t%s\tUNKNOWN\tSKIPPED\tUnsupported control character in object name\n' \
+                        "$OBJ_SCHEMA" "$OBJ_TABLE" >> "$INDEX_IO_SCOPE_FILE"
+                else
+                    printf '%s\t%s\n' "$OBJ_SCHEMA" "$OBJ_TABLE" >> "$INDEX_IO_CANDIDATES"
+                fi
+                ;;
+        esac
+    done < "$OUTPUT_DIR/objects.tsv"
+
+    INDEX_IO_TABLE_COUNT="$(wc -l < "$INDEX_IO_CANDIDATES" | tr -d ' ')"
+    [ "$INDEX_IO_TABLE_COUNT" -gt 0 ] || return 0
+    if [ "$INDEX_IO_TABLE_COUNT" -gt "$INDEX_IO_MAX_TABLES" ]; then
+        while IFS="$(printf '\t')" read -r OBJ_SCHEMA OBJ_TABLE; do
+            printf '%s\t%s\tUNKNOWN\tSKIPPED\tMore than %s tables; bounded collection disabled\n' \
+                "$OBJ_SCHEMA" "$OBJ_TABLE" "$INDEX_IO_MAX_TABLES" >> "$INDEX_IO_SCOPE_FILE"
+        done < "$INDEX_IO_CANDIDATES"
+        return 0
+    fi
+
+    # One small engine lookup, only for the named tables (max 6).  If
+    # metadata is unavailable, omit I/O collection rather than fail ANALYZE.
+    IO_METADATA_FILTER="0"
+    while IFS="$(printf '\t')" read -r OBJ_SCHEMA OBJ_TABLE; do
         IO_SCHEMA_HEX="$(hex_utf8 "$OBJ_SCHEMA")"
         IO_TABLE_HEX="$(hex_utf8 "$OBJ_TABLE")"
-        IO_FILTER="$IO_FILTER OR (OBJECT_SCHEMA=CONVERT(0x$IO_SCHEMA_HEX USING utf8mb4) AND OBJECT_NAME=CONVERT(0x$IO_TABLE_HEX USING utf8mb4))"
-    done < "$OUTPUT_DIR/objects.tsv"
-    [ "$IO_FILTER" != "0" ] || return 0
+        IO_METADATA_FILTER="$IO_METADATA_FILTER OR (TABLE_SCHEMA=CONVERT(0x$IO_SCHEMA_HEX USING utf8mb4) AND TABLE_NAME=CONVERT(0x$IO_TABLE_HEX USING utf8mb4))"
+    done < "$INDEX_IO_CANDIDATES"
+
+    if ! mysql_raw "SELECT TABLE_SCHEMA,TABLE_NAME,COALESCE(ENGINE,'<NULL>')
+FROM information_schema.tables
+WHERE ($IO_METADATA_FILTER);" > "$INDEX_IO_ENGINES" 2>"$OUTPUT_DIR/index_io_scope.err"; then
+        while IFS="$(printf '\t')" read -r OBJ_SCHEMA OBJ_TABLE; do
+            printf '%s\t%s\tUNKNOWN\tSKIPPED\tCannot verify storage engine; no counter queries performed\n' \
+                "$OBJ_SCHEMA" "$OBJ_TABLE" >> "$INDEX_IO_SCOPE_FILE"
+        done < "$INDEX_IO_CANDIDATES"
+        warn "Index I/O delta skipped: engine lookup failed; see index_io_scope.err"
+        return 0
+    fi
+
+    IO_FILTER="0"
+    while IFS="$(printf '\t')" read -r OBJ_SCHEMA OBJ_TABLE; do
+        IO_ENGINE="$(awk -F '\t' -v db="$OBJ_SCHEMA" -v tbl="$OBJ_TABLE" \
+            '$1==db && $2==tbl {print $3;exit}' "$INDEX_IO_ENGINES")"
+        if [ "$IO_ENGINE" = InnoDB ]; then
+            printf '%s\t%s\tInnoDB\tINCLUDED\tGlobal counters, not attributable to one SQL\n' \
+                "$OBJ_SCHEMA" "$OBJ_TABLE" >> "$INDEX_IO_SCOPE_FILE"
+            IO_SCHEMA_HEX="$(hex_utf8 "$OBJ_SCHEMA")"
+            IO_TABLE_HEX="$(hex_utf8 "$OBJ_TABLE")"
+            IO_FILTER="$IO_FILTER OR (OBJECT_SCHEMA=CONVERT(0x$IO_SCHEMA_HEX USING utf8mb4) AND OBJECT_NAME=CONVERT(0x$IO_TABLE_HEX USING utf8mb4))"
+        else
+            [ -n "$IO_ENGINE" ] || IO_ENGINE=UNKNOWN
+            printf '%s\t%s\t%s\tSKIPPED\tNot a verified user InnoDB table\n' \
+                "$OBJ_SCHEMA" "$OBJ_TABLE" "$IO_ENGINE" >> "$INDEX_IO_SCOPE_FILE"
+        fi
+    done < "$INDEX_IO_CANDIDATES"
+    [ "$IO_FILTER" != 0 ] || return 0
     INDEX_IO_READY=1
 
-    # Performance Schema index I/O counters are GLOBAL for a table/index,
-    # even when sampled before/after by this diagnostic connection.
+    # Bounded at 65 rows.  If there are >64 index entries the collector
+    # skips delta calculation entirely, avoiding unbounded JSON memory.
+    # Two targeted reads of GLOBAL in-memory P_S counters; no extra ANALYZE.
     INDEX_IO_BEFORE_SQL="SET @diag_io_before=(
       SELECT COALESCE(JSON_ARRAYAGG(JSON_OBJECT(
         'db',OBJECT_SCHEMA, 'tbl',OBJECT_NAME,
@@ -817,25 +886,38 @@ build_index_io_delta_sql() {
         'nread',COUNT_READ, 'nfetch',COUNT_FETCH,
         'nwrite',COUNT_WRITE, 'nwait',SUM_TIMER_WAIT
       )), JSON_ARRAY())
-      FROM performance_schema.table_io_waits_summary_by_index_usage
-      WHERE ($IO_FILTER)
-    );"
+      FROM (
+        SELECT OBJECT_SCHEMA,OBJECT_NAME,INDEX_NAME,COUNT_READ,
+               COUNT_FETCH,COUNT_WRITE,SUM_TIMER_WAIT
+        FROM performance_schema.table_io_waits_summary_by_index_usage
+        WHERE ($IO_FILTER)
+        LIMIT 65
+      ) AS bounded_io
+    );
+    SELECT CONCAT('##IOLIMIT##',JSON_LENGTH(@diag_io_before));"
 
     INDEX_IO_AFTER_SQL="
-SELECT CONCAT('##IDXDELTA##',CONCAT_WS(CHAR(9),
+SELECT CONCAT('##IODETAIL##',CONCAT_WS(CHAR(9),
        b.db_name,b.table_name,b.index_name,
+       b.nread,CAST(p.COUNT_READ AS DECIMAL(30,0)),
        CAST(p.COUNT_READ AS DECIMAL(30,0))-b.nread,
+       b.nfetch,CAST(p.COUNT_FETCH AS DECIMAL(30,0)),
        CAST(p.COUNT_FETCH AS DECIMAL(30,0))-b.nfetch,
+       b.nwrite,CAST(p.COUNT_WRITE AS DECIMAL(30,0)),
        CAST(p.COUNT_WRITE AS DECIMAL(30,0))-b.nwrite,
+       b.nwait,CAST(p.SUM_TIMER_WAIT AS DECIMAL(30,0)),
        ROUND((CAST(p.SUM_TIMER_WAIT AS DECIMAL(30,0))-b.nwait)/1000000000,3)))
-FROM JSON_TABLE(@diag_io_before, '\$[*]' COLUMNS(
-  db_name VARCHAR(128) PATH '\$.db',
-  table_name VARCHAR(128) PATH '\$.tbl',
-  index_name VARCHAR(128) PATH '\$.idx',
-  nread DECIMAL(30,0) PATH '\$.nread',
-  nfetch DECIMAL(30,0) PATH '\$.nfetch',
-  nwrite DECIMAL(30,0) PATH '\$.nwrite',
-  nwait DECIMAL(30,0) PATH '\$.nwait'
+FROM JSON_TABLE(
+  IF(JSON_LENGTH(@diag_io_before)>$INDEX_IO_MAX_INDEXES,
+     JSON_ARRAY(),@diag_io_before),
+  '\$[*]' COLUMNS(
+    db_name VARCHAR(128) PATH '\$.db',
+    table_name VARCHAR(128) PATH '\$.tbl',
+    index_name VARCHAR(128) PATH '\$.idx',
+    nread DECIMAL(30,0) PATH '\$.nread',
+    nfetch DECIMAL(30,0) PATH '\$.nfetch',
+    nwrite DECIMAL(30,0) PATH '\$.nwrite',
+    nwait DECIMAL(30,0) PATH '\$.nwait'
 )) AS b
 JOIN performance_schema.table_io_waits_summary_by_index_usage p
   ON p.OBJECT_SCHEMA=b.db_name AND p.OBJECT_NAME=b.table_name
@@ -941,13 +1023,30 @@ $INDEX_IO_AFTER_SQL"
         return 0
     fi
 
+    # Preserve raw before/after counter values as well as computed deltas.
+    # Every output row is for a verified user InnoDB table only.
+    IO_VALUES="$OUTPUT_DIR/index_io_before_after.tsv"
+    printf 'Schema\tTable\tIndex\tRead Before\tRead After\tRead Delta\tFetch Before\tFetch After\tFetch Delta\tWrite Before\tWrite After\tWrite Delta\tWait Before (ps)\tWait After (ps)\tWait Delta (ms)\n' > "$IO_VALUES"
+    awk '/^##IODETAIL##/ {sub(/^##IODETAIL##/,"");print}' "$TMP_DIR/analyze_all.txt" >> "$IO_VALUES"
+
+    printf 'Schema\tTable\tIndex\tCOUNT_READ\tCOUNT_FETCH\tCOUNT_WRITE\tSUM_TIMER_WAIT (ps)\n' > "$OUTPUT_DIR/index_io_before.tsv"
+    printf 'Schema\tTable\tIndex\tCOUNT_READ\tCOUNT_FETCH\tCOUNT_WRITE\tSUM_TIMER_WAIT (ps)\n' > "$OUTPUT_DIR/index_io_after.tsv"
+    awk -F '\t' 'NR>1 {print $1"\t"$2"\t"$3"\t"$4"\t"$7"\t"$10"\t"$13}' "$IO_VALUES" >> "$OUTPUT_DIR/index_io_before.tsv"
+    awk -F '\t' 'NR>1 {print $1"\t"$2"\t"$3"\t"$5"\t"$8"\t"$11"\t"$14}' "$IO_VALUES" >> "$OUTPUT_DIR/index_io_after.tsv"
+    IO_COUNT="$(awk -F '\t' '/^##IOLIMIT##/ {sub(/^##IOLIMIT##/,"",$1);print $1;exit}' "$TMP_DIR/analyze_all.txt")"
     {
-        printf '%s\n' 'Scope: global Performance Schema index I/O counters (other sessions may contribute).'
-        printf '%s\n' 'Read/Fetch/Write deltas are counter differences; Wait delta is milliseconds.'
+        printf '%s\n' 'Scope: verified USER InnoDB table indexes only; other sessions may contribute.'
+        printf '%s\n' 'System/virtual tables are excluded. See index_io_scope.tsv for every skipped object.'
+        printf '%s\n' 'Read/Fetch/Write = After - Before; Wait delta is milliseconds.'
+        printf 'Bound: max %s tables, max %s index rows; no extra ANALYZE execution.\n' "$INDEX_IO_MAX_TABLES" "$INDEX_IO_MAX_INDEXES"
         printf 'Schema\tTable\tIndex\tRead Delta\tFetch Delta\tWrite Delta\tWait Delta (ms)\n'
-        awk '/^##IDXDELTA##/ {sub(/^##IDXDELTA##/,"");print}' "$TMP_DIR/analyze_all.txt"
+        awk -F '\t' 'NR>1 {print $1"\t"$2"\t"$3"\t"$6"\t"$9"\t"$12"\t"$15}' "$IO_VALUES"
         if [ "$INDEX_IO_READY" -eq 0 ]; then
-            printf '%s\n' 'No eligible base tables in the current JSON plan.'
+            printf '%s\n' 'Not collected: no eligible user InnoDB tables (or object limit reached).'
+        elif [ -n "$IO_COUNT" ] && [ "$IO_COUNT" -gt "$INDEX_IO_MAX_INDEXES" ]; then
+            printf '%s\n' 'Not collected: index row count exceeded safety limit (64).'
+        elif [ "$(wc -l < "$IO_VALUES")" -le 1 ]; then
+            printf '%s\n' 'No matching instrumented index counters (or Performance Schema index I/O disabled).'
         fi
     } > "$OUTPUT_DIR/index_io_delta.txt"
 
