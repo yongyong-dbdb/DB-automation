@@ -1048,6 +1048,10 @@ $INDEX_IO_AFTER_SQL"
         elif [ "$(wc -l < "$IO_VALUES")" -le 1 ]; then
             printf '%s\n' 'No matching instrumented index counters (or Performance Schema index I/O disabled).'
         fi
+        if awk -F '\t' 'NR>1 && $4=="SKIPPED" {found=1} END {exit !found}' "$INDEX_IO_SCOPE_FILE"; then
+            printf '\n%s\n' 'Skipped / non-comparable objects:'
+            awk -F '\t' 'NR>1 && $4=="SKIPPED" {printf "%s.%s [%s]: %s\n",$1,$2,$3,$5}' "$INDEX_IO_SCOPE_FILE"
+        fi
     } > "$OUTPUT_DIR/index_io_delta.txt"
 
     awk -F '\t' '($1=="Warning" || $1=="Error" || $1=="Note") && $2 ~ /^[0-9]+$/ {print}' \
