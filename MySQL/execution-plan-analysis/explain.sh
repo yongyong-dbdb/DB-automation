@@ -1233,33 +1233,13 @@ print_console_results() {
             print_saved_result "explain_analyze.txt" "EXPLAIN ANALYZE FORMAT=$ANALYZE_FORMAT"
             if [ -s "$OUTPUT_DIR/estimated_actual.tsv" ]; then
                 printf '\n========== ESTIMATED / ACTUAL ROWS ==========\n'
-                # Human-readable alignment only; keep estimated_actual.tsv intact.
-                awk -F '\t' '
-                    BEGIN {
-                        h[1]="Iterator"; h[2]="Operation"; h[3]="Estimated rows"
-                        h[4]="Actual rows/loop"; h[5]="Loops"
-                        h[6]="Actual/Estimated (calculated)"
-                        for (j=1;j<=6;j++) w[j]=length(h[j])
-                    }
-                    NF>=6 {
-                        n++
-                        for (j=1;j<=6;j++) {
-                            a[n,j]=$j
-                            if (length(a[n,j])>w[j]) w[j]=length(a[n,j])
-                        }
-                    }
-                    END {
-                        for (i=0;i<=n;i++) {
-                            for (j=1;j<=6;j++) {
-                                s=(i==0 ? h[j] : a[i,j])
-                                if (j==2) printf "%-*s",w[j],s
-                                else printf "%*s",w[j],s
-                                if (j<6) printf "  "
-                            }
-                            printf "\n"
-                        }
-                    }
-                ' "$OUTPUT_DIR/estimated_actual.tsv"
+                # Compact per-row display; never pad short operations to
+                # the maximum operation length. Preserve the raw TSV file.
+                printf 'Iterator  Operation  Estimated  Actual/loop  Loops  Ratio (calculated)\n'
+                printf 'Ratio = actual rows per loop / estimated rows; N/A if estimated rows = 0.\n'
+                awk -F '\t' 'NF>=6 {
+                    printf "%s  %s  %s  %s  %s  %s\n", $1,$2,$3,$4,$5,$6
+                }' "$OUTPUT_DIR/estimated_actual.tsv"
                 printf '\n========== END ESTIMATED / ACTUAL ROWS ==========\n'
             fi
             print_saved_result "index_io_delta.txt" "GLOBAL INDEX I/O BEFORE / AFTER DELTA"
