@@ -829,10 +829,10 @@ build_index_io_delta_sql() {
 
     INDEX_IO_TABLE_COUNT="$(wc -l < "$INDEX_IO_CANDIDATES" | tr -d ' ')"
     [ "$INDEX_IO_TABLE_COUNT" -gt 0 ] || return 0
-    if [ "$INDEX_IO_TABLE_COUNT" -gt "$INDEX_IO_MAX_TABLES" ]; then
+    if [ "$INDEX_IO_TABLE_COUNT" -gt 64 ]; then
         while IFS="$(printf '\t')" read -r OBJ_SCHEMA OBJ_TABLE; do
             printf '%s\t%s\tUNKNOWN\tSKIPPED\tMore than %s tables; bounded collection disabled\n' \
-                "$OBJ_SCHEMA" "$OBJ_TABLE" "$INDEX_IO_MAX_TABLES" >> "$INDEX_IO_SCOPE_FILE"
+                "$OBJ_SCHEMA" "$OBJ_TABLE" 64 >> "$INDEX_IO_SCOPE_FILE"
         done < "$INDEX_IO_CANDIDATES"
         return 0
     fi
@@ -858,22 +858,33 @@ WHERE ($IO_METADATA_FILTER);" > "$INDEX_IO_ENGINES" 2>"$OUTPUT_DIR/index_io_scop
     fi
 
     IO_FILTER="0"
+    INDEX_IO_VERIFIED_COUNT=0
     while IFS="$(printf '\t')" read -r OBJ_SCHEMA OBJ_TABLE; do
         IO_ENGINE="$(awk -F '\t' -v db="$OBJ_SCHEMA" -v tbl="$OBJ_TABLE" \
             '$1==db && $2==tbl {print $3;exit}' "$INDEX_IO_ENGINES")"
         if [ "$IO_ENGINE" = InnoDB ]; then
+            INDEX_IO_VERIFIED_COUNT=$((INDEX_IO_VERIFIED_COUNT + 1))
             printf '%s\t%s\tInnoDB\tINCLUDED\tGlobal counters, not attributable to one SQL\n' \
                 "$OBJ_SCHEMA" "$OBJ_TABLE" >> "$INDEX_IO_SCOPE_FILE"
             IO_SCHEMA_HEX="$(hex_utf8 "$OBJ_SCHEMA")"
             IO_TABLE_HEX="$(hex_utf8 "$OBJ_TABLE")"
             IO_FILTER="$IO_FILTER OR (OBJECT_SCHEMA=CONVERT(0x$IO_SCHEMA_HEX USING utf8mb4) AND OBJECT_NAME=CONVERT(0x$IO_TABLE_HEX USING utf8mb4))"
         else
-            [ -n "$IO_ENGINE" ] || IO_ENGINE=UNKNOWN
-            printf '%s\t%s\t%s\tSKIPPED\tNot a verified user InnoDB table\n' \
-                "$OBJ_SCHEMA" "$OBJ_TABLE" "$IO_ENGINE" >> "$INDEX_IO_SCOPE_FILE"
+            if [ -z "$IO_ENGINE" ]; then
+                IO_ENGINE='PLAN_ONLY'
+                IO_REASON='Execution-plan alias or internal result; not a catalog table'
+            else
+                IO_REASON='Non-InnoDB table; index I/O collection not supported'
+            fi
+            printf '%s\t%s\t%s\tSKIPPED\t%s\n' \
+                "$OBJ_SCHEMA" "$OBJ_TABLE" "$IO_ENGINE" "$IO_REASON" >> "$INDEX_IO_SCOPE_FILE"
         fi
     done < "$INDEX_IO_CANDIDATES"
     [ "$IO_FILTER" != 0 ] || return 0
+    if [ "$INDEX_IO_VERIFIED_COUNT" -gt "$INDEX_IO_MAX_TABLES" ]; then
+        warn "Index I/O delta skipped: more than $INDEX_IO_MAX_TABLES verified InnoDB tables"
+        return 0
+    fi
     INDEX_IO_READY=1
 
     # Bounded at 65 rows.  If there are >64 index entries the collector
@@ -953,7 +964,7 @@ SET @diag_loops=JSON_EXTRACT(@diag_actual, '\$**.actual_loops');
 SELECT CONCAT('##METRIC##',o.n,CHAR(9),
               REPLACE(o.operation,CHAR(9),' '),CHAR(9),
               e.est,CHAR(9),a.act,CHAR(9),l.loops,CHAR(9),
-              COALESCE(ROUND(a.act/NULLIF(e.est,0),3),0))
+              COALESCE(CAST(ROUND(a.act/NULLIF(e.est,0),3) AS CHAR),'N/A'))
 FROM JSON_TABLE(
   IF(JSON_TYPE(@diag_ops)='ARRAY',@diag_ops,JSON_ARRAY(@diag_ops)),
   '\$[*]' COLUMNS(n FOR ORDINALITY, operation VARCHAR(512) PATH '\$')
@@ -1132,8 +1143,8 @@ $INDEX_IO_AFTER_SQL"
                 sub(/\).*/, "", loops)
                 if (est ~ /^[0-9]+([.][0-9]+)?$/ && act ~ /^[0-9]+([.][0-9]+)?$/ && loops ~ /^[0-9]+([.][0-9]+)?$/) {
                     n++
-                    ratio=(est+0)>0 ? (act+0)/(est+0) : 0
-                    printf "%d\t%s\t%s\t%s\t%s\t%.3f\n", n,op,est,act,loops,ratio
+                    ratio=(est+0)>0 ? sprintf("%.3f",(act+0)/(est+0)) : "N/A"
+                    printf "%d\t%s\t%s\t%s\t%s\t%s\n", n,op,est,act,loops,ratio
                 }
             }
         ' "$OUTPUT_DIR/explain_analyze.txt" > "$OUTPUT_DIR/estimated_actual.tsv"
