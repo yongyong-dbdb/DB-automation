@@ -871,8 +871,15 @@ WHERE ($IO_METADATA_FILTER);" > "$INDEX_IO_ENGINES" 2>"$OUTPUT_DIR/index_io_scop
             IO_FILTER="$IO_FILTER OR (OBJECT_SCHEMA=CONVERT(0x$IO_SCHEMA_HEX USING utf8mb4) AND OBJECT_NAME=CONVERT(0x$IO_TABLE_HEX USING utf8mb4))"
         else
             if [ -z "$IO_ENGINE" ]; then
-                IO_ENGINE='PLAN_ONLY'
-                IO_REASON='Execution-plan alias or internal result; not a catalog table'
+                IO_ENGINE='N/A'
+                case "$OBJ_TABLE" in
+                    '<materialized_subquery>'*)
+                        IO_REASON='Subquery materialization (internal temporary table); not a base table'
+                        ;;
+                    *)
+                        IO_REASON='Not found in INFORMATION_SCHEMA.TABLES; possible derived table or common table expression (CTE) reference'
+                        ;;
+                esac
             else
                 IO_REASON='Non-InnoDB table; index I/O collection not supported'
             fi
