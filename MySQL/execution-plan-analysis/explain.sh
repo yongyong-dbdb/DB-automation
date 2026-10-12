@@ -1,13 +1,13 @@
 #!/bin/sh
 # MySQL Execution Plan Analysis
-# Version: 0.5.2
+# Version: 0.6.0
 #
 # Oracle MySQL execution-plan / optimizer diagnostic collector.
 # No Python / jq / external package dependency.
 
 set -u
 
-VERSION="0.5.2"
+VERSION="0.6.0"
 
 MYSQL_BIN="${MYSQL_BIN:-mysql}"
 MYSQL_HOST="${MYSQL_HOST:-}"
@@ -23,6 +23,7 @@ ANALYZE=0
 ANALYZE_DML=0
 EXPLAIN_FORMAT=""
 ANALYZE_FORMAT="TREE"
+ANALYZE_TIMEOUT_MS=30000
 OPTIMIZER_TRACE=0
 DIAG_ERRORS=0
 CHECK_ONLY=0
@@ -69,6 +70,7 @@ Analysis:
   --format NAME               TRADITIONAL | TREE | JSON | ALL
   --analyze                   EXPLAIN ANALYZE for SELECT/TABLE only (executes SQL)
   --analyze-format NAME       TREE | JSON (JSON requires explain_json_format_version=2)
+  --analyze-timeout-ms N      SELECT limit in milliseconds (default 30000)
   --analyze-dml               Disabled for safety
   Interactive use            Always select FORMAT, ANALYZE, TRACE, WARNINGS, SCHEMA
   --batch                     Non-interactive execution with explicit CLI options
@@ -390,6 +392,18 @@ choose_analysis_options() {
                 esac
                 menu_choice "Confirm actual SQL execution: 1) Cancel ANALYZE  2) Execute : " "1 2"
                 [ "$CHOICE" = "2" ] || ANALYZE=0
+                if [ "$ANALYZE" -eq 1 ]; then
+                    menu_choice "ANALYZE timeout: 1) 5s  2) 30s  3) 60s  4) Custom milliseconds : " "1 2 3 4"
+                    case "$CHOICE" in
+                        1) ANALYZE_TIMEOUT_MS=5000 ;;
+                        2) ANALYZE_TIMEOUT_MS=30000 ;;
+                        3) ANALYZE_TIMEOUT_MS=60000 ;;
+                        4)
+                            printf 'Timeout in milliseconds (positive integer): ' >&2
+                            IFS= read -r ANALYZE_TIMEOUT_MS || die "Timeout input cancelled"
+                            ;;
+                    esac
+                fi
             else
                 ANALYZE=0
             fi
@@ -417,6 +431,11 @@ choose_analysis_options() {
     [ -n "$EXPLAIN_FORMAT" ] || EXPLAIN_FORMAT=TRADITIONAL
     case "$EXPLAIN_FORMAT" in TRADITIONAL|TREE|JSON|ALL) ;; *) die "Invalid EXPLAIN FORMAT" ;; esac
     case "$ANALYZE_FORMAT" in TREE|JSON) ;; *) die "Invalid ANALYZE FORMAT" ;; esac
+    case "$ANALYZE_TIMEOUT_MS" in
+        ''|*[!0-9]*) die "ANALYZE timeout must be positive milliseconds" ;;
+    esac
+    [ "$ANALYZE_TIMEOUT_MS" -gt 0 ] && [ "$ANALYZE_TIMEOUT_MS" -le 4294967295 ] ||
+        die "ANALYZE timeout must be 1..4294967295 milliseconds"
     if [ "$ANALYSIS_MODE" = "CONNECTION" ]; then
         printf '%s\n' "$CONNECTION_ID" | grep -Eq '^[1-9][0-9]*$' ||
             die "Connection ID must be a positive integer"
@@ -714,7 +733,8 @@ run_explain_analyze() {
             ;;
     esac
 
-    log "[ANALYZE] $ANALYZE_FORMAT (same MySQL session)"
+    log "[ANALYZE] $ANALYZE_FORMAT (READ ONLY transaction, max_execution_time=${ANALYZE_TIMEOUT_MS}ms)"
+    warn "ANALYZE executes SELECT; MySQL max_execution_time is limited to supported SELECT statements and does not undo external side effects"
     INIT=""
     ANALYZE_STATEMENT="EXPLAIN ANALYZE FORMAT=$ANALYZE_FORMAT ${SCHEMA_CLAUSE}${SQL_TEXT}"
     AFTER_SQL=""
@@ -756,6 +776,8 @@ ORDER BY o.n;"
     # EXPLAIN and the Performance Schema snapshot share one server session.
     # A prepared EXPLAIN is tracked as execute_sql, not dealloc_sql.
     ANALYZE_SQL="$INIT
+SET SESSION max_execution_time=$ANALYZE_TIMEOUT_MS;
+START TRANSACTION READ ONLY;
 SET @diag_thread = (
   SELECT THREAD_ID FROM performance_schema.threads
   WHERE PROCESSLIST_ID = CONNECTION_ID()
@@ -773,7 +795,8 @@ SELECT CONCAT('##EVENT##',COALESCE((
     AND SQL_TEXT LIKE 'EXPLAIN ANALYZE%'
     AND EVENT_NAME IN ('statement/sql/select', 'statement/sql/execute_sql')
   ORDER BY EVENT_ID DESC LIMIT 1
-),'NOT_COLLECTED'));"
+),'NOT_COLLECTED'));
+ROLLBACK;"
 
     if ! mysql_raw "$ANALYZE_SQL" > "$TMP_DIR/analyze_all.txt" \
       2> "$OUTPUT_DIR/explain_analyze.err"; then
@@ -832,6 +855,8 @@ write_summary() {
         printf 'EXPLAIN Format : %s\n' "$EXPLAIN_FORMAT"
         printf 'Analyze Format : %s\n' "$ANALYZE_FORMAT"
         printf 'Analyze        : %s\n' "$ANALYZE"
+        printf 'Analyze TX     : %s\n' "START TRANSACTION READ ONLY / ROLLBACK"
+        printf 'Analyze Timeout: %s ms\n' "$ANALYZE_TIMEOUT_MS"
         printf 'DML Analyze    : disabled (safety / SQL restrictions)\n'
         printf 'P_S metrics    : same-session THREAD_ID statement event\n'
         printf 'Optimizer Trace: %s\n' "$OPTIMIZER_TRACE"
@@ -994,6 +1019,15 @@ ${1#*=}"
 
         --analyze-format=*)
             ANALYZE_FORMAT="${1#*=}"
+            shift
+            ;;
+        --analyze-timeout-ms)
+            [ "$#" -ge 2 ] || die "--analyze-timeout-ms requires a positive integer"
+            ANALYZE_TIMEOUT_MS="$2"
+            shift 2
+            ;;
+        --analyze-timeout-ms=*)
+            ANALYZE_TIMEOUT_MS="${1#*=}"
             shift
             ;;
 
