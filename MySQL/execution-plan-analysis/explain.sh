@@ -1039,8 +1039,49 @@ $INDEX_IO_AFTER_SQL"
         printf '%s\n' 'System/virtual tables are excluded. See index_io_scope.tsv for every skipped object.'
         printf '%s\n' 'Read/Fetch/Write = After - Before; Wait delta is milliseconds.'
         printf 'Bound: max %s tables, max %s index rows; no extra ANALYZE execution.\n' "$INDEX_IO_MAX_TABLES" "$INDEX_IO_MAX_INDEXES"
-        printf 'Schema\tTable\tIndex\tRead Delta\tFetch Delta\tWrite Delta\tWait Delta (ms)\n'
-        awk -F '\t' 'NR>1 {print $1"\t"$2"\t"$3"\t"$6"\t"$9"\t"$12"\t"$15}' "$IO_VALUES"
+        # Human-readable report: dynamic widths, right-aligned numeric deltas.
+        # Leave the raw TSV counter files unchanged for machine consumption.
+        awk -F '\t' '
+            function grouped(s,    a, frac, neg, out) {
+                if (s !~ /^-?[0-9]+([.][0-9]+)?$/) return s
+                neg = ""
+                if (substr(s,1,1) == "-") { neg = "-"; s = substr(s,2) }
+                frac = ""
+                if (index(s,".")) { frac = substr(s,index(s,".")); s = substr(s,1,index(s,".")-1) }
+                out = ""
+                while (length(s) > 3) {
+                    out = "," substr(s,length(s)-2,3) out
+                    s = substr(s,1,length(s)-3)
+                }
+                return neg s out frac
+            }
+            BEGIN {
+                ncol=7
+                h[1]="Schema"; h[2]="Table"; h[3]="Index"
+                h[4]="Read Delta"; h[5]="Fetch Delta"
+                h[6]="Write Delta"; h[7]="Wait Delta (ms)"
+                for (j=1;j<=ncol;j++) w[j]=length(h[j])
+            }
+            NR>1 {
+                n++
+                a[n,1]=$1; a[n,2]=$2; a[n,3]=$3
+                a[n,4]=grouped($6); a[n,5]=grouped($9)
+                a[n,6]=grouped($12); a[n,7]=grouped($15)
+                for (j=1;j<=ncol;j++)
+                    if (length(a[n,j])>w[j]) w[j]=length(a[n,j])
+            }
+            END {
+                for (i=0;i<=n;i++) {
+                    for (j=1;j<=ncol;j++) {
+                        s=(i==0 ? h[j] : a[i,j])
+                        if (j<=3) printf "%-*s",w[j],s
+                        else printf "%*s",w[j],s
+                        if (j<ncol) printf "  "
+                    }
+                    printf "\n"
+                }
+            }
+        ' "$IO_VALUES"
         if [ "$INDEX_IO_READY" -eq 0 ]; then
             printf '%s\n' 'Not collected: no eligible user InnoDB tables (or object limit reached).'
         elif [ -n "$IO_COUNT" ] && [ "$IO_COUNT" -gt "$INDEX_IO_MAX_INDEXES" ]; then
