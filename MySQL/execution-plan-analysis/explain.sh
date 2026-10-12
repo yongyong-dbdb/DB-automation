@@ -1233,13 +1233,31 @@ print_console_results() {
             print_saved_result "explain_analyze.txt" "EXPLAIN ANALYZE FORMAT=$ANALYZE_FORMAT"
             if [ -s "$OUTPUT_DIR/estimated_actual.tsv" ]; then
                 printf '\n========== ESTIMATED / ACTUAL ROWS ==========\n'
-                # Compact per-row display; never pad short operations to
-                # the maximum operation length. Preserve the raw TSV file.
-                printf 'Iterator  Operation  Estimated  Actual/loop  Loops  Ratio (calculated)\n'
-                printf 'Ratio = actual rows per loop / estimated rows; N/A if estimated rows = 0.\n'
-                awk -F '\t' 'NF>=6 {
-                    printf "%s  %s  %s  %s  %s  %s\n", $1,$2,$3,$4,$5,$6
-                }' "$OUTPUT_DIR/estimated_actual.tsv"
+                # Align numeric columns; keep variable-length Operation last.
+                # Preserve estimated_actual.tsv field order for consumers.
+                awk -F '\t' '
+                    BEGIN {
+                        h[1]="Iterator"; h[2]="Estimated"; h[3]="Actual/loop"
+                        h[4]="Loops"; h[5]="Ratio (Actual/Estimated)"; h[6]="Operation"
+                        for (j=1;j<=5;j++) w[j]=length(h[j])
+                    }
+                    NF>=6 {
+                        n++
+                        a[n,1]=$1; a[n,2]=$3; a[n,3]=$4
+                        a[n,4]=$5; a[n,5]=$6; a[n,6]=$2
+                        for (j=1;j<=5;j++)
+                            if (length(a[n,j])>w[j]) w[j]=length(a[n,j])
+                    }
+                    END {
+                        for (i=0;i<=n;i++) {
+                            for (j=1;j<=5;j++) {
+                                value=(i==0 ? h[j] : a[i,j])
+                                printf "%-*s  ",w[j],value
+                            }
+                            print (i==0 ? h[6] : a[i,6])
+                        }
+                    }
+                ' "$OUTPUT_DIR/estimated_actual.tsv"
                 printf '\n========== END ESTIMATED / ACTUAL ROWS ==========\n'
             fi
             print_saved_result "index_io_delta.txt" "GLOBAL INDEX I/O BEFORE / AFTER DELTA"
