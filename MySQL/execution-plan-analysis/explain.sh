@@ -33,6 +33,7 @@ EXPLAIN_SCHEMA=""
 SCHEMA_CLAUSE=""
 ANALYSIS_MODE="SQL"
 CONNECTION_ID=""
+DIGEST_ID=""
 PRINT_PLAN=1
 OUTPUT_DIR=""
 SQL_TEXT=""
@@ -78,6 +79,7 @@ Analysis:
   --show-warnings             Optimizer rewritten SQL (SHOW WARNINGS)
   --schema NAME               EXPLAIN FOR SCHEMA NAME
   --for-connection ID         Inspect running connection (instead of SQL file)
+  --digest HEX                Read-only Performance Schema digest summary (64 hex)
   --check-only                Connection / capability precheck only
   --output DIR                Report output directory
   --no-print-plan             Save results without displaying plans/ANALYZE/warnings
@@ -184,12 +186,27 @@ read_sql() {
         SQL_TEXT="$(cat "$SQL_FILE")"
     fi
 
-    [ -n "$SQL_TEXT" ] || [ "$CHECK_ONLY" -eq 1 ] || [ "$ANALYSIS_MODE" = "CONNECTION" ] || die "SQL input required"
+    [ -n "$SQL_TEXT" ] || [ "$CHECK_ONLY" -eq 1 ] || [ "$ANALYSIS_MODE" = "CONNECTION" ] || [ "$ANALYSIS_MODE" = "DIGEST" ] || die "SQL input required"
 
     if [ -n "$SQL_TEXT" ]; then
         SQL_TEXT="$(printf '%s' "$SQL_TEXT" | sed 's/[[:space:]]*;[[:space:]]*$//')"
+        # Conservative SQL check: reject any interior semicolon, including one
+        # inside a quoted literal (rather than risk accidental multi-statement
+        # execution under differing sql_mode settings).
         case "$SQL_TEXT" in
             *';'*) die "Multiple SQL statements / embedded semicolons are not accepted" ;;
+        esac
+        # mysql -e processes client commands in addition to SQL. Refuse any
+        # line that can be interpreted as a client meta-command.
+        if printf '%s\n' "$SQL_TEXT" | grep -Eq '^[[:space:]]*\\'; then
+            die "MySQL client backslash commands are not accepted in SQL input"
+        fi
+        if printf '%s\n' "$SQL_TEXT" | grep -Eiq '^[[:space:]]*(DELIMITER|SOURCE)[[:space:]]+'; then
+            die "MySQL client SOURCE/DELIMITER commands are not accepted"
+        fi
+        case "$(statement_type)" in
+            SELECT|TABLE|WITH|INSERT|UPDATE|DELETE|REPLACE) ;;
+            *) die "SQL input must be a single EXPLAIN-able SELECT/TABLE/WITH/INSERT/UPDATE/DELETE/REPLACE" ;;
         esac
     fi
 }
@@ -341,15 +358,22 @@ menu_choice() {
 
 choose_analysis_options() {
     # Reject incompatible explicit input in both interactive and --batch modes.
-    if [ -n "$CONNECTION_ID" ] && { [ -n "$SQL_FILE" ] || [ -n "$SQL_TEXT" ]; }; then
-        die "Cannot combine --file/--sql with --for-connection"
+    if [ -n "$CONNECTION_ID" ] && { [ -n "$SQL_FILE" ] || [ -n "$SQL_TEXT" ] || [ -n "$DIGEST_ID" ]; }; then
+        die "Cannot combine --for-connection with SQL/DIGEST inputs"
     fi
+    if [ -n "$DIGEST_ID" ] && { [ -n "$SQL_FILE" ] || [ -n "$SQL_TEXT" ]; }; then
+        die "Cannot combine --digest with --file/--sql"
+    fi
+    if [ -n "$DIGEST_ID" ]; then ANALYSIS_MODE="DIGEST"; fi
     if [ "$BATCH_MODE" -eq 0 ] && [ "$CHECK_ONLY" -eq 0 ]; then
         [ -t 0 ] || die "Interactive menu requires TTY. Use --batch for automated execution."
         printf '\n========== MySQL EXPLAIN Analysis ==========\n' >&2
         # An explicit SQL input or Connection ID already identifies the target.
         # Ask only when neither was supplied by the caller.
-        if [ -n "$SQL_FILE" ] || [ -n "$SQL_TEXT" ]; then
+        if [ -n "$DIGEST_ID" ]; then
+            ANALYSIS_MODE="DIGEST"
+            printf 'Target: Performance Schema Digest (specified by argument)\n' >&2
+        elif [ -n "$SQL_FILE" ] || [ -n "$SQL_TEXT" ]; then
             [ -z "$CONNECTION_ID" ] ||
                 die "Cannot combine --file/--sql with --for-connection"
             ANALYSIS_MODE="SQL"
@@ -358,10 +382,11 @@ choose_analysis_options() {
             ANALYSIS_MODE="CONNECTION"
             printf 'Target: Running Connection %s (specified by argument)\n' "$CONNECTION_ID" >&2
         else
-            menu_choice "Target: 1) SQL query/file  2) Running Connection : " "1 2"
+            menu_choice "Target: 1) SQL query/file  2) Running Connection  3) Digest summary : " "1 2 3"
             case "$CHOICE" in
                 1) ANALYSIS_MODE="SQL" ;;
                 2) ANALYSIS_MODE="CONNECTION" ;;
+                3) ANALYSIS_MODE="DIGEST" ;;
             esac
         fi
 
@@ -372,7 +397,13 @@ choose_analysis_options() {
         elif [ "$ANALYSIS_MODE" = "CONNECTION" ] && [ -z "$CONNECTION_ID" ]; then
             printf 'Connection ID: ' >&2
             IFS= read -r CONNECTION_ID || die "Connection ID input cancelled"
+        elif [ "$ANALYSIS_MODE" = "DIGEST" ] && [ -z "$DIGEST_ID" ]; then
+            printf 'Performance Schema Digest SHA-256 (64 hex characters): ' >&2
+            IFS= read -r DIGEST_ID || die "Digest input cancelled"
         fi
+        if [ "$ANALYSIS_MODE" = "DIGEST" ]; then
+            printf 'Digest mode is read-only and does not run EXPLAIN/ANALYZE.\n' >&2
+        else
         menu_choice "EXPLAIN FORMAT: 1) TRADITIONAL  2) TREE  3) JSON  4) ALL : " "1 2 3 4"
         case "$CHOICE" in
             1) EXPLAIN_FORMAT=TRADITIONAL ;;
@@ -425,6 +456,7 @@ choose_analysis_options() {
             EXPLAIN_SCHEMA=""
             printf 'FOR CONNECTION cannot run EXPLAIN ANALYZE or FOR SCHEMA.\n' >&2
         fi
+        fi
     fi
     EXPLAIN_FORMAT="$(printf '%s' "$EXPLAIN_FORMAT" | tr '[:lower:]' '[:upper:]')"
     ANALYZE_FORMAT="$(printf '%s' "$ANALYZE_FORMAT" | tr '[:lower:]' '[:upper:]')"
@@ -436,6 +468,11 @@ choose_analysis_options() {
     esac
     [ "$ANALYZE_TIMEOUT_MS" -gt 0 ] && [ "$ANALYZE_TIMEOUT_MS" -le 4294967295 ] ||
         die "ANALYZE timeout must be 1..4294967295 milliseconds"
+    if [ "$ANALYSIS_MODE" = "DIGEST" ]; then
+        printf '%s\n' "$DIGEST_ID" | grep -Eq '^[[:xdigit:]]{64}$' ||
+            die "Digest must be 64 hexadecimal characters"
+        DIGEST_ID="$(printf '%s' "$DIGEST_ID" | tr '[:lower:]' '[:upper:]')"
+    fi
     if [ "$ANALYSIS_MODE" = "CONNECTION" ]; then
         printf '%s\n' "$CONNECTION_ID" | grep -Eq '^[1-9][0-9]*$' ||
             die "Connection ID must be a positive integer"
@@ -447,6 +484,39 @@ choose_analysis_options() {
         [ "$ANALYSIS_MODE" = "SQL" ] || die "FOR SCHEMA incompatible with FOR CONNECTION"
         SCHEMA_CLAUSE="FOR SCHEMA \`$EXPLAIN_SCHEMA\` "
     fi
+}
+
+collect_digest_report() {
+    log "[DIGEST] Read-only Performance Schema statement summary"
+    DIGEST_SCHEMA_FILTER=""
+    if [ -n "$MYSQL_DATABASE" ]; then
+        DIGEST_DB_HEX="$(hex_utf8 "$MYSQL_DATABASE")"
+        DIGEST_SCHEMA_FILTER="AND SCHEMA_NAME=CONVERT(0x$DIGEST_DB_HEX USING utf8mb4)"
+    fi
+    DIGEST_QUERY="SELECT SCHEMA_NAME, DIGEST, DIGEST_TEXT, COUNT_STAR,
+       ROUND(AVG_TIMER_WAIT/1000000000,3) AS avg_ms,
+       ROUND(SUM_TIMER_WAIT/1000000000,3) AS total_ms,
+       ROUND(SUM_LOCK_TIME/1000000000,3) AS lock_total_ms,
+       SUM_ROWS_EXAMINED, SUM_ROWS_SENT, SUM_NO_INDEX_USED,
+       SUM_ERRORS, SUM_WARNINGS, FIRST_SEEN, LAST_SEEN
+FROM performance_schema.events_statements_summary_by_digest
+WHERE DIGEST='$DIGEST_ID' $DIGEST_SCHEMA_FILTER
+ORDER BY COUNT_STAR DESC;"
+    if ! mysql_exec "$DIGEST_QUERY" --batch --raw \
+      > "$OUTPUT_DIR/digest_summary.txt" 2> "$OUTPUT_DIR/digest_summary.err"; then
+        die "Digest summary query failed; see $OUTPUT_DIR/digest_summary.err"
+    fi
+    if [ "$(wc -l < "$OUTPUT_DIR/digest_summary.txt")" -le 1 ]; then
+        die "Digest not found, schema filter excludes it, or Performance Schema digest collection is disabled"
+    fi
+    {
+        printf 'MySQL Performance Schema Digest Summary\n'
+        printf 'Script Version : %s\n' "$VERSION"
+        printf 'Digest         : %s\n' "$DIGEST_ID"
+        printf 'Schema filter  : %s\n' "\${MYSQL_DATABASE:-all schemas}"
+        printf 'SQL execution  : NONE (aggregated digest only)\n'
+        printf 'Note: normalized DIGEST_TEXT has no original literal/bind values.\n'
+    } > "$OUTPUT_DIR/summary.txt"
 }
 
 collect_connection_plan() {
@@ -961,6 +1031,9 @@ print_console_results() {
     print_saved_result "explain_tree.txt" "EXPLAIN FORMAT=TREE"
     print_saved_result "explain.json" "EXPLAIN FORMAT=JSON"
 
+    if [ "$ANALYSIS_MODE" = "DIGEST" ]; then
+        print_saved_result "digest_summary.txt" "PERFORMANCE SCHEMA DIGEST SUMMARY"
+    fi
     if [ "$ANALYSIS_MODE" = "SQL" ]; then
         if [ "$ANALYZE" -eq 1 ]; then
             print_saved_result "explain_analyze.txt" "EXPLAIN ANALYZE FORMAT=$ANALYZE_FORMAT"
@@ -1116,6 +1189,17 @@ ${1#*=}"
             ANALYSIS_MODE="CONNECTION"
             shift 2
             ;;
+        --digest)
+            [ "$#" -ge 2 ] || die "--digest requires 64 hex characters"
+            DIGEST_ID="$2"
+            ANALYSIS_MODE="DIGEST"
+            shift 2
+            ;;
+        --digest=*)
+            DIGEST_ID="${1#*=}"
+            ANALYSIS_MODE="DIGEST"
+            shift
+            ;;
         --batch)
             BATCH_MODE=1
             shift
@@ -1186,6 +1270,13 @@ if ! mysql_raw "SELECT 1;" >/dev/null 2> "$OUTPUT_DIR/connection.err"; then
 fi
 
 collect_precheck
+
+if [ "$ANALYSIS_MODE" = "DIGEST" ]; then
+    collect_digest_report
+    log "Done: $OUTPUT_DIR"
+    print_console_results
+    exit 0
+fi
 
 if [ "$ANALYSIS_MODE" = "CONNECTION" ]; then
     collect_connection_plan
