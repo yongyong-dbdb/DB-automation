@@ -1131,7 +1131,7 @@ $INDEX_IO_AFTER_SQL"
     awk '/^##EVENT##/ {print}' "$TMP_DIR/analyze_all.txt" > "$OUTPUT_DIR/thread_statement_event.txt"
     awk '/^##METRIC##/ {sub(/^##METRIC##/,"");print}' \
       "$TMP_DIR/analyze_all.txt" > "$OUTPUT_DIR/estimated_actual.tsv"
-    awk 'NR>1 && $0 !~ /^##SESSION##/ && $0 !~ /^##EVENT##/ && $0 !~ /^##METRIC##/ && $0 !~ /^##IDXDELTA##/ && $0 !~ /^(Warning|Error|Note)[[:space:]]+[0-9]+[[:space:]]/ {print}' \
+    awk 'NR>1 && $0 !~ /^##SESSION##/ && $0 !~ /^##EVENT##/ && $0 !~ /^##METRIC##/ && $0 !~ /^##IDXDELTA##/ && $0 !~ /^##IODETAIL##/ && $0 !~ /^##IOLIMIT##/ && $0 !~ /^(Warning|Error|Note)[[:space:]]+[0-9]+[[:space:]]/ {print}' \
       "$TMP_DIR/analyze_all.txt" > "$OUTPUT_DIR/explain_analyze.txt"
 
     if [ "$ANALYZE_FORMAT" = "TREE" ]; then
