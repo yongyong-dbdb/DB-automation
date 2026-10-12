@@ -894,6 +894,19 @@ WHERE JSON_LENGTH(@diag_ops)=JSON_LENGTH(@diag_est)
 ORDER BY o.n;"
     fi
 
+    # Capture warnings immediately after ANALYZE, BEFORE prepared DEALLOCATE
+    # or any later SELECT clears the statement diagnostic area.
+    ANALYZE_RUN_SQL="$(prepare_diagnostic_sql "$ANALYZE_STATEMENT")"
+    if [ "$BIND_COUNT" -gt 0 ]; then
+        ANALYZE_RUN_SQL="$(printf '%s\n' "$ANALYZE_RUN_SQL" | awk '
+            /^DEALLOCATE PREPARE diag_explain_stmt;/ { print "SHOW WARNINGS;"; print; next }
+            { print }
+        ')"
+    else
+        ANALYZE_RUN_SQL="$ANALYZE_RUN_SQL
+SHOW WARNINGS;"
+    fi
+
     # EXPLAIN and the Performance Schema snapshot share one server session.
     # A prepared EXPLAIN is tracked as execute_sql, not dealloc_sql.
     ANALYZE_SQL="$INIT
@@ -905,7 +918,7 @@ SET @diag_thread = (
   WHERE PROCESSLIST_ID = CONNECTION_ID()
 );
 SELECT CONCAT('##SESSION##', CONNECTION_ID(), '|', COALESCE(@diag_thread,'NULL'));
-$(prepare_diagnostic_sql "$ANALYZE_STATEMENT")
+$ANALYZE_RUN_SQL
 $AFTER_SQL
 SELECT CONCAT('##EVENT##',COALESCE((
   SELECT CONCAT_WS('|',EVENT_ID,EVENT_NAME,
@@ -938,11 +951,20 @@ $INDEX_IO_AFTER_SQL"
         fi
     } > "$OUTPUT_DIR/index_io_delta.txt"
 
+    awk -F '\t' '($1=="Warning" || $1=="Error" || $1=="Note") && $2 ~ /^[0-9]+$/ {print}' \
+        "$TMP_DIR/analyze_all.txt" > "$OUTPUT_DIR/analyze_warnings.txt"
+    # MySQL 9.7 can return success with Warning 1317 when a timed
+    # EXPLAIN ANALYZE was interrupted. Never treat it as a valid full plan.
+    if grep -Eq '^(Warning|Error)[[:space:]]+(1317|3024)[[:space:]]' "$OUTPUT_DIR/analyze_warnings.txt"; then
+        warn "EXPLAIN ANALYZE was interrupted or timed out; partial plan is not a successful analysis"
+        DIAG_ERRORS=1
+    fi
+
     awk '/^##SESSION##/ {print}' "$TMP_DIR/analyze_all.txt" > "$OUTPUT_DIR/analyze_session.txt"
     awk '/^##EVENT##/ {print}' "$TMP_DIR/analyze_all.txt" > "$OUTPUT_DIR/thread_statement_event.txt"
     awk '/^##METRIC##/ {sub(/^##METRIC##/,"");print}' \
       "$TMP_DIR/analyze_all.txt" > "$OUTPUT_DIR/estimated_actual.tsv"
-    awk 'NR>1 && $0 !~ /^##SESSION##/ && $0 !~ /^##EVENT##/ && $0 !~ /^##METRIC##/ && $0 !~ /^##IDXDELTA##/ {print}' \
+    awk 'NR>1 && $0 !~ /^##SESSION##/ && $0 !~ /^##EVENT##/ && $0 !~ /^##METRIC##/ && $0 !~ /^##IDXDELTA##/ && $0 !~ /^(Warning|Error|Note)[[:space:]]+[0-9]+[[:space:]]/ {print}' \
       "$TMP_DIR/analyze_all.txt" > "$OUTPUT_DIR/explain_analyze.txt"
 
     if [ "$ANALYZE_FORMAT" = "TREE" ]; then
@@ -988,6 +1010,7 @@ write_summary() {
         printf 'Analyze        : %s\n' "$ANALYZE"
         printf 'Analyze TX     : %s\n' "START TRANSACTION READ ONLY / ROLLBACK"
         printf 'Analyze Timeout: %s ms\n' "$ANALYZE_TIMEOUT_MS"
+        printf 'ANALYZE warnings: %s\n' "see analyze_warnings.txt"
         printf 'DML Analyze    : disabled (safety / SQL restrictions)\n'
         printf 'P_S metrics    : same-session THREAD_ID statement event\n'
         printf 'Optimizer Trace: %s\n' "$OPTIMIZER_TRACE"
