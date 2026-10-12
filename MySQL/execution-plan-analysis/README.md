@@ -6,7 +6,7 @@ MySQL Optimizer 실행계획과 Connection / Thread 기반 Performance Schema �
 
 선택한 `EXPLAIN FORMAT` 출력, 내부 JSON Plan 기반 Object 진단, Table/Index 통계, Column Histogram, Index I/O 누적값, 동일 Connection에서 수집한 `EXPLAIN ANALYZE` Statement Event, Optimizer Trace 원본 수집 기능 포함.
 
-> 현재 구현 버전: `v0.5.2`
+> 현재 구현 버전: `v0.6.0`
 
 실행 파일:
 
@@ -23,7 +23,9 @@ explain.sh
 - 대화형 메뉴 선택 지원(TTY), 비대화형 기본값 `TRADITIONAL`
 - 내부 Table 추출용 JSON Plan 별도 수집
 - `--analyze-format TREE|JSON` 실제 실행계획 형식 별도 선택
-- `EXPLAIN ANALYZE`
+- `EXPLAIN ANALYZE`: READ ONLY 트랜잭션 + 시간 제한(기본 30,000ms) + ROLLBACK
+- ANALYZE 전후 동일 Connection에서 Global Index I/O Counter Delta 수집
+- Performance Schema Digest 조회 (집계 정보만 조회, SQL 재실행 없음)
 - MySQL Server JSON 함수 기반 Schema-qualified Base Table 자동 추출
 - 타입 명시 Bind Parameter (`PREPARE → EXECUTE USING`)
 - CTE 선행 SELECT의 Query Type 확인
@@ -65,16 +67,19 @@ stty
 
 | 순서 | 선택 항목 | 메뉴 |
 | --- | --- | --- |
-| 1 | 분석 대상 (미지정 시에만 질문) | SQL File/Query 또는 실행 중인 Connection |
+| 1 | 분석 대상 (미지정 시에만 질문) | SQL File/Query / 실행 중인 Connection / Digest 집계 |
 | 2 | EXPLAIN FORMAT | TRADITIONAL / TREE / JSON / ALL |
 | 3 | EXPLAIN ANALYZE | No / Yes (실제 SQL 실행) |
 | 4 | ANALYZE FORMAT | TREE / JSON v2 (Yes일 때만 표시) |
 | 5 | 실제 SQL 실행 최종 확인 | 취소 / 실행 (Yes일 때만 표시) |
+| 5-1 | ANALYZE 실행 제한 시간 | 5초 / 30초 / 60초 / 직접 밀리초 입력 |
 | 6 | Optimizer Trace | No / Yes |
 | 7 | SHOW WARNINGS | No / Yes — Optimizer Rewrite SQL 수집 |
 | 8 | FOR SCHEMA | 기본 Database 사용 / 별도 Schema 입력 |
 
 `--for-connection ID`를 지정했다면 Connection ID는 다시 입력하지 않음. 대상 미지정 상태에서 `FOR CONNECTION`을 선택한 경우에만 ID 입력. `--file`/`--sql`과 `--for-connection`은 동시 지정 불가.
+
+`Digest`를 선택하면 SHA-256 Digest 값을 입력받아 Performance Schema 집계만 조회. 원본 SQL·Bind를 재구성하거나 EXPLAIN ANALYZE를 실행하지 않음.
 
 `FOR CONNECTION`을 선택하면 Connection ID와 FORMAT만 입력. 실행 중인 Connection의 Plan을 조회하며, `ANALYZE`·`FOR SCHEMA`는 호환되지 않으므로 제공하지 않음.
 
@@ -183,12 +188,14 @@ sh explain.sh \
 | `--no-password` | Password Prompt 생략 |
 | `--format NAME` | `TRADITIONAL`, `TREE`, `JSON`, `ALL` 중 선택 |
 | `--analyze-format NAME` | `TREE`(기본) / `JSON`(지원 버전의 JSON v2 필요) |
-| `--analyze` | SELECT/TABLE 대상 `EXPLAIN ANALYZE` 수행 |
+| `--analyze` | SELECT/TABLE 대상 `EXPLAIN ANALYZE` 수행(READ ONLY 트랜잭션) |
+| `--analyze-timeout-ms N` | SELECT 시간 제한(밀리초, 기본 30000, 1~4294967295) |
 | `--analyze-dml` | 안전 문제로 차단. DML은 기본 `EXPLAIN`만 수행 |
 | `--optimizer-trace` | Optimizer Trace 수집 |
 | `--show-warnings` | EXPLAIN 직후 SHOW WARNINGS로 SQL Rewrite 수집 |
 | `--schema NAME` | EXPLAIN FOR SCHEMA (입력 SQL의 기본 Schema 지정) |
 | `--for-connection ID` | 실행 중인 Connection의 예상 실행계획 조회 (PROCESS 권한 필요할 수 있음) |
+| `--digest SHA256` | Performance Schema의 정규화 SQL Digest 집계 조회. SQL 실행 없음 |
 | `--check-only` | 접속 / 기본 Capability 확인만 수행 |
 | `--output DIR` | 결과 Directory 지정 |
 | `--no-print-plan` | 선택한 EXPLAIN/ANALYZE/WARNINGS의 터미널 출력 생략(파일 저장 유지) |
@@ -215,6 +222,11 @@ InnoDB Table / Index Statistics, Histogram 조회
 Performance Schema Index I/O 누적 통계 확인
   ↓
 선택적 EXPLAIN ANALYZE (TREE 또는 JSON v2)
+  ├─ START TRANSACTION READ ONLY
+  ├─ max_execution_time(기본 30000ms)
+  ├─ Global Index I/O Counter Before / After
+  ├─ SHOW WARNINGS로 중단·시간 초과 감지
+  └─ ROLLBACK
   ↓
 동일 Connection ID → Performance Schema THREAD_ID 매핑
   ↓
@@ -317,13 +329,61 @@ Optimizer Trace 내부 형식은 MySQL Version에 따라 변경 가능하므로 
 | `index_definitions.txt` | Index 정의 / Cardinality |
 | `column_histograms.txt` | Column Histogram |
 | `index_io.txt` | 누적 Index I/O |
-| `index_io_delta.txt` | 비수집 안내(전역 지표의 SQL별 귀속 오류 방지) |
+| `index_io_delta.txt` | ANALYZE 직전·직후 Global Index I/O의 Read/Fetch/Write/Wait Delta (타 세션 포함 가능) |
 | `analyze_session.txt` | 실제 ANALYZE Connection ID / P_S THREAD_ID |
 | `thread_statement_event.txt` | 실제 ANALYZE의 동일 Thread Statement Event |
+| `analyze_warnings.txt` | ANALYZE 직후의 Warning. 중단·시간 초과 감지 시 실패 처리 |
+| `digest_summary.txt` | DIGEST_TEXT·실행 횟수·평균/총 실행 시간·Rows·인덱스 사용 관련 누적 통계 |
 | `optimizer_trace.txt` | Optimizer Trace 및 실행계획 수집 원본 |
 | `show_warnings.txt` | SHOW WARNINGS에 나타난 Rewrite Note/Warning |
 | `explain_connection.err` | FOR CONNECTION 조회 실패 시 오류 |
 | `diagnostic_errors.txt` | Table/Index/Histogram 진단 SQL 오류(발생 시) |
+
+## 안전 실행·실행 시간 제한 (v0.6.0)
+
+- `EXPLAIN ANALYZE`는 **새 MySQL Client Session에서** `START TRANSACTION READ ONLY` → ANALYZE 1회 실행 → 같은 Session의 Performance Schema 조회 → `ROLLBACK` 순서 수행
+- SQL 오류나 접속 중단으로 세션이 종료되면 MySQL이 미완료 트랜잭션을 롤백. 외부 UDF/Stored Function 부작용까지 되돌리지는 못함
+- `SET SESSION max_execution_time=<ms>`: 기본 30,000ms. 대화형에서는 5초·30초·60초·직접 입력 선택. `--batch --analyze-timeout-ms 5000` 가능
+- `max_execution_time`은 MySQL에서 지원하는 SELECT 범위에 적용. 트랜잭션 전체 또는 모든 Stored Routine/UDF의 시간 초과를 보장하지 않음
+- MySQL 9.7.2에서는 실행 중단 시 **종료 코드 0과 Warning 1317**이 함께 발생할 수 있음. ANALYZE 직후 `SHOW WARNINGS`로 1317/3024 확인하여 실패 처리
+- 실제 ANALYZE를 중복 실행하지 않으며 기존 1회 실행 정책 유지
+
+## Before/After Index I/O (v0.6.0)
+
+- ANALYZE 전후 같은 MySQL Session에서 `performance_schema.table_io_waits_summary_by_index_usage`의 대상 Schema·Table·Index별 누적값 비교
+- `COUNT_READ`, `COUNT_FETCH`, `COUNT_WRITE`, `SUM_TIMER_WAIT` 차이 확인(Wait은 ms 변환)
+- `index_io_delta.txt`에 저장하고 터미널에도 출력(단 `--no-print-plan` 시 저장만)
+- **인스턴스 전역 누적값**이므로 다른 Connection의 동시 작업 포함 가능. SQL 단독 I/O로 단정하면 안 됨
+
+## MySQL Digest 집계 조회 (v0.6.0)
+
+Performance Schema `events_statements_summary_by_digest`의 **정규화 SQL 집계** 조회. PostgreSQL `pg_stat_statements`의 Query ID와 유사한 분석 목적이나, 원본 Literal·Bind·Session 설정까지 복원할 수는 없음.
+
+```sql
+SELECT SCHEMA_NAME, DIGEST, DIGEST_TEXT,
+       COUNT_STAR, ROUND(AVG_TIMER_WAIT/1000000000,3) AS avg_ms
+FROM performance_schema.events_statements_summary_by_digest
+WHERE DIGEST IS NOT NULL
+ORDER BY SUM_TIMER_WAIT DESC LIMIT 10;
+```
+
+```bash
+sh explain.sh --batch --digest <64자리_SHA256_DIGEST> \
+  --login-path remote_mysql
+```
+
+- `--database DB` 지정 시 `SCHEMA_NAME=DB`로 필터링. 미지정 시 여러 DB에 동일 Digest가 있으면 모두 출력
+- `digest_summary.txt`: 호출 횟수, 평균·총 실행 시간, Lock Time, Rows Examined/Sent, 인덱스 미사용 횟수, 오류·경고, FIRST/LAST_SEEN
+- **Digest 모드는 Read-only 통계 조회이며 EXPLAIN/ANALYZE 실행 없음.** Digest만으로 원래 Bind를 가정해 실행하는 기능은 의도적으로 미지원
+- Performance Schema Digest 수집이 비활성화된 환경에서는 결과가 없을 수 있음
+
+## SQL 입력 검증 (v0.6.0)
+
+- SQL 파일 또는 `--sql`은 단일 Statement만 허용. 끝 세미콜론 하나는 허용하되 내부 세미콜론(문자열 포함)도 보수적으로 거부
+- MySQL Client 백슬래시 명령과 `SOURCE`/`DELIMITER` 명령 차단
+- SELECT/TABLE/WITH/INSERT/UPDATE/DELETE/REPLACE만 일반 EXPLAIN 시도
+- ANALYZE는 기존처럼 SELECT/TABLE만 허용. WITH는 JSON Plan의 query_type이 select일 때 허용
+- 완전한 SQL Parser가 아니므로 SELECT 내 Stored Function/UDF 등 외부 부작용은 완전하게 검증하지 못함
 
 ## 현재 제한 사항
 
@@ -334,8 +394,16 @@ Optimizer Trace 내부 형식은 MySQL Version에 따라 변경 가능하므로 
 - Row 오차 배율 = `Actual Rows (Loop당 평균) / Estimated Rows`. `loops>1`은 별도 해석 필요
 - 단순 `?` Bind 지원. 복잡한 SQL Placeholder의 정적 위치 파싱/의미 분석 및 Application Prepared Statement 실행 이력 재현 기능 없음
 - Performance Schema Statement History 및 Instrument 설정에 따라 Thread Event 미수집 가능
-- 인스턴스 전역 Index I/O는 개별 SQL의 기여분으로 귀속하지 않음
+- Index I/O Delta는 인스턴스 전역 누적값의 Before/After 차이일 뿐 개별 SQL의 기여분으로 귀속하지 않음
 - Column Histogram/인덱스 변경 권고 자동 수행 없음. DML ANALYZE 차단
+
+## 변경사항 검증 (v0.6.0)
+
+- MySQL 9.7.2에서 READ ONLY 트랜잭션 내부 TREE/JSON ANALYZE 성공, Typed Bind JSON ANALYZE 정상
+- 동일 Session에서 Index I/O Before/After Read/Fetch/Wait Delta 확인
+- 시간 초과·중단 Warning 1317이 발생할 수 있음을 확인하고 실패 처리 로직 추가
+- Performance Schema SHA-256 Digest 집계 조회 성공. SQL 실행 없음
+- 복수 SQL, Client 메타 명령, 비 EXPLAIN Statement 입력 차단 검증
 
 ## 선택 결과 터미널 출력 검증 (v0.5.2)
 
