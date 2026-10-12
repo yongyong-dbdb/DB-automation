@@ -723,6 +723,56 @@ SET optimizer_trace='enabled=off';"
     fi
 }
 
+build_index_io_delta_sql() {
+    INDEX_IO_BEFORE_SQL=""
+    INDEX_IO_AFTER_SQL=""
+    INDEX_IO_READY=0
+    [ -s "$OUTPUT_DIR/objects.tsv" ] || return 0
+    IO_FILTER="0"
+    while IFS="$(printf '\t')" read -r OBJ_SCHEMA OBJ_TABLE; do
+        [ -n "$OBJ_SCHEMA" ] && [ -n "$OBJ_TABLE" ] || continue
+        IO_SCHEMA_HEX="$(hex_utf8 "$OBJ_SCHEMA")"
+        IO_TABLE_HEX="$(hex_utf8 "$OBJ_TABLE")"
+        IO_FILTER="$IO_FILTER OR (OBJECT_SCHEMA=CONVERT(0x$IO_SCHEMA_HEX USING utf8mb4) AND OBJECT_NAME=CONVERT(0x$IO_TABLE_HEX USING utf8mb4))"
+    done < "$OUTPUT_DIR/objects.tsv"
+    [ "$IO_FILTER" != "0" ] || return 0
+    INDEX_IO_READY=1
+
+    # Performance Schema index I/O counters are GLOBAL for a table/index,
+    # even when sampled before/after by this diagnostic connection.
+    INDEX_IO_BEFORE_SQL="SET @diag_io_before=(
+      SELECT COALESCE(JSON_ARRAYAGG(JSON_OBJECT(
+        'db',OBJECT_SCHEMA, 'tbl',OBJECT_NAME,
+        'idx',COALESCE(INDEX_NAME,'<NO_INDEX>'),
+        'nread',COUNT_READ, 'nfetch',COUNT_FETCH,
+        'nwrite',COUNT_WRITE, 'nwait',SUM_TIMER_WAIT
+      )), JSON_ARRAY())
+      FROM performance_schema.table_io_waits_summary_by_index_usage
+      WHERE ($IO_FILTER)
+    );"
+
+    INDEX_IO_AFTER_SQL="
+SELECT CONCAT('##IDXDELTA##',CONCAT_WS(CHAR(9),
+       b.db_name,b.table_name,b.index_name,
+       CAST(p.COUNT_READ AS DECIMAL(30,0))-b.nread,
+       CAST(p.COUNT_FETCH AS DECIMAL(30,0))-b.nfetch,
+       CAST(p.COUNT_WRITE AS DECIMAL(30,0))-b.nwrite,
+       ROUND((CAST(p.SUM_TIMER_WAIT AS DECIMAL(30,0))-b.nwait)/1000000000,3)))
+FROM JSON_TABLE(@diag_io_before, '$[*]' COLUMNS(
+  db_name VARCHAR(128) PATH '$.db',
+  table_name VARCHAR(128) PATH '$.tbl',
+  index_name VARCHAR(128) PATH '$.idx',
+  nread DECIMAL(30,0) PATH '$.nread',
+  nfetch DECIMAL(30,0) PATH '$.nfetch',
+  nwrite DECIMAL(30,0) PATH '$.nwrite',
+  nwait DECIMAL(30,0) PATH '$.nwait'
+)) AS b
+JOIN performance_schema.table_io_waits_summary_by_index_usage p
+  ON p.OBJECT_SCHEMA=b.db_name AND p.OBJECT_NAME=b.table_name
+ AND COALESCE(p.INDEX_NAME,'<NO_INDEX>')=b.index_name
+ORDER BY b.db_name,b.table_name,b.index_name;"
+}
+
 run_explain_analyze() {
     TYPE="$1"
     case "$TYPE" in
@@ -733,6 +783,7 @@ run_explain_analyze() {
             ;;
     esac
 
+    build_index_io_delta_sql
     log "[ANALYZE] $ANALYZE_FORMAT (READ ONLY transaction, max_execution_time=${ANALYZE_TIMEOUT_MS}ms)"
     warn "ANALYZE executes SELECT; MySQL max_execution_time is limited to supported SELECT statements and does not undo external side effects"
     INIT=""
@@ -778,6 +829,7 @@ ORDER BY o.n;"
     ANALYZE_SQL="$INIT
 SET SESSION max_execution_time=$ANALYZE_TIMEOUT_MS;
 START TRANSACTION READ ONLY;
+$INDEX_IO_BEFORE_SQL
 SET @diag_thread = (
   SELECT THREAD_ID FROM performance_schema.threads
   WHERE PROCESSLIST_ID = CONNECTION_ID()
@@ -796,7 +848,8 @@ SELECT CONCAT('##EVENT##',COALESCE((
     AND EVENT_NAME IN ('statement/sql/select', 'statement/sql/execute_sql')
   ORDER BY EVENT_ID DESC LIMIT 1
 ),'NOT_COLLECTED'));
-ROLLBACK;"
+ROLLBACK;
+$INDEX_IO_AFTER_SQL"
 
     if ! mysql_raw "$ANALYZE_SQL" > "$TMP_DIR/analyze_all.txt" \
       2> "$OUTPUT_DIR/explain_analyze.err"; then
@@ -805,11 +858,21 @@ ROLLBACK;"
         return 0
     fi
 
+    {
+        printf '%s\n' 'Scope: global Performance Schema index I/O counters (other sessions may contribute).'
+        printf '%s\n' 'Read/Fetch/Write deltas are counter differences; Wait delta is milliseconds.'
+        printf 'Schema\tTable\tIndex\tRead Delta\tFetch Delta\tWrite Delta\tWait Delta (ms)\n'
+        awk '/^##IDXDELTA##/ {sub(/^##IDXDELTA##/,"");print}' "$TMP_DIR/analyze_all.txt"
+        if [ "$INDEX_IO_READY" -eq 0 ]; then
+            printf '%s\n' 'No eligible base tables in the current JSON plan.'
+        fi
+    } > "$OUTPUT_DIR/index_io_delta.txt"
+
     awk '/^##SESSION##/ {print}' "$TMP_DIR/analyze_all.txt" > "$OUTPUT_DIR/analyze_session.txt"
     awk '/^##EVENT##/ {print}' "$TMP_DIR/analyze_all.txt" > "$OUTPUT_DIR/thread_statement_event.txt"
     awk '/^##METRIC##/ {sub(/^##METRIC##/,"");print}' \
       "$TMP_DIR/analyze_all.txt" > "$OUTPUT_DIR/estimated_actual.tsv"
-    awk 'NR>1 && $0 !~ /^##SESSION##/ && $0 !~ /^##EVENT##/ && $0 !~ /^##METRIC##/ {print}' \
+    awk 'NR>1 && $0 !~ /^##SESSION##/ && $0 !~ /^##EVENT##/ && $0 !~ /^##METRIC##/ && $0 !~ /^##IDXDELTA##/ {print}' \
       "$TMP_DIR/analyze_all.txt" > "$OUTPUT_DIR/explain_analyze.txt"
 
     if [ "$ANALYZE_FORMAT" = "TREE" ]; then
@@ -839,8 +902,6 @@ ROLLBACK;"
         ' "$OUTPUT_DIR/explain_analyze.txt" > "$OUTPUT_DIR/estimated_actual.tsv"
     fi
 
-    printf '%s\n' 'Not collected: index I/O counters are global across all server threads.' \
-      > "$OUTPUT_DIR/index_io_delta.txt"
 }
 
 write_summary() {
@@ -909,6 +970,7 @@ print_console_results() {
                 cat "$OUTPUT_DIR/estimated_actual.tsv"
                 printf '\n========== END ESTIMATED / ACTUAL ROWS ==========\n'
             fi
+            print_saved_result "index_io_delta.txt" "GLOBAL INDEX I/O BEFORE / AFTER DELTA"
         fi
         if [ "$SHOW_REWRITE" -eq 1 ]; then
             print_saved_result "show_warnings.txt" "SHOW WARNINGS (OPTIMIZER REWRITE)"
