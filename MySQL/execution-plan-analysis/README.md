@@ -6,7 +6,7 @@ MySQL Optimizer 실행계획과 Connection / Thread 기반 Performance Schema �
 
 선택한 `EXPLAIN FORMAT` 출력, 내부 JSON Plan 기반 Object 진단, Table/Index 통계, Column Histogram, Index I/O 누적값, 동일 Connection에서 수집한 `EXPLAIN ANALYZE` Statement Event, Optimizer Trace 원본 수집 기능 포함.
 
-> 현재 구현 버전: `v0.6.2`
+> 현재 구현 버전: `v0.6.4` (2026-10-14, MySQL 9.7.2 서버 검증)
 
 실행 파일:
 
@@ -248,7 +248,7 @@ Optimizer Trace(별도 동일 세션 흐름) 및 결과 저장
 - `EXPLAIN ANALYZE` 실행과 `events_statements_history` 조회를 **한 mysql 접속 세션에서 수행**
 - Thread Event 수집 비활성화 시 `NOT_COLLECTED`로 표시(임의 추정 금지)
 - `table_io_waits_summary_by_index_usage`: 인스턴스 전체 Thread가 공유하는 누적 통계. 개별 SQL 실행량으로 귀속 금지
-- Global Index I/O Delta 출력 중지. Thread 단위 Statement Event 중심 분석
+- Global Index I/O Delta는 `index_io_delta.txt` 및 콘솔에 출력(`--no-print-plan` 지정 시 파일만 저장). 다른 세션의 I/O가 포함될 수 있으므로 Thread 단위 Statement Event와 구분하여 해석
 
 ## EXPLAIN FORMAT 선택
 
@@ -360,8 +360,8 @@ Optimizer Trace 내부 형식은 MySQL Version에 따라 변경 가능하므로 
 
 - ANALYZE 전후 같은 MySQL Session에서 `performance_schema.table_io_waits_summary_by_index_usage`의 대상 Schema·Table·Index별 누적값 비교. **실제 분석 SQL을 재실행하지 않음**
 - JSON Plan의 객체 중 `mysql`, `performance_schema`, `information_schema`, `sys` 시스템 스키마를 즉시 제외. `performance_schema.data_lock_waits` 같은 가상·Instrumentation 테이블의 0 Delta는 일반 InnoDB 인덱스 I/O와 비교할 수 없으므로 **SKIPPED 및 사유를 터미널과 `index_io_scope.tsv`에 표시**
-- 시스템 스키마 제외 후 최대 6개 테이블에 대해서만 `information_schema.tables`의 Storage Engine을 **한 번의 경량 조회**로 확인. `ENGINE=InnoDB`일 때만 Delta 측정, 다른 엔진·엔진 확인 불가 객체는 건너뜀
-- 대상 테이블이 6개 초과 시 **전체 Delta 수집 생략**, Index I/O 64행 초과 시 **Delta 계산 생략**. 대상이 없으면 기존 ANALYZE만 실행하며 Index I/O Counter Snapshot SQL을 만들지 않음
+- 시스템 스키마 제외 후 후보 객체 최대 64개에 대해 `information_schema.tables`의 Storage Engine을 한 번 조회하고, 확인된 InnoDB 테이블이 최대 6개일 때만 I/O Delta를 수집. `ENGINE=InnoDB`일 때만 Delta 측정, 다른 엔진·엔진 확인 불가 객체는 건너뜀
+- 확인된 InnoDB 테이블이 6개 초과 시 **전체 Delta 수집 생략**, Index I/O 64행 초과 시 **Delta 계산 생략**. 대상이 없으면 기존 ANALYZE만 실행하며 Index I/O Counter Snapshot SQL을 만들지 않음
 - 대상 InnoDB 테이블의 Index Counter만 **최대 65행 읽어 상한 초과 여부를 판단**, Before/After 동일 Session에서 제한된 통계만 비교. 추가적인 Full Table Scan, `ANALYZE TABLE`, 통계 초기화/Reset 작업 없음
 - `index_io_before.tsv`, `index_io_after.tsv`, `index_io_before_after.tsv`에 `COUNT_READ`, `COUNT_FETCH`, `COUNT_WRITE`, `SUM_TIMER_WAIT`의 원본값과 After−Before 저장. `SUM_TIMER_WAIT` 원본은 ps, Delta 출력은 ms
 - `index_io_delta.txt`는 콘솔에서도 표시 (`--no-print-plan`이면 파일만 저장)
@@ -459,6 +459,25 @@ sh explain.sh --batch --digest <64자리_SHA256_DIGEST> \
 - `--batch`에서 JSON ANALYZE 및 Bind/Trace/Warnings 연동 정상
 - TTY 없는 실행에서 `--batch` 미지정 시 명확한 오류
 - SQL 파일의 다중 SQL 문장 차단 확인
+
+## v0.6.4 서버 재검증 (2026-10-14)
+
+검증 인스턴스: MySQL 9.7.2 / 3306. 서버에 저장된 Login Path로 접속. 기존 `diag_explain_a`·`diag_explain_b`의 SELECT만 실행했으며 DB 데이터와 서버 설정은 변경하지 않음.
+
+| 시나리오 | 수행 및 결과 |
+| --- | --- |
+| 셸 문법 | `sh -n` 통과, `--version` 0.6.4 |
+| TREE ANALYZE | `diag_explain_a.customer_probe` / 종료 코드 0 / 실행계획 첫 행 보존 |
+| 통계·Index I/O | Table/Index Stats, `idx_segment` Read Delta 1·Fetch Delta 1 수집 |
+| 내부 마커 | `explain_analyze.txt`에 `##IODETAIL##` 노출 없음 |
+| Cross-Schema JOIN | `diag_explain_a.customer_probe` + `diag_explain_b.order_probe` 모두 식별 |
+| JSON v2 ANALYZE | JOIN의 Nested Loop Estimated 20 / Actual 20 / Loops 1, 종료 코드 0 |
+| 부가 수집 | `--format ALL`, Optimizer Trace, SHOW WARNINGS 정상 종료 |
+| 오류 파일 | 위 두 실행에서 `diagnostic_errors.txt` 비어 있음 |
+
+리포트 경로(검증 서버): `/tmp/explain-validation-20261014-a`, `/tmp/explain-validation-20261014-b`. I/O Delta는 Performance Schema **전역 누적값 차이**이므로 다른 세션 작업이 포함될 수 있음.
+
+**이번 재검증에 포함되지 않은 범위:** MySQL 8.0/8.4, 제한 초과·실패 유도, 모든 Bind/Digest/Connection 모드 재검증. 해당 기능의 종전 기록은 유지하며 v0.6.4 추가 검증 완료로 확대 해석하지 않음.
 
 ## 실제 서버 검증
 
