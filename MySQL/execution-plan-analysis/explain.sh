@@ -1,13 +1,13 @@
 #!/bin/sh
 # MySQL Execution Plan Analysis
-# Version: 0.6.2
+# Version: 0.6.3
 #
 # Oracle MySQL execution-plan / optimizer diagnostic collector.
 # No Python / jq / external package dependency.
 
 set -u
 
-VERSION="0.6.2"
+VERSION="0.6.3"
 
 MYSQL_BIN="${MYSQL_BIN:-mysql}"
 MYSQL_HOST="${MYSQL_HOST:-}"
@@ -517,7 +517,7 @@ ORDER BY COUNT_STAR DESC;"
         printf 'MySQL Performance Schema Digest Summary\n'
         printf 'Script Version : %s\n' "$VERSION"
         printf 'Digest         : %s\n' "$DIGEST_ID"
-        printf 'Schema filter  : %s\n' "\${MYSQL_DATABASE:-all schemas}"
+        printf 'Schema filter  : %s\n' "${MYSQL_DATABASE:-all schemas}"
         printf 'SQL execution  : NONE (aggregated digest only)\n'
         printf 'Note: normalized DIGEST_TEXT has no original literal/bind values.\n'
     } > "$OUTPUT_DIR/summary.txt"
@@ -833,15 +833,16 @@ build_index_io_delta_sql() {
 
     INDEX_IO_TABLE_COUNT="$(wc -l < "$INDEX_IO_CANDIDATES" | tr -d ' ')"
     [ "$INDEX_IO_TABLE_COUNT" -gt 0 ] || return 0
-    if [ "$INDEX_IO_TABLE_COUNT" -gt 64 ]; then
+    INDEX_IO_MAX_CANDIDATES=$INDEX_IO_MAX_INDEXES
+    if [ "$INDEX_IO_TABLE_COUNT" -gt "$INDEX_IO_MAX_CANDIDATES" ]; then
         while IFS="$(printf '\t')" read -r OBJ_SCHEMA OBJ_TABLE; do
             printf '%s\t%s\tUNKNOWN\tSKIPPED\tMore than %s tables; bounded collection disabled\n' \
-                "$OBJ_SCHEMA" "$OBJ_TABLE" 64 >> "$INDEX_IO_SCOPE_FILE"
+                "$OBJ_SCHEMA" "$OBJ_TABLE" "$INDEX_IO_MAX_CANDIDATES" >> "$INDEX_IO_SCOPE_FILE"
         done < "$INDEX_IO_CANDIDATES"
         return 0
     fi
 
-    # One small engine lookup, only for the named tables (max 6).  If
+    # One bounded engine lookup, only for named candidate tables (max 64). If
     # metadata is unavailable, omit I/O collection rather than fail ANALYZE.
     IO_METADATA_FILTER="0"
     while IFS="$(printf '\t')" read -r OBJ_SCHEMA OBJ_TABLE; do
@@ -1131,7 +1132,7 @@ $INDEX_IO_AFTER_SQL"
     awk '/^##EVENT##/ {print}' "$TMP_DIR/analyze_all.txt" > "$OUTPUT_DIR/thread_statement_event.txt"
     awk '/^##METRIC##/ {sub(/^##METRIC##/,"");print}' \
       "$TMP_DIR/analyze_all.txt" > "$OUTPUT_DIR/estimated_actual.tsv"
-    awk 'NR>1 && $0 !~ /^##SESSION##/ && $0 !~ /^##EVENT##/ && $0 !~ /^##METRIC##/ && $0 !~ /^##IDXDELTA##/ && $0 !~ /^##IODETAIL##/ && $0 !~ /^##IOLIMIT##/ && $0 !~ /^(Warning|Error|Note)[[:space:]]+[0-9]+[[:space:]]/ {print}' \
+    awk '$0 !~ /^##SESSION##/ && $0 !~ /^##EVENT##/ && $0 !~ /^##METRIC##/ && $0 !~ /^##IDXDELTA##/ && $0 !~ /^##IODETAIL##/ && $0 !~ /^##IOLIMIT##/ && $0 !~ /^(Warning|Error|Note)[[:space:]]+[0-9]+[[:space:]]/ {print}' \
       "$TMP_DIR/analyze_all.txt" > "$OUTPUT_DIR/explain_analyze.txt"
 
     if [ "$ANALYZE_FORMAT" = "TREE" ]; then
