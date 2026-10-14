@@ -1,13 +1,13 @@
 #!/bin/sh
 # MySQL Execution Plan Analysis
-# Version: 0.6.3
+# Version: 0.6.4
 #
 # Oracle MySQL execution-plan / optimizer diagnostic collector.
 # No Python / jq / external package dependency.
 
 set -u
 
-VERSION="0.6.3"
+VERSION="0.6.4"
 
 MYSQL_BIN="${MYSQL_BIN:-mysql}"
 MYSQL_HOST="${MYSQL_HOST:-}"
@@ -701,7 +701,7 @@ SELECT
 FROM mysql.innodb_table_stats
 WHERE database_name='$DB_ESC'
   AND table_name='$TBL_ESC';
-" 2>&1
+" 2>&1 || printf 'DIAGNOSTIC_COMMAND_FAILED: mysql exited nonzero\n'
         } >> "$OUTPUT_DIR/table_stats.txt"
 
         {
@@ -726,7 +726,7 @@ FROM information_schema.statistics
 WHERE TABLE_SCHEMA='$DB_ESC'
   AND TABLE_NAME='$TBL_ESC'
 ORDER BY INDEX_NAME, SEQ_IN_INDEX;
-" 2>&1
+" 2>&1 || printf 'DIAGNOSTIC_COMMAND_FAILED: mysql exited nonzero\n'
         } >> "$OUTPUT_DIR/index_definitions.txt"
 
         {
@@ -749,7 +749,7 @@ FROM performance_schema.table_io_waits_summary_by_index_usage
 WHERE OBJECT_SCHEMA='$DB_ESC'
   AND OBJECT_NAME='$TBL_ESC'
 ORDER BY COUNT_STAR DESC;
-" 2>&1
+" 2>&1 || printf 'DIAGNOSTIC_COMMAND_FAILED: mysql exited nonzero\n'
         } >> "$OUTPUT_DIR/index_io.txt"
 
         {
@@ -765,16 +765,16 @@ FROM information_schema.column_statistics
 WHERE SCHEMA_NAME='$DB_ESC'
   AND TABLE_NAME='$TBL_ESC'
 ORDER BY COLUMN_NAME;
-" 2>&1
+" 2>&1 || printf 'DIAGNOSTIC_COMMAND_FAILED: mysql exited nonzero\n'
         } >> "$OUTPUT_DIR/column_histograms.txt"
 
     done < "$OUTPUT_DIR/objects.tsv"
 
     : > "$OUTPUT_DIR/diagnostic_errors.txt"
     for DIAG_FILE in table_stats.txt index_definitions.txt index_io.txt column_histograms.txt; do
-        if grep -Eq '^ERROR [0-9]+' "$OUTPUT_DIR/$DIAG_FILE"; then
+        if grep -Eq '^(ERROR [0-9]+|DIAGNOSTIC_COMMAND_FAILED:)' "$OUTPUT_DIR/$DIAG_FILE"; then
             warn "Diagnostic SQL failed in $DIAG_FILE; see report"
-            grep -E '^ERROR [0-9]+' "$OUTPUT_DIR/$DIAG_FILE" >> "$OUTPUT_DIR/diagnostic_errors.txt"
+            grep -E '^(ERROR [0-9]+|DIAGNOSTIC_COMMAND_FAILED:)' "$OUTPUT_DIR/$DIAG_FILE" >> "$OUTPUT_DIR/diagnostic_errors.txt"
             DIAG_ERRORS=1
         fi
     done
@@ -895,6 +895,9 @@ WHERE ($IO_METADATA_FILTER);" > "$INDEX_IO_ENGINES" 2>"$OUTPUT_DIR/index_io_scop
     [ "$IO_FILTER" != 0 ] || return 0
     if [ "$INDEX_IO_VERIFIED_COUNT" -gt "$INDEX_IO_MAX_TABLES" ]; then
         warn "Index I/O delta skipped: more than $INDEX_IO_MAX_TABLES verified InnoDB tables"
+        awk -F '\t' 'BEGIN {OFS="\t"} $4=="INCLUDED" {$4="SKIPPED";$5="Verified InnoDB table count exceeded collection limit"} {print}' \
+            "$INDEX_IO_SCOPE_FILE" > "$TMP_DIR/index_io_scope_bounded.tsv"
+        mv "$TMP_DIR/index_io_scope_bounded.tsv" "$INDEX_IO_SCOPE_FILE"
         return 0
     fi
     INDEX_IO_READY=1
